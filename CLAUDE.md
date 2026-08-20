@@ -31,8 +31,8 @@ code exists yet. Phase 0 (repo scaffold, CI, ADRs, live spike) is next.
   `TelegramGateway` seam, Typer CLI, stdlib `sqlite3` (WAL) with explicit
   migrations, pytest + pytest-asyncio, ruff + pyright.
 - **Raw first:** every TL object the API returns is appended verbatim
-  (`to_dict()` JSONL) before any normalisation; normalised tables are a
-  projection that can be rebuilt from raw.
+  (`to_dict()` JSON) to the `raw_records` table before any normalisation;
+  normalised tables are a projection that can be rebuilt from raw.
 - **SQLite is the system of record**, Datasette-friendly (plain columns, JSON
   text for raw, FTS5, `metadata.json`); `edges` is triple-shaped
   `(subject, predicate, object, observed_at, tier, source_raw_id)` with
