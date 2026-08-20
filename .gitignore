@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+dist/
+build/
+*.egg-info/
+
+# paperboy secrets & data — never commit
+*.session
+*.session-journal
+.env
+.env.*
+config.local.*
+data/
+paperboy-data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# local tooling
+.claude/settings.local.json
+.claude/worktrees/
+.DS_Store
