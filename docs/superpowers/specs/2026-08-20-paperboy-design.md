@@ -256,7 +256,7 @@ graph/RDF as export; encryption by volume (SQLCipher not investigated).
 
 ## 13. Unverified — settled by the Phase 0 spike
 
-1. Telethon 1.44.0 wheel layer vs 228 · 2. `getHistory` on a public channel
+1. ~~Telethon 1.44.0 wheel layer vs 228~~ — SETTLED 2026-08-20: installed wheel is **layer 227**; all core raw methods present (getChannelRecommendations, getChannelDifference, getSponsoredMessages, premium.getBoostsList, channels.searchPosts). · 2. `getHistory` on a public channel
 un-joined · 3. `getParticipants(Admins)` on a broadcast channel as subscriber
 · 4. passive `getChannelDifference` un-joined delivers delete events · 5.
 `Recent` yield on a mid-size visible supergroup · 6. `channelParticipantsMentions`

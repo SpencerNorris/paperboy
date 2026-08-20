@@ -34,6 +34,8 @@ pytest-asyncio, ruff, pyright.
 
 ### Task 0: Project scaffold, CI, and the guardrail smoke gate
 
+> **DELIVERED in the Phase-0 `chore/bootstrap` PR** (scaffold, CI, ADRs, opsec, settings, branch-tier). `single-feature-run` starts at Task 1. Steps retained below for reference.
+
 **Files:**
 - Create: `pyproject.toml`, `src/paperboy/__init__.py`, `src/paperboy/py.typed`, `tests/__init__.py`, `tests/conftest.py`, `.github/workflows/ci.yml`, `ruff.toml`, `.python-version`
 - Create: `docs/adr/0001-library.md` … `0004-sync.md`, `docs/opsec.md` (stubs filled in Task 15)
