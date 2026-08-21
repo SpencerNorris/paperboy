@@ -44,12 +44,6 @@ uv run paperboy --help
 `uv run paperboy …` runs the CLI inside the project environment. (Not yet
 published to PyPI.)
 
-> If the repo lives on a secondary/external volume (e.g. `/Volumes/…`), `uv
-> sync` may print `warning: Failed to clone files; falling back to full copy`.
-> That is harmless — uv's cache and your project are on different filesystems,
-> so reflinking isn't available and it copies instead. Silence it with
-> `export UV_LINK_MODE=copy`.
-
 ## Quick start
 
 ### 1. Get your API credentials
