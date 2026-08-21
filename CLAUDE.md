@@ -12,8 +12,12 @@ database for OSINT / investigative-journalism use. Architected as an entity
 graph so later recipes (user dossier, phone lookup, watchlists) are thin
 additions. See `README.md` for the user-facing summary and disclaimer.
 
-**Status (2026-08-20):** pre-scaffold. Research and design are done; no Python
-code exists yet. Phase 0 (repo scaffold, CI, ADRs, live spike) is next.
+**Status (2026-08-21):** Phase 1 (core) shipped on `feat/core` — `paperboy
+collect`/`status`/`export`/`doctor`/`auth` work end to end against live
+Telegram (see `docs/features/collect-channel.md` for the DoD smoke
+transcript). `watch` and `lookup` are Phase 2 stubs. Phase 2 collectors
+(`discussion`, `participants`, `profiles`, `media`, `graph`, `web`) are not
+started.
 
 ## Read these first
 
@@ -65,9 +69,13 @@ code exists yet. Phase 0 (repo scaffold, CI, ADRs, live spike) is next.
 
 ## Commands
 
-Pending Phase 0 scaffold (`uv sync`, `uv run pytest`, `uv run ruff check`,
-`uv run pyright`, `uv run paperboy --help`). Update this section when the
-scaffold lands; do not add commands that don't exist yet.
+`uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
+`uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
+[--phases channel,history] [--unsafe]`, `status [TARGET]`, `export TARGET
+--format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
+`--profile` (default `default`) from the macOS Keychain (`scripts/store_api.py`,
+`scripts/login.py`, or `paperboy auth`). `watch`/`lookup` exit 1 with a
+"Phase 2" message — not implemented yet.
 
 ## Workflow
 
