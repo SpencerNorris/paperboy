@@ -152,8 +152,10 @@ class FakeGateway:
     async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
         del input_channel
         self.download_media_calls.append(message["id"])
-        table: dict[int, bytes] = self._fx.get("media", {})
-        return table.get(message["id"])
+        value = self._fx.get("media", {}).get(message["id"])
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         del input_channel

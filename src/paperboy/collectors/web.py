@@ -20,7 +20,7 @@ import httpx
 from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.ids import msg_uri, utc_now_iso
-from paperboy.store.sync import get_state, set_state
+from paperboy.store.sync import set_state
 from paperboy.store.web import insert_tme_snapshot, insert_wayback_snapshot
 from paperboy.targets import Target, TargetKind
 from paperboy.web.client import WebClient
@@ -126,8 +126,14 @@ class WebCollector:
         self, ctx: CollectContext, client: WebClient, username: str, channel_id: int | None
     ) -> dict[str, int]:
         counts = {"tme_posts": 0, "deleted_recovered": 0}
-        resume = get_state(ctx.store, "web_tme", username) or {}
-        before_cursor: int | None = resume.get("before")
+        # Always start from the NEWEST posts each run (t.me/s with no
+        # `?before=`), then page backward within the run. The previous design
+        # persisted the backward cursor across runs, so a re-run only ever
+        # continued deeper into the past and never re-captured posts published
+        # since — this guarantees the newest are always fetched. web_snapshots
+        # is a time series, so re-observing a recent post later is expected.
+        before_cursor: int | None = None
+        newest_seen: int | None = None
 
         for _ in range(_MAX_TME_PAGES):
             url = f"https://t.me/s/{username}"
@@ -152,12 +158,16 @@ class WebCollector:
                 self._store_post(ctx, fetched_at, username, channel_id, post, counts)
                 if post.msg_id is not None:
                     new_min = post.msg_id if new_min is None else min(new_min, post.msg_id)
+                    newest_seen = (
+                        post.msg_id if newest_seen is None else max(newest_seen, post.msg_id)
+                    )
 
             if new_min is None or (before_cursor is not None and new_min >= before_cursor):
                 break
             before_cursor = new_min
-            set_state(ctx.store, "web_tme", username, {"before": before_cursor})
 
+        if newest_seen is not None:
+            set_state(ctx.store, "web_tme", username, {"newest_seen": newest_seen})
         return counts
 
     def _store_post(
