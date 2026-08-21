@@ -96,6 +96,30 @@ async def test_admin_required_is_skip_and_record(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_transient_network_error_retries_without_polluting_flood_log(tmp_path):
+    # ConnectionError/TimeoutError/OSError classify as Disposition.RETRY too,
+    # but they carry no `.seconds` — `getattr(exc, "seconds", 0)` is 0, so a
+    # retry here must not write a spurious flood_log row (until=now,
+    # seconds=0); only genuine FloodWait retries belong in flood_log.
+    s = load_settings("default", {})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        b = Budget(s, st, sleeper=lambda x: None)
+
+        calls = {"n": 0}
+
+        async def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("connection reset")
+            return "ok"
+
+        result = await b.call("messages.getHistory", flaky)
+        assert result == "ok"
+        rows = st.conn.execute("select * from flood_log").fetchall()
+        assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_min_interval_paces_repeat_calls_to_same_method(tmp_path):
     s = load_settings("default", {})
     with Store.open(tmp_path / "p.sqlite") as st:

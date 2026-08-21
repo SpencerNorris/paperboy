@@ -4,9 +4,9 @@ Runs `channel` (which populates `CollectContext.input_channel`/`channel_id`/
 `tier` for everything after it), then `history` (backfill, immediately
 followed by one `pts` catch-up so the channel's sync state is current as of
 *now*, not as of whenever backfill started — both folded into one `history`
-CollectResult). `PhaseStop` is recorded and that phase's result is marked
-stopped, but later phases still run; `HardStop` is recorded and the whole
-run ends there (spec §8). A `run_events` row is written for every phase.
+CollectResult). `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
+marked stopped, but later phases still run; `HardStop` is recorded and the
+whole run ends there (spec §8). A `run_events` row is written for every phase.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from paperboy.budget import HardStop, PhaseStop
+from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.history import HistoryCollector
@@ -94,6 +94,16 @@ async def collect_channel(
             continue
         try:
             result = await _run_one(collector, ctx)
+        except SkipAndRecord as exc:
+            # Disposition.SKIP (e.g. ChannelPrivateError, ChatAdminRequiredError,
+            # MsgIdInvalidError, BroadcastForbiddenError, PremiumAccountRequiredError):
+            # skip this one collector, the run continues (spec §8) — this must
+            # never abort the whole run, unlike PhaseStop/HardStop below.
+            log.warning("phase %s skipped: %s", collector.name, exc)
+            detail = {"error": str(exc)}
+            _record_run_event(store, ctx.channel_id, collector.name, "skip", detail)
+            results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
+            continue
         except PhaseStop as exc:
             log.warning("phase %s stopped: %s", collector.name, exc)
             detail = {"error": str(exc)}
