@@ -28,6 +28,12 @@ class CollectContext:
     channel_id: int | None
     tier: str
     log: Logger
+    # Which profile this run is collecting into — only `media` needs it (to
+    # derive `<data_dir>/<profile>/media/...`, matching `profile_dir()` in
+    # config.py); every other field above is required, so this is appended
+    # at the end with a default rather than threaded through every existing
+    # positional `CollectContext(...)` call site (recipes.py, every test).
+    profile: str = "default"
 
 
 @dataclass

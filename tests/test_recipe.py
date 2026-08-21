@@ -21,9 +21,20 @@ def _fixtures():
         "full_channel": json.loads((FX / "full_channel.json").read_text()),
         "self": {"_": "user", "id": 1, "self": True},
         "history": [
-            {"_": "message", "id": i, "message": f"m{i}", "date": 1767322445} for i in (2, 1)
+            {
+                "_": "message", "id": 2, "message": "", "date": 1767322445,
+                "media": {
+                    "_": "MessageMediaDocument",
+                    "document": {
+                        "_": "Document", "id": 1, "access_hash": 1, "mime_type": "text/plain",
+                        "attributes": [{"_": "DocumentAttributeFilename", "file_name": "a.txt"}],
+                    },
+                },
+            },
+            {"_": "message", "id": 1, "message": "m1", "date": 1767322445},
         ],
         "channel_difference": {"_": "updates.channelDifferenceEmpty", "final": True, "pts": 42},
+        "media": {2: b"file contents"},
     }
 
 
@@ -38,6 +49,49 @@ async def test_collect_channel_runs_channel_then_history(tmp_path):
         assert [r.name for r in results] == ["channel", "history"]
         assert st.conn.execute("select count(*) as n from channels").fetchone()["n"] == 1
         assert st.conn.execute("select count(*) as n from messages").fetchone()["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_collect_channel_media_is_opt_out_by_default(tmp_path):
+    # `media` is opt-in (spec §6): a plain run with no `media=True` and no
+    # `--phases media` must never touch the network for downloads, even
+    # though `history` populated a message with downloadable media above.
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {"data_dir": tmp_path}), parse_target("@durov"),
+            phases=["channel", "history"], log=logging.getLogger("t"),
+        )
+        assert [r.name for r in results] == ["channel", "history"]
+        assert gw.download_media_calls == []
+        assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_collect_channel_media_flag_opts_in(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {"data_dir": tmp_path}), parse_target("@durov"),
+            phases=None, log=logging.getLogger("t"), media=True, profile="mediarecipe",
+        )
+        assert [r.name for r in results] == ["channel", "history", "media"]
+        media_result = next(r for r in results if r.name == "media")
+        assert media_result.counts["downloaded"] == 1
+        assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_channel_phases_media_opts_in_without_flag(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {"data_dir": tmp_path}), parse_target("@durov"),
+            phases=["channel", "history", "media"], log=logging.getLogger("t"),
+            profile="mediarecipe2",
+        )
+        assert [r.name for r in results] == ["channel", "history", "media"]
+        assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1
 
 
 @pytest.mark.asyncio
