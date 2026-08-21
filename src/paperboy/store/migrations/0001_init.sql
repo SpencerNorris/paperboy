@@ -130,9 +130,13 @@ CREATE TABLE IF NOT EXISTS message_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_message_metrics_msg ON message_metrics(message_uri, observed_at);
 
+-- No FK to messages(uri): a `gap`/`empty` tombstone can be recorded for a
+-- message id that was probed but never itself observed/stored (spec §7 —
+-- deletion evidence for ids that never appeared in a verified-complete
+-- range or in any page of history).
 CREATE TABLE IF NOT EXISTS message_tombstones (
     id           INTEGER PRIMARY KEY,
-    message_uri  TEXT NOT NULL REFERENCES messages(uri),
+    message_uri  TEXT NOT NULL,
     observed_at  TEXT NOT NULL,
     evidence     TEXT NOT NULL CHECK (evidence IN ('update', 'gap', 'empty'))
 );
