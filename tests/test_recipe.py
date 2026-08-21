@@ -120,6 +120,24 @@ def test_default_collectors_web_is_opt_in():
     ]
 
 
+def test_discussion_runs_by_default_immediately_after_history():
+    """Design spec §10: `channel -> history -> discussion -> participants ->
+    profiles -> media -> graph -> web`. Nothing previously pinned
+    `discussion`'s position in `_default_collectors` — a registration
+    anywhere else in the list (e.g. after `graph`, or before `history`)
+    would still pass every other test, including
+    `tests/test_integration_discussion.py`, which bypasses
+    `_default_collectors` entirely via an explicit `collectors=` override.
+    Expected to fail with `ValueError` (`"discussion"` not yet in the list)
+    until plan Task 4 registers `DiscussionCollector` — at which point the
+    two existing assertions above (`test_default_collectors_web_is_opt_in`)
+    also need their expected lists updated to include `"discussion"`; that
+    update is Task 4's, not this test-gate fix's, since it requires the
+    production registration this test itself is pinned against."""
+    names = [c.name for c in _default_collectors(include_media=False, include_web=False)]
+    assert names.index("discussion") == names.index("history") + 1
+
+
 class _StubCollector:
     def __init__(self, name, exc=None):
         self.name = name

@@ -219,3 +219,52 @@ async def test_explicit_target_resumes_on_its_own_cursor(tmp_path):
         )
         assert get_state(st, "history", "5") == {"offset_id": 999}
         assert get_state(st, "history", "77") == {"offset_id": 1}
+
+
+# --- page_budget (added for the `discussion` collector's Opus test-gate
+# review, coverage gap 3: "the default is unpinned, and nothing asserts
+# `history`'s own `page_budget` stays unbounded when a caller (`discussion`)
+# threads its own budget through the shared parameter") ---------------------
+
+
+@pytest.mark.asyncio
+async def test_page_budget_defaults_to_unbounded(tmp_path):
+    """Task 1 Step 6 adds a `page_budget: int | None = None` kwarg to
+    `collect()`; `discussion` threads its own `discussion_page_budget`
+    (default 500, see `tests/test_collector_discussion.py::
+    test_discussion_page_budget_defaults_to_500`) through it explicitly.
+    `history`'s OWN default must stay unbounded — a plain `collect()` call
+    with no `page_budget` argument at all must page a channel past 100
+    (`_HISTORY_PAGE_SIZE`) messages, indeed past whatever small number
+    `discussion` happens to default to, without ever raising `PhaseStop`.
+    3 full 100-message pages (300 total, no gaps) exercises this without
+    depending on the exact default value."""
+    gw = FakeGateway({"history": [_m(i) for i in range(300, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["messages"] == 300
+
+
+@pytest.mark.asyncio
+async def test_explicit_target_with_probe_gaps_true_probes_gaps_on_that_target(tmp_path):
+    """The explicit-target axis (`test_collect_targets_an_explicit_channel`)
+    and the `probe_gaps` axis (`test_probe_gaps_true_still_tombstones`) are
+    each exercised only against `ctx.channel_id`/`ctx.input_channel`
+    individually. An implementation whose `_probe_gaps` call still reads
+    `ctx.channel_id`/`ctx.input_channel` instead of the threaded `channel_id`/
+    `input_channel` parameters would gap-probe (and tombstone) the WRONG
+    channel entirely and still pass both of those tests on their own —
+    neither can observe which channel actually got probed. This combines
+    both axes and asserts the tombstone landed under the EXPLICIT target's
+    URI, not `ctx.channel_id`'s."""
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        assert res.counts["tombstones"] == 1
+        row = st.conn.execute("select message_uri from message_tombstones").fetchone()
+        assert row["message_uri"] == "tg:msg:77/2"
