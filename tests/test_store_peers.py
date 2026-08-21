@@ -1,0 +1,58 @@
+from paperboy.store.db import Store
+from paperboy.store.peers import upsert_peer
+
+
+def test_min_does_not_clobber_full(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        full = {"_": "user", "id": 9, "access_hash": 111, "username": "real", "first_name": "Real"}
+        r1 = st.add_raw("user", full, "member", None)
+        upsert_peer(st, full, r1, "2026-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None)
+        mn = {"_": "user", "id": 9, "min": True, "first_name": "MinName"}
+        r2 = st.add_raw("user", mn, "stranger", None)
+        upsert_peer(st, mn, r2, "2026-01-02T00:00:00+00:00", seen_in_chat=7, seen_in_msg=34)
+        row = st.conn.execute(
+            "select username, first_name, is_min, seen_in_msg from peers where uri='tg:user:9'"
+        ).fetchone()
+        assert row["username"] == "real"
+        assert row["first_name"] == "Real"  # not clobbered
+        assert row["seen_in_msg"] == 34  # provenance updated
+        assert row["is_min"] == 0  # the full row's is_min flag is untouched
+
+
+def test_first_observation_min_is_stored_as_is(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        mn = {"_": "user", "id": 42, "min": True, "first_name": "OnlyMin"}
+        r = st.add_raw("user", mn, "stranger", None)
+        uri = upsert_peer(st, mn, r, "2026-01-01T00:00:00+00:00", seen_in_chat=7, seen_in_msg=1)
+        assert uri == "tg:user:42"
+        row = st.conn.execute("select is_min, first_name from peers where uri=?", (uri,)).fetchone()
+        assert row["is_min"] == 1
+        assert row["first_name"] == "OnlyMin"
+
+
+def test_full_observation_overwrites_a_prior_full_observation(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        old = {"_": "user", "id": 9, "username": "old_handle", "first_name": "Old"}
+        r1 = st.add_raw("user", old, "member", None)
+        upsert_peer(st, old, r1, "2026-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None)
+        new = {"_": "user", "id": 9, "username": "new_handle", "first_name": "New"}
+        r2 = st.add_raw("user", new, "member", None)
+        upsert_peer(st, new, r2, "2026-01-02T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None)
+        row = st.conn.execute(
+            "select username, first_name from peers where uri='tg:user:9'"
+        ).fetchone()
+        assert row["username"] == "new_handle"
+        assert row["first_name"] == "New"
+
+
+def test_channel_typed_peer_stores_title(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        chan = {"_": "channel", "id": 5, "access_hash": 99, "title": "Durov", "username": "durov"}
+        r = st.add_raw("channel", chan, "stranger", None)
+        uri = upsert_peer(
+            st, chan, r, "2026-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None
+        )
+        assert uri == "tg:channel:5"
+        row = st.conn.execute("select kind, title from peers where uri=?", (uri,)).fetchone()
+        assert row["kind"] == "channel"
+        assert row["title"] == "Durov"

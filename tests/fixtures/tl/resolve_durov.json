@@ -1,0 +1,14 @@
+{
+  "_": "contacts.resolvedPeer",
+  "chats": [
+    {
+      "_": "channel",
+      "id": 5,
+      "access_hash": 99,
+      "title": "Durov",
+      "username": "durov",
+      "broadcast": true
+    }
+  ],
+  "users": []
+}

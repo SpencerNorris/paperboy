@@ -16,7 +16,8 @@ build/
 .env
 .env.*
 config.local.*
-data/
+/data/            # default data dir (SQLite DB, logs, media) — repo-relative
+data/             # any other data/ dir
 paperboy-data/
 *.sqlite
 *.sqlite-wal
