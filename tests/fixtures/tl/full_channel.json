@@ -1,0 +1,22 @@
+{
+  "_": "messages.chatFull",
+  "full_chat": {
+    "_": "channelFull",
+    "id": 5,
+    "participants_count": 100,
+    "about": "x",
+    "pts": 42,
+    "linked_chat_id": 0
+  },
+  "chats": [
+    {
+      "_": "channel",
+      "id": 5,
+      "access_hash": 99,
+      "title": "Durov",
+      "username": "durov",
+      "broadcast": true
+    }
+  ],
+  "users": []
+}
