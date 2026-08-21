@@ -18,6 +18,14 @@ _registered_secrets: set[str] = set()
 _MASK = "***"
 
 
+def _redact(text: str) -> str:
+    """Mask every registered secret out of `text` (longest-first)."""
+    for secret in sorted(_registered_secrets, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, _MASK)
+    return text
+
+
 def register_secret(value: str) -> None:
     """Register a sensitive string so every log record has it masked out.
 
@@ -39,15 +47,18 @@ class RedactionFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        # Longest-first so one secret that is a substring of another (e.g. a
-        # short test token contained in a longer one) doesn't leave a partial
-        # match unmasked.
-        for secret in sorted(_registered_secrets, key=len, reverse=True):
-            if secret in message:
-                message = message.replace(secret, _MASK)
-        record.msg = message
+        record.msg = _redact(record.getMessage())
         record.args = ()
+        # Exception tracebacks are a second credential-leak path: a secret in an
+        # exception's str() would otherwise reach the file/console unmasked. Pre-
+        # render exc_info to text here (before any formatter), scrub it, cache it
+        # on record.exc_text, and clear exc_info so no downstream formatter (JSON
+        # or Rich) re-derives an unredacted traceback from the raw exception.
+        if record.exc_info:
+            record.exc_text = _redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = _redact(record.exc_text)
         return True
 
 
@@ -59,8 +70,11 @@ class _JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
+        exc = record.exc_text or (
+            self.formatException(record.exc_info) if record.exc_info else None
+        )
+        if exc:
+            payload["exc_info"] = exc
         return json.dumps(payload, ensure_ascii=False)
 
 
