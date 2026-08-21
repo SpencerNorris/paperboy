@@ -30,6 +30,7 @@ from paperboy.web.wayback import cdx_timestamp_to_iso, parse_cdx_rows
 # Safety bound on `?before=` pagination depth and the pacing delay between
 # HTTP requests — code constants (spec: not user config), like the allow-list.
 _MAX_TME_PAGES = 50
+_WAYBACK_CDX_LIMIT = 10000  # cap the CDX response (durov has ~775k captures = 112MB unbounded)
 _DEFAULT_MIN_INTERVAL_SECONDS = 1.0
 
 
@@ -209,7 +210,15 @@ class WebCollector:
             counts["deleted_recovered"] += 1
 
     def _collect_wayback(self, ctx: CollectContext, client: WebClient, username: str) -> int:
-        url = f"https://web.archive.org/cdx/search/cdx?url=t.me/s/{username}*&output=json"
+        # Bound the query: an unbounded `url=t.me/s/<name>*` CDX search on a
+        # heavily-archived channel returns hundreds of thousands of rows (a
+        # 100+ MB response that arrives truncated and fails to parse). Cap it,
+        # collapse consecutive identical-content captures, and keep only real
+        # page captures (200s).
+        url = (
+            f"https://web.archive.org/cdx/search/cdx?url=t.me/s/{username}*"
+            f"&output=json&filter=statuscode:200&collapse=digest&limit={_WAYBACK_CDX_LIMIT}"
+        )
         response = self._paced_get(client, url)
         fetched_at = utc_now_iso()
         ctx.store.add_raw(
