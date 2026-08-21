@@ -4,9 +4,11 @@ Runs `channel` (which populates `CollectContext.input_channel`/`channel_id`/
 `tier` for everything after it), then `history` (backfill, immediately
 followed by one `pts` catch-up so the channel's sync state is current as of
 *now*, not as of whenever backfill started — both folded into one `history`
-CollectResult). `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
-marked stopped, but later phases still run; `HardStop` is recorded and the
-whole run ends there (spec §8). A `run_events` row is written for every phase.
+CollectResult), then `web` (`t.me/s/` + Wayback CDX capture, pure HTTP — no
+`Gateway`/`Budget` involvement). `SkipAndRecord` and `PhaseStop` are each
+recorded and that phase's result is marked stopped, but later phases still
+run; `HardStop` is recorded and the whole run ends there (spec §8). A
+`run_events` row is written for every phase.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.history import HistoryCollector
+from paperboy.collectors.web import WebCollector
 from paperboy.ids import utc_now_iso
 from paperboy.store.db import dumps
 
@@ -31,7 +34,7 @@ if TYPE_CHECKING:
 
 
 def _default_collectors() -> list[Collector]:
-    return [ChannelCollector(), HistoryCollector()]
+    return [ChannelCollector(), HistoryCollector(), WebCollector()]
 
 
 def _record_run_event(

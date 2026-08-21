@@ -131,7 +131,7 @@ async def _run_doctor(settings, secrets, profile: str, store):
 def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
-    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history"),
+    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history,web"),
     join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
     profile_budget: int = typer.Option(None, "--profile-budget"),
     max_rpc: int = typer.Option(None, "--max-rpc"),
