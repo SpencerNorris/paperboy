@@ -67,6 +67,24 @@ class Gateway(Protocol):
         anything on Telegram's side."""
         ...
 
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        """`channels.getChannelRecommendations` — a `Chats`/`ChatsSlice` dict
+        (the latter's `count` is the true total, even though at most ~10 `chats` come
+        back). May raise `SkipAndRecord` (e.g. `CHAT_NOT_MODIFIED`, `PREMIUM_ACCOUNT_REQUIRED`)."""
+        ...
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        """`messages.checkChatInvite` — never joins. Returns a `ChatInvite` dict
+        (unjoined preview: title/photo/participants_count, no chat id) or a
+        `ChatInviteAlready`/`ChatInvitePeek` dict (a real `Chat`, if already known)."""
+        ...
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        """`messages.getSponsoredMessages` — a `SponsoredMessages` or
+        `SponsoredMessagesEmpty` dict. May raise `SkipAndRecord` (e.g.
+        `CHAT_ADMIN_REQUIRED`, `PREMIUM_ACCOUNT_REQUIRED` on some accounts)."""
+        ...
+
 
 class FakeGateway:
     """Replays recorded fixture dicts — no network, no `Budget` involved.
@@ -76,6 +94,11 @@ class FakeGateway:
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
     `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`),
     `media` (a `{msg_id: bytes}` lookup for `download_media`).
+    `channel_recommendations`, `sponsored_messages`, `chat_invite` (a
+    `{hash: dict}` lookup). Any of these three graph-collector fixture
+    values may instead be a `BaseException` instance (e.g. a `SkipAndRecord`)
+    to simulate `Budget.call`'s classification without going through it —
+    `FakeGateway` never touches `Budget`.
     """
 
     def __init__(self, fixtures: dict) -> None:
@@ -131,6 +154,27 @@ class FakeGateway:
         self.download_media_calls.append(message["id"])
         table: dict[int, bytes] = self._fx.get("media", {})
         return table.get(message["id"])
+
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        del input_channel
+        return self._fx_or_raise("channel_recommendations")
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        table: dict[str, dict] = self._fx.get("chat_invite", {})
+        value = table[hash_]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        del input_channel
+        return self._fx_or_raise("sponsored_messages")
+
+    def _fx_or_raise(self, key: str) -> dict:
+        value = self._fx[key]
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
 
 def _input_channel(input_channel: dict) -> InputChannel:
@@ -396,3 +440,44 @@ class TelethonGateway:
                 raise SkipAndRecord(
                     f"media download skipped: file_reference expired twice for msg {msg_id}"
                 ) from exc
+
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        from telethon.tl.functions.channels import GetChannelRecommendationsRequest
+        from telethon.tl.tlobject import TLObject
+
+        channel = _input_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "channels.getChannelRecommendations",
+                lambda: self.client(GetChannelRecommendationsRequest(channel=channel)),
+            ),
+        )
+        return result.to_dict()
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.tlobject import TLObject
+
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "messages.checkChatInvite",
+                lambda: self.client(CheckChatInviteRequest(hash=hash_)),
+            ),
+        )
+        return result.to_dict()
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        from telethon.tl.functions.messages import GetSponsoredMessagesRequest
+        from telethon.tl.tlobject import TLObject
+
+        peer = _input_peer_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "messages.getSponsoredMessages",
+                lambda: self.client(GetSponsoredMessagesRequest(peer=peer)),
+            ),
+        )
+        return result.to_dict()

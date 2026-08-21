@@ -1,0 +1,9 @@
+{
+  "_": "ChatInvite",
+  "title": "Cool Group",
+  "photo": {"_": "PhotoEmpty", "id": 0},
+  "participants_count": 250,
+  "broadcast": false,
+  "megagroup": true,
+  "color": 0
+}

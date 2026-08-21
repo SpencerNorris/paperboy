@@ -39,6 +39,7 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         BroadcastForbiddenError,
         ChannelPrivateError,
         ChatAdminRequiredError,
+        ChatNotModifiedError,
         MsgIdInvalidError,
         PremiumAccountRequiredError,
     )
@@ -49,6 +50,11 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         MsgIdInvalidError,
         BroadcastForbiddenError,
         PremiumAccountRequiredError,
+        # `graph`'s getChannelRecommendations/getSponsoredMessages/
+        # checkChatInvite each land here in the documented "nothing to
+        # return" case (no recommendations, ads disabled, invite already
+        # known unchanged) — skip that one RPC, the phase continues.
+        ChatNotModifiedError,
     )
 
 
