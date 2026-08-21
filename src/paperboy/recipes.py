@@ -7,9 +7,11 @@ followed by one `pts` catch-up so the channel's sync state is current as of
 CollectResult), then `graph` (similar-channel recommendations, entity-derived
 mentions, invite-link previews, sponsored-message provenance — consumes
 `history`'s stored messages / `channel`'s context). `media` (download +
-content-address every stored message's media) is opt-in — off by default,
-on via `collect_channel(..., media=True)` or `phases=[..., "media"]`. Both
-`graph` and `media` run after `history` so they have messages to walk.
+content-address every stored message's media) and `web` (`t.me/s/` + Wayback
+CDX capture over plain HTTP — no `Gateway`/`Budget`, a different trust
+boundary) are OPT-IN — off by default, on via `collect_channel(..., media=True
+/ web=True)` or by naming them in `phases`. `graph` runs by default; all of
+`graph`/`media`/`web` run after `history` so they have messages to walk.
 `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
 marked stopped, but later phases still run; `HardStop` is recorded and the
 whole run ends there (spec §8). A `run_events` row is written for every phase.
@@ -27,6 +29,7 @@ from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
+from paperboy.collectors.web import WebCollector
 from paperboy.ids import utc_now_iso
 from paperboy.store.db import dumps
 
@@ -38,13 +41,15 @@ if TYPE_CHECKING:
     from paperboy.targets import Target
 
 
-def _default_collectors(*, include_media: bool) -> list[Collector]:
-    # `graph` consumes `history`'s stored messages + `channel`'s context, so
-    # it runs after both. `media` is opt-in (spec §6): a plain `collect` with
-    # no `--media` flag (and no explicit `--phases media`) stays
-    # metadata+history+graph only, since downloading every file in a channel
-    # is a much bigger bandwidth/disk commitment than the rest.
+def _default_collectors(*, include_media: bool, include_web: bool) -> list[Collector]:
+    # The default set is all-MTProto and cheap-ish: channel + history + graph.
+    # `media` (heavy downloads) and `web` (external HTTP to t.me/archive.org —
+    # a different trust boundary than the authenticated MTProto session) are
+    # OPT-IN (--media / --web, or named in --phases), so a plain `collect`
+    # stays Telegram-only: metadata + history + graph.
     collectors: list[Collector] = [ChannelCollector(), HistoryCollector(), GraphCollector()]
+    if include_web:
+        collectors.append(WebCollector())
     if include_media:
         collectors.append(MediaCollector())
     return collectors
@@ -93,6 +98,7 @@ async def collect_channel(
     *,
     collectors: Sequence[Collector] | None = None,
     media: bool = False,
+    web: bool = False,
     profile: str = "default",
 ) -> list[CollectResult]:
     """Run `channel`, then `history` (+ its `catch_up`), then `graph`, against `target`.
@@ -108,8 +114,9 @@ async def collect_channel(
     """
     ctx = CollectContext(gateway, store, settings, target, None, None, "stranger", log, profile)
     include_media = media or (phases is not None and "media" in phases)
+    include_web = web or (phases is not None and "web" in phases)
     active = collectors if collectors is not None else _default_collectors(
-        include_media=include_media
+        include_media=include_media, include_web=include_web
     )
     selected = set(phases) if phases is not None else {c.name for c in active}
 

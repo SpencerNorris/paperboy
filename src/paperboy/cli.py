@@ -132,11 +132,14 @@ def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
     phases: str = typer.Option(
-        None, "--phases", help="Comma-separated: channel,history,graph,media"
+        None, "--phases", help="Comma-separated: channel,history,graph,web,media"
     ),
     join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
     media: bool = typer.Option(
         False, "--media", help="Also download message media (opt-in; off by default)."
+    ),
+    web: bool = typer.Option(
+        False, "--web", help="Also capture t.me/s + Wayback snapshots over HTTP (opt-in)."
     ),
     profile_budget: int = typer.Option(None, "--profile-budget"),
     max_rpc: int = typer.Option(None, "--max-rpc"),
@@ -163,7 +166,7 @@ def collect(
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
-        p for p in ("history", "graph", "media") if phase_list and p in phase_list
+        p for p in ("history", "graph", "media", "web") if phase_list and p in phase_list
     ]
     if phase_list is not None and _dependent_phases and "channel" not in phase_list:
         # `channel` populates `CollectContext.input_channel`/`channel_id` (the
@@ -189,7 +192,8 @@ def collect(
     with composition.build_store(settings, profile) as store:
         results = _run_async_or_exit(
             _run_collect(
-                settings, secrets, profile, store, parsed_target, phase_list, log, unsafe, media
+                settings, secrets, profile, store, parsed_target,
+                phase_list, log, unsafe, media, web,
             )
         )
 
@@ -202,7 +206,9 @@ def collect(
     console.print(table)
 
 
-async def _run_collect(settings, secrets, profile, store, target, phase_list, log, unsafe, media):
+async def _run_collect(
+    settings, secrets, profile, store, target, phase_list, log, unsafe, media, web
+):
     gateway = await composition.build_gateway(settings, secrets, profile, store)
     if not unsafe:
         checks = await run_doctor(gateway, settings)
@@ -213,7 +219,7 @@ async def _run_collect(settings, secrets, profile, store, target, phase_list, lo
             )
             raise typer.Exit(code=1)
     return await collect_channel(
-        gateway, store, settings, target, phase_list, log, media=media, profile=profile
+        gateway, store, settings, target, phase_list, log, media=media, web=web, profile=profile
     )
 
 

@@ -7,7 +7,7 @@ import pytest
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import load_settings
-from paperboy.recipes import collect_channel
+from paperboy.recipes import _default_collectors, collect_channel
 from paperboy.store.db import Store
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
@@ -105,6 +105,19 @@ async def test_collect_channel_honors_phases_filter(tmp_path):
         )
         assert [r.name for r in results] == ["channel"]
         assert st.conn.execute("select count(*) as n from messages").fetchone()["n"] == 0
+
+
+def test_default_collectors_web_is_opt_in():
+    # `web` is pure HTTP to an external host (t.me/archive.org) — a different
+    # trust boundary than the MTProto session — so like `media` it is OPT-IN,
+    # not in the default set. Running it end to end needs a mocked WebClient
+    # (see tests/test_collector_web.py), not a real network call.
+    assert [c.name for c in _default_collectors(include_media=False, include_web=False)] == [
+        "channel", "history", "graph",
+    ]
+    assert [c.name for c in _default_collectors(include_media=False, include_web=True)] == [
+        "channel", "history", "graph", "web",
+    ]
 
 
 class _StubCollector:
