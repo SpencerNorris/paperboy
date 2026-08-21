@@ -93,6 +93,68 @@ def test_collect_history_alone_rejected_with_clear_message(tmp_path, monkeypatch
     assert "AssertionError" not in result.stdout
 
 
+def test_collect_media_alone_rejected_with_clear_message(tmp_path, monkeypatch):
+    # Same rule as `history`: `media` also depends on `channel_id`/
+    # `input_channel`, so `--phases media` without `channel` must fail fast.
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_media_only", "--phases", "media", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code != 0
+    assert "channel" in result.stdout
+    assert "AssertionError" not in result.stdout
+
+
+def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeypatch):
+    fx = _fixtures()
+    fx["history"] = [
+        {
+            "_": "message", "id": 1, "message": "", "date": 1767322445,
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 1, "access_hash": 1, "mime_type": "text/plain",
+                    "attributes": [{"_": "DocumentAttributeFilename", "file_name": "a.txt"}],
+                },
+            },
+        }
+    ]
+    fx["media"] = {1: b"hello"}
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(fx)
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_nomedia", "--phases", "channel,history",
+         "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "media" not in result.stdout
+
+    result2 = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_withmedia", "--media", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result2.exit_code == 0, result2.stdout
+    assert "media" in result2.stdout
+    downloaded_path = tmp_path / "clitest_withmedia" / "media"
+    assert downloaded_path.exists()
+    assert any(downloaded_path.rglob("*.txt"))
+
+
 def test_doctor_noncompliant_exits_nonzero(tmp_path, monkeypatch):
     async def fake_run_doctor(gateway, settings):
         del gateway, settings
