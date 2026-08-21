@@ -71,6 +71,28 @@ def test_collect_unsupported_target_exits_nonzero(tmp_path, monkeypatch):
     assert result.exit_code != 0
 
 
+def test_collect_history_alone_rejected_with_clear_message(tmp_path, monkeypatch):
+    # `history` depends on `channel_id`/`input_channel`, which only the
+    # `channel` collector populates *within one run* (access_hash isn't
+    # persisted between runs — see cli.py). Selecting `--phases history`
+    # alone must fail fast with an actionable message, not the raw
+    # `AssertionError` `HistoryCollector.collect` would otherwise raise.
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_history_only", "--phases", "history", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code != 0
+    assert "channel" in result.stdout
+    assert "AssertionError" not in result.stdout
+
+
 def test_doctor_noncompliant_exits_nonzero(tmp_path, monkeypatch):
     async def fake_run_doctor(gateway, settings):
         del gateway, settings
