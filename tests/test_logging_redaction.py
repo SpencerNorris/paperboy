@@ -47,3 +47,25 @@ def test_child_logger_is_also_redacted(tmp_path):
     text = logf.read_text()
     assert "TOPSECRET_SESSION_STRING" not in text
     assert "***" in text
+
+
+def test_exception_traceback_is_redacted(tmp_path):
+    """A secret inside an exception's message must not reach the log via exc_info."""
+    import json as _json
+
+    logf = tmp_path / "p.log"
+    configure_logging(logf, console=False)
+    register_secret("SUPER_SECRET_HASH_VALUE")
+    log = logging.getLogger("paperboy.cli")
+    try:
+        raise RuntimeError("boom with SUPER_SECRET_HASH_VALUE inside")
+    except RuntimeError:
+        log.error("operation failed", exc_info=True)
+
+    raw = logf.read_text()
+    assert "SUPER_SECRET_HASH_VALUE" not in raw
+    # the exc_info field exists and is masked, and the traceback still logged
+    line = _json.loads([ln for ln in raw.splitlines() if ln.strip()][-1])
+    assert "exc_info" in line
+    assert "***" in line["exc_info"]
+    assert "RuntimeError" in line["exc_info"]
