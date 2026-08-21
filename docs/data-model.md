@@ -2,8 +2,9 @@
 
 The complete reference for the SQLite database paperboy writes to
 `<data_dir>/<profile>/paperboy.sqlite` (default `./data/default/paperboy.sqlite`).
-The authoritative schema is `src/paperboy/store/migrations/0001_init.sql`; this
-document explains what each table and column means.
+The authoritative schema is `src/paperboy/store/migrations/*.sql`
+(`0001_init.sql` + per-feature files like `0002_web.sql`); this document
+explains what each table and column means.
 
 For a quick orientation and how to browse the data (Datasette, `sqlite3`), see
 the **"What's in the database"** section of the [README](../README.md).
@@ -280,6 +281,30 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | `sha256` | TEXT | Hash at write time. |
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |
+
+## Web (Phase 2)
+
+### `web_snapshots` — `t.me/s/` post captures + Wayback CDX index (migration `0002_web`)
+
+Append-only observation log (like `channel_snapshots`), written by the `web`
+collector (`collectors/web.py`) over `WebClient` — the allow-listed HTTP
+seam (`t.me`/`www.t.me`/`web.archive.org` only, spec §2). `source='tme'` is
+one row per post parsed off a `t.me/s/<name>` page; `source='wayback'` is
+one row per Wayback Machine CDX index entry for `t.me/s/<name>*` (the whole
+page snapshot index, not per-post — `msg_id` is `NULL`).
+
+| Column | Type | Meaning |
+|---|---|---|
+| `id` | INTEGER PK | Row id. |
+| `source` | TEXT | `tme` or `wayback`. |
+| `url` | TEXT | The post permalink (`tme`) or the CDX row's `original` URL (`wayback`). |
+| `fetched_at` | TEXT | When paperboy fetched this. |
+| `channel_username` | TEXT | The `t.me/s/<name>` username. |
+| `msg_id` | INTEGER | Post id (`tme` only; `NULL` for `wayback`). |
+| `timestamp` | TEXT | The post's `datetime` attribute (`tme`), or the CDX snapshot time converted to ISO-8601 UTC (`wayback`). |
+| `content_hash` | TEXT | SHA-256 of the post text (`tme`), or the CDX row's own `digest` (`wayback`). |
+| `raw` | TEXT (JSON) | The parsed post fields (`tme`) or the full CDX row (`wayback`) — the verbatim page/response itself is in `raw_records` (`kind='tme_page'`/`'wayback_cdx'`), not duplicated here. |
+| `meta_json` | TEXT (JSON) | `tme`: `views`, `author_signature`, `forwarded_from`, `tombstoned_in_store` (deleted-post recovery — set when this post id is tombstoned in `message_tombstones`, meaning the web page still serves content the MTProto API no longer will). `wayback`: `statuscode`, `length`, `mimetype`. |
 
 ## Full-text search
 

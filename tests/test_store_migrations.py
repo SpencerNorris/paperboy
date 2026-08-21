@@ -32,10 +32,11 @@ def test_add_raw_without_context(tmp_path):
 def test_reopen_does_not_reapply_migrations(tmp_path):
     path = tmp_path / "p.sqlite"
     with Store.open(path) as st:
+        first_open_count = st.conn.execute("select count(*) from schema_migrations").fetchone()[0]
         st.add_raw("x", {}, tier="stranger", context=None)
     with Store.open(path) as st:
         count = st.conn.execute("select count(*) from schema_migrations").fetchone()[0]
-        assert count == 1  # not reapplied / duplicated
+        assert count == first_open_count  # not reapplied / duplicated
         rows = st.conn.execute("select count(*) from raw_records").fetchone()[0]
         assert rows == 1
 
@@ -63,8 +64,17 @@ def test_expected_tables_exist(tmp_path):
             "custody_log",
             "run_events",
             "schema_migrations",
+            "web_snapshots",
         ):
             assert expected in names, f"missing table {expected}"
+
+
+def test_0002_web_migration_applied(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        applied = {
+            r["name"] for r in st.conn.execute("select name from schema_migrations")
+        }
+        assert "0002_web" in applied
 
 
 def test_messages_fts_tracks_inserts(tmp_path):

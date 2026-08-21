@@ -7,7 +7,7 @@ import pytest
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import load_settings
-from paperboy.recipes import collect_channel
+from paperboy.recipes import _default_collectors, collect_channel
 from paperboy.store.db import Store
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
@@ -50,6 +50,14 @@ async def test_collect_channel_honors_phases_filter(tmp_path):
         )
         assert [r.name for r in results] == ["channel"]
         assert st.conn.execute("select count(*) as n from messages").fetchone()["n"] == 0
+
+
+def test_default_collectors_registers_web_after_history():
+    # `web` is pure HTTP (no gateway/Budget) — this only checks it's wired
+    # into the default recipe; running it end to end needs a mocked
+    # WebClient (see tests/test_collector_web.py), not a real network call.
+    names = [c.name for c in _default_collectors()]
+    assert names == ["channel", "history", "web"]
 
 
 class _StubCollector:
