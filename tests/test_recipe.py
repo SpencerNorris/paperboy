@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from paperboy.budget import HardStop, PhaseStop
+from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import load_settings
 from paperboy.recipes import collect_channel
@@ -98,3 +98,24 @@ async def test_phase_stop_continues_to_next_phase(tmp_path):
         assert [r.name for r in results] == ["a", "b"]
         assert results[0].stopped == "phase_stop"
         assert results[1].stopped is None
+
+
+@pytest.mark.asyncio
+async def test_skip_and_record_continues_to_next_phase(tmp_path):
+    # SkipAndRecord (Budget's Disposition.SKIP: e.g. ChannelPrivateError,
+    # ChatAdminRequiredError) means "skip this RPC/collector, the run
+    # continues" — it must never abort the whole run (spec §8).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        collectors = [
+            _StubCollector("a", exc=SkipAndRecord("Channel is private")),
+            _StubCollector("b"),
+        ]
+        results = await collect_channel(
+            FakeGateway({}), st, load_settings("default", {}), parse_target("@durov"),
+            phases=["a", "b"], log=logging.getLogger("t"), collectors=collectors,
+        )
+        assert [r.name for r in results] == ["a", "b"]
+        assert results[0].stopped == "skip"
+        assert results[1].stopped is None
+        events = st.conn.execute("select kind from run_events order by id").fetchall()
+        assert [e["kind"] for e in events] == ["skip", "complete"]

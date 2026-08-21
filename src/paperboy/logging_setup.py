@@ -78,17 +78,27 @@ def configure_logging(path: Path, console: bool = True) -> None:
     for f in list(logger.filters):
         logger.removeFilter(f)
 
+    # A filter attached to the `paperboy` logger itself is only consulted
+    # by `Logger.filter()` for records logged *through that logger* — the
+    # app logs exclusively through children (`paperboy.cli`, the `log`
+    # threaded into recipes/collectors), and `Logger.callHandlers` never
+    # re-checks an ancestor logger's own filters for a record bubbling up
+    # from a child. Attaching one shared (stateless) `RedactionFilter`
+    # instance to each handler instead works for every record regardless of
+    # which logger emitted it, since `callHandlers` always applies each
+    # handler's own filters.
+    rf = RedactionFilter()
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(path, encoding="utf-8")
     file_handler.setFormatter(_JsonFormatter())
+    file_handler.addFilter(rf)
     logger.addHandler(file_handler)
 
     if console:
         from rich.logging import RichHandler
 
-        logger.addHandler(RichHandler(show_path=False))
-
-    # One filter on the logger (not per-handler) so redaction runs exactly
-    # once and every handler sees the same scrubbed record.
-    logger.addFilter(RedactionFilter())
+        rich_handler = RichHandler(show_path=False)
+        rich_handler.addFilter(rf)
+        logger.addHandler(rich_handler)

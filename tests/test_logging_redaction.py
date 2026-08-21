@@ -30,3 +30,20 @@ def test_multiple_secrets_all_masked(tmp_path):
     text = logf.read_text()
     assert "apihashvalue" not in text
     assert "sessionstringvalue" not in text
+
+
+def test_child_logger_is_also_redacted(tmp_path):
+    # The app logs exclusively through child loggers (`paperboy.cli`, the
+    # `log` threaded into recipes/collectors) — records that propagate up
+    # from a child are only ever checked against each *handler's* filters
+    # (`Logger.callHandlers`), never re-checked against an ancestor logger's
+    # own filters. The `RedactionFilter` must therefore live on the
+    # handlers, not just the `paperboy` logger, or secrets logged through
+    # any child logger reach the file unmasked.
+    logf = tmp_path / "p4.log"
+    configure_logging(logf, console=False)
+    register_secret("TOPSECRET_SESSION_STRING")
+    logging.getLogger("paperboy.cli").warning("session=%s", "TOPSECRET_SESSION_STRING")
+    text = logf.read_text()
+    assert "TOPSECRET_SESSION_STRING" not in text
+    assert "***" in text

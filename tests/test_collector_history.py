@@ -2,6 +2,7 @@ import logging
 
 import pytest
 
+from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext
 from paperboy.collectors.history import HistoryCollector
 from paperboy.config import load_settings
@@ -122,3 +123,29 @@ async def test_min_peer_recorded_with_message_provenance(tmp_path):
 def test_applies_to_channel_like_targets():
     assert HistoryCollector().applies_to(parse_target("@durov"))
     assert not HistoryCollector().applies_to(parse_target("#osint"))
+
+
+def _unset_ctx(st, gw):
+    # Mirrors what `collect_channel` builds before `channel` has run, and
+    # what it's left with if `channel` raised `PhaseStop` before setting
+    # `input_channel`/`channel_id` (e.g. a FLOOD_WAIT during resolve()).
+    return CollectContext(
+        gw, st, load_settings("default", {}), parse_target("@x"),
+        None, None, "stranger", logging.getLogger("t"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_raises_phase_stop_when_channel_context_unset(tmp_path):
+    gw = FakeGateway({"history": [_m(1)]})
+    with Store.open(tmp_path / "p.sqlite") as st, pytest.raises(PhaseStop):
+        await HistoryCollector().collect(_unset_ctx(st, gw))
+
+
+@pytest.mark.asyncio
+async def test_catch_up_raises_phase_stop_when_channel_context_unset(tmp_path):
+    gw = FakeGateway({
+        "channel_difference": {"_": "updates.channelDifferenceEmpty", "final": True, "pts": 1},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st, pytest.raises(PhaseStop):
+        await HistoryCollector().catch_up(_unset_ctx(st, gw))

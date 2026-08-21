@@ -13,6 +13,7 @@ collector from `channelFull.pts`.
 
 from __future__ import annotations
 
+from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.ids import msg_uri, peer_ref_uri, utc_now_iso
 from paperboy.store.edges import add_edge
@@ -42,8 +43,15 @@ class HistoryCollector:
         return target.is_channel_like
 
     async def collect(self, ctx: CollectContext) -> CollectResult:
-        assert ctx.input_channel is not None
-        assert ctx.channel_id is not None
+        if ctx.input_channel is None or ctx.channel_id is None:
+            # The `channel` phase didn't complete (e.g. it raised `PhaseStop`
+            # on a FLOOD_WAIT during resolve()/getFullChannel before setting
+            # these) — a handled disposition the recipe layer records and
+            # continues past, never a bare `AssertionError` crash.
+            raise PhaseStop(
+                "history skipped: channel context not established "
+                "(channel phase did not complete)"
+            )
         channel_id = ctx.channel_id
         counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
 
@@ -156,8 +164,11 @@ class HistoryCollector:
         gap probe for this channel is the caller's job (a future `watch`
         loop iteration or a plain re-run of `history`).
         """
-        assert ctx.input_channel is not None
-        assert ctx.channel_id is not None
+        if ctx.input_channel is None or ctx.channel_id is None:
+            raise PhaseStop(
+                "history skipped: channel context not established "
+                "(channel phase did not complete)"
+            )
         channel_id = ctx.channel_id
         counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
 

@@ -156,8 +156,14 @@ class Budget:
             if disposition is not Disposition.RETRY:
                 raise self._to_exception(disposition, exc) from exc
 
+            # `seconds` is only meaningful for a genuine FloodWaitError/
+            # FakeFlood retry; a transient ConnectionError/TimeoutError/OSError
+            # also classifies as RETRY but has no `.seconds`, so `getattr`
+            # falls back to 0 — guard `_record_flood` so those don't pollute
+            # `flood_log` with spurious (until=now, seconds=0) rows.
             seconds = getattr(exc, "seconds", 0)
-            self._record_flood(method, seconds)
+            if seconds > 0:
+                self._record_flood(method, seconds)
             await self._sleep(seconds)
             self._last_call[method] = self._clock.time()
             try:
@@ -169,7 +175,9 @@ class Budget:
                     # the same call — treat it as a phase stop so the caller
                     # doesn't spin. The next run will see the persisted
                     # cooldown via `_active_cooldown_seconds`.
-                    self._record_flood(method, getattr(exc2, "seconds", 0))
+                    seconds2 = getattr(exc2, "seconds", 0)
+                    if seconds2 > 0:
+                        self._record_flood(method, seconds2)
                     raise PhaseStop(str(exc2)) from exc2
                 if d2 is Disposition.PHASE_STOP:
                     self._record_flood(method, getattr(exc2, "seconds", 0))
