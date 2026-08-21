@@ -7,7 +7,7 @@ from paperboy.collectors.base import CollectContext
 from paperboy.collectors.history import HistoryCollector
 from paperboy.config import load_settings
 from paperboy.store.db import Store
-from paperboy.store.sync import get_state
+from paperboy.store.sync import get_state, set_state
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
 
@@ -149,3 +149,73 @@ async def test_catch_up_raises_phase_stop_when_channel_context_unset(tmp_path):
     })
     with Store.open(tmp_path / "p.sqlite") as st, pytest.raises(PhaseStop):
         await HistoryCollector().catch_up(_unset_ctx(st, gw))
+
+
+# --- generalization: explicit target + probe_gaps switch -------------------
+#
+# `discussion` reuses this same page loop against a linked group instead of
+# duplicating cursor/resumability/FLOOD_WAIT handling (plan Task 1). These
+# reuse this file's own `_m`/`_ctx` helpers rather than a `_msg` of their
+# own — `_m` already parameterizes the message id and accepts overrides via
+# `**extra`, and the channel the loop writes rows under is controlled
+# entirely by `collect()`'s `channel_id` kwarg (or `ctx.channel_id` by
+# default), never by anything inside the message payload itself, so no
+# helper change is needed to target a different channel.
+
+
+@pytest.mark.asyncio
+async def test_collect_defaults_to_the_context_channel(tmp_path):
+    """No kwargs => today's behaviour, bit for bit."""
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        rows = st.conn.execute("select channel_id from messages").fetchall()
+        assert {r["channel_id"] for r in rows} == {5}
+        assert res.counts["messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_an_explicit_channel(tmp_path):
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        rows = st.conn.execute("select channel_id from messages").fetchall()
+        assert {r["channel_id"] for r in rows} == {77}
+
+
+@pytest.mark.asyncio
+async def test_probe_gaps_false_writes_no_tombstones(tmp_path):
+    # ids 1 and 3 present, 2 missing: probing ON would tombstone 2.
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        assert res.counts["tombstones"] == 0
+        assert st.conn.execute("select count(*) c from message_tombstones").fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_gaps_true_still_tombstones(tmp_path):
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["tombstones"] == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_target_resumes_on_its_own_cursor(tmp_path):
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "history", "5", {"offset_id": 999})
+        await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        assert get_state(st, "history", "5") == {"offset_id": 999}
+        assert get_state(st, "history", "77") == {"offset_id": 1}
