@@ -296,15 +296,23 @@ per-subject deletion.
 
 ## 7. UNVERIFIED — first-spike smoke-test list
 
-1. Telethon 1.44.0 wheel's actual layer (`telethon.tl.alltlobjects.LAYER`) vs 228.
-2. `photos.getUserPhotos` on a privacy-restricted non-contact: empty vs partial.
-3. `stories.getPeerStories` / `storyItem.views` as a non-contact.
-4. `fragment.getCollectibleInfo` on a stranger's collectible.
-5. `channels.getParticipants(Admins)` on a broadcast channel as subscriber
-   (expected `CHAT_ADMIN_REQUIRED`).
-6. Real `Recent` yield on a mid-size supergroup with members visible.
-7. `messages.getHistory` on a public channel **without joining** (expected OK).
-8. `updates.getChannelDifference` passive mode without joining: delete events
-   arrive?
-9. `channelParticipantsMentions` returning non-participant commenters.
-10. FLOOD_WAIT onset for sequential `getFullUser` at 1 req/s on an aged account.
+Spike 1 (2026-08-20, `scripts/spike.py` against `@telegram`, a broadcast
+channel) settled items 1, 5, 7 and the recommendation-degree leak. The rest
+need different target types (a visible supergroup, a restricted non-contact, a
+stranger's collectible) and are settled by later spikes or in the DoD smoke.
+
+1. ~~Telethon wheel layer~~ — **SETTLED: layer 227**; all core raw methods present.
+2. `photos.getUserPhotos` on a privacy-restricted non-contact: empty vs partial. *(needs a restricted user target)*
+3. `stories.getPeerStories` / `storyItem.views` as a non-contact. *(needs a user with active stories)*
+4. `fragment.getCollectibleInfo` on a stranger's collectible. *(needs a collectible-holding target)*
+5. ~~`channels.getParticipants(Admins)` on a broadcast channel as subscriber~~ — **SETTLED: `CHAT_ADMIN_REQUIRED`**, as expected. Even the admin list is walled.
+6. Real `Recent` yield on a mid-size supergroup with members visible. *(needs a supergroup target)*
+7. ~~`messages.getHistory` on a public channel without joining~~ — **SETTLED: works un-joined** (resolve + getFullChannel + getHistory all succeed; @telegram: 9.78M subs, pts=736, hidden=False).
+8. `updates.getChannelDifference` passive mode without joining: delete events arrive? *(needs a watch window)*
+9. `channelParticipantsMentions` returning non-participant commenters. *(needs a channel with a linked discussion group)*
+10. FLOOD_WAIT onset for sequential `getFullUser` at 1 req/s on an aged account. *(needs a profiles run)*
+
+**Bonus (settled):** `channels.getChannelRecommendations` returns the true
+degree in `count` (87 for @telegram) while capping the returned list at 10 for a
+non-Premium account — the true similar-channel count leaks regardless of
+Premium.
