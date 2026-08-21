@@ -72,6 +72,10 @@ async def test_web_collector_stores_wayback_rows(tmp_path):
         collector = WebCollector(client=client, sleep=lambda s: None)
         res = await collector.collect(_ctx(st))
         assert res.counts["wayback_rows"] == 2
+        # the CDX query must be BOUNDED (unbounded returns 100+ MB on a
+        # heavily-archived channel and fails to parse)
+        cdx_calls = [c for c in calls if "web.archive.org/cdx" in c]
+        assert cdx_calls and "limit=" in cdx_calls[0] and "collapse=" in cdx_calls[0]
         rows = st.conn.execute(
             "SELECT url, timestamp, content_hash, meta_json FROM web_snapshots "
             "WHERE source='wayback' ORDER BY timestamp"
