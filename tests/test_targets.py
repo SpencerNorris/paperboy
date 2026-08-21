@@ -53,4 +53,4 @@ def test_unsupported_target_raises():
 def test_target_is_frozen():
     t = parse_target("@durov")
     with pytest.raises(Exception):  # noqa: B017, PT011 - frozen dataclass raises FrozenInstanceError
-        t.value = "x"
+        setattr(t, "value", "x")  # noqa: B010 - setattr avoids a static assignment to a frozen field

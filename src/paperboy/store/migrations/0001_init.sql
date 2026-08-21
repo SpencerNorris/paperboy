@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS channels (
     last_seen           TEXT NOT NULL
 );
 
+-- `peers` is the generic min-provenance-tracked projection for ANY entity id
+-- encountered (`user`, `channel`, `chat`) — not just users. `title` covers
+-- channel/chat-typed peers; `first_name`/`last_name` cover user-typed peers.
+-- The richer, channel-specific state (about, kind, linked_chat_id, ...)
+-- lives in `channels`, which a channel-typed peer row also has an entry in.
 CREATE TABLE IF NOT EXISTS peers (
     uri            TEXT PRIMARY KEY,
     kind           TEXT NOT NULL,
@@ -45,6 +50,7 @@ CREATE TABLE IF NOT EXISTS peers (
     username       TEXT,
     first_name     TEXT,
     last_name      TEXT,
+    title          TEXT,
     flags_json     TEXT,
     source_raw_id  INTEGER REFERENCES raw_records(id),
     first_seen     TEXT NOT NULL,
