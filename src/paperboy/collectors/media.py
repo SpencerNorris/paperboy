@@ -29,7 +29,7 @@ import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from paperboy.budget import PhaseStop
+from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import profile_dir
 from paperboy.ids import utc_now_iso
@@ -109,7 +109,10 @@ class MediaCollector:
                 "(channel phase did not complete)"
             )
         channel_id = ctx.channel_id
-        counts = {"downloaded": 0, "duplicates": 0, "unavailable": 0, "skipped_kind": 0}
+        counts = {
+            "downloaded": 0, "duplicates": 0, "unavailable": 0,
+            "skipped_kind": 0, "skipped": 0,
+        }
         media_root = profile_dir(ctx.settings, ctx.profile) / "media"
 
         content_index = self._load_content_index(ctx, channel_id)
@@ -135,9 +138,16 @@ class MediaCollector:
                 counts["duplicates"] += 1
                 continue
 
-            data = await ctx.gateway.download_media(
-                ctx.input_channel, {"id": row["msg_id"], "media": media}
-            )
+            try:
+                data = await ctx.gateway.download_media(
+                    ctx.input_channel, {"id": row["msg_id"], "media": media}
+                )
+            except SkipAndRecord as exc:
+                # A per-file skip (e.g. file_reference expired twice) must not
+                # abort the whole media phase — skip this one file and continue.
+                ctx.log.warning("media: skipping msg %s: %s", row["msg_id"], exc)
+                counts["skipped"] += 1
+                continue
             if data is None:
                 counts["unavailable"] += 1
                 continue

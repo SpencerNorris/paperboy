@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from paperboy.budget import PhaseStop
+from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext
 from paperboy.collectors.media import MediaCollector
 from paperboy.config import load_settings
@@ -267,3 +267,20 @@ async def test_collect_raises_phase_stop_when_channel_context_unset(tmp_path):
         )
         with pytest.raises(PhaseStop):
             await MediaCollector().collect(ctx)
+
+
+@pytest.mark.asyncio
+async def test_media_skip_and_record_skips_one_file_and_continues(tmp_path):
+    # A per-file SkipAndRecord (e.g. file_reference expired twice) must skip
+    # just that file, not abort the whole media phase.
+    settings = _settings(tmp_path)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, _doc_msg(1, doc_id=1001))
+        _seed(st, _doc_msg(2, doc_id=1002))
+        gw = FakeGateway(
+            {"media": {1: SkipAndRecord("file_reference expired twice"), 2: b"good bytes"}}
+        )
+        res = await MediaCollector().collect(_ctx(st, gw, settings))
+        assert res.counts["skipped"] == 1
+        assert res.counts["downloaded"] == 1
+        assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1

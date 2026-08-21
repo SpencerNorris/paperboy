@@ -124,8 +124,15 @@ async def test_web_collector_paginates_with_before_and_stops_on_empty_page(tmp_p
         await collector.collect(_ctx(st))
         tme_calls = [c for c in calls if c.startswith("https://t.me/s/durov")]
         assert len(tme_calls) == 2
+        # first call fetches the NEWEST posts (no ?before=), then pages backward
+        assert "?before" not in tme_calls[0]
         assert "before=523" in tme_calls[1]
-        assert get_state(st, "web_tme", "durov") == {"before": 523}
+        # state is a newest-seen high-water mark, not a backward resume cursor —
+        # so a later run re-fetches the newest posts rather than only continuing
+        # deeper into the past.
+        state = get_state(st, "web_tme", "durov")
+        assert state is not None
+        assert "before" not in state and "newest_seen" in state
 
 
 def test_applies_to_channel_like_targets():

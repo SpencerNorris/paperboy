@@ -19,11 +19,20 @@ from datetime import UTC, datetime
 
 
 def parse_cdx_rows(payload: list[list[str]]) -> list[dict[str, str]]:
-    """Zip the header row onto every following row; `[]`/header-only -> `[]`."""
-    if len(payload) < 2:
+    """Zip the header row onto every following row; `[]`/header-only -> `[]`.
+
+    A row whose length doesn't match the header (a malformed/truncated CDX
+    line) is skipped rather than crashing the whole `web` phase — the CDX
+    endpoint is a best-effort bonus vector, not worth aborting a collect over.
+    """
+    if not isinstance(payload, list) or len(payload) < 2:
         return []
     header, *rows = payload
-    return [dict(zip(header, row, strict=True)) for row in rows]
+    out: list[dict[str, str]] = []
+    for row in rows:
+        if isinstance(row, list) and len(row) == len(header):
+            out.append(dict(zip(header, row, strict=True)))
+    return out
 
 
 def cdx_timestamp_to_iso(timestamp: str) -> str | None:
