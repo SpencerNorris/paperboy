@@ -1,0 +1,17 @@
+{
+  "_": "SponsoredMessages",
+  "messages": [
+    {
+      "_": "SponsoredMessage",
+      "random_id": "AAAAAAAA",
+      "url": "https://t.me/sponsorchannel",
+      "title": "Sponsor Title",
+      "message": "Check this out",
+      "button_text": "View",
+      "sponsor_info": "Acme Corp",
+      "additional_info": "Promoted"
+    }
+  ],
+  "chats": [],
+  "users": []
+}

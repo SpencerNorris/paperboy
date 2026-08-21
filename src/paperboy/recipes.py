@@ -4,10 +4,13 @@ Runs `channel` (which populates `CollectContext.input_channel`/`channel_id`/
 `tier` for everything after it), then `history` (backfill, immediately
 followed by one `pts` catch-up so the channel's sync state is current as of
 *now*, not as of whenever backfill started — both folded into one `history`
-CollectResult). `media` (download+content-address every stored message's
-media) is opt-in — off by default, on via `collect_channel(..., media=True)`
-or `phases=[..., "media"]` — and runs after `history` so it has messages to
-walk. `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
+CollectResult), then `graph` (similar-channel recommendations, entity-derived
+mentions, invite-link previews, sponsored-message provenance — consumes
+`history`'s stored messages / `channel`'s context). `media` (download +
+content-address every stored message's media) is opt-in — off by default,
+on via `collect_channel(..., media=True)` or `phases=[..., "media"]`. Both
+`graph` and `media` run after `history` so they have messages to walk.
+`SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
 marked stopped, but later phases still run; `HardStop` is recorded and the
 whole run ends there (spec §8). A `run_events` row is written for every phase.
 """
@@ -21,6 +24,7 @@ from typing import TYPE_CHECKING
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
+from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.ids import utc_now_iso
@@ -35,11 +39,12 @@ if TYPE_CHECKING:
 
 
 def _default_collectors(*, include_media: bool) -> list[Collector]:
-    # `media` is opt-in (spec §6): a plain `collect` with no `--media` flag
-    # and no explicit `--phases media` stays metadata+history only, since
-    # downloading every file in a channel is a much bigger bandwidth/disk
-    # commitment than the rest of core v1.
-    collectors: list[Collector] = [ChannelCollector(), HistoryCollector()]
+    # `graph` consumes `history`'s stored messages + `channel`'s context, so
+    # it runs after both. `media` is opt-in (spec §6): a plain `collect` with
+    # no `--media` flag (and no explicit `--phases media`) stays
+    # metadata+history+graph only, since downloading every file in a channel
+    # is a much bigger bandwidth/disk commitment than the rest.
+    collectors: list[Collector] = [ChannelCollector(), HistoryCollector(), GraphCollector()]
     if include_media:
         collectors.append(MediaCollector())
     return collectors
@@ -90,16 +95,16 @@ async def collect_channel(
     media: bool = False,
     profile: str = "default",
 ) -> list[CollectResult]:
-    """Run `channel` then `history` (+ its `catch_up`), against `target`.
+    """Run `channel`, then `history` (+ its `catch_up`), then `graph`, against `target`.
 
     `phases` filters which collectors run by name (`None` runs all of the
-    *active* set). `media` (or naming `"media"` in `phases`) opts the
-    `media` collector into the active set — it's excluded by default (see
+    *active* set). `media` (or naming `"media"` in `phases`) opts the `media`
+    collector into the active set — it's excluded by default (see
     `_default_collectors`). `profile` is threaded into `CollectContext` only
-    for `media`'s content-addressed download path. `collectors` overrides
-    the default active list entirely — used by tests to inject a stub that
-    raises `HardStop`/`PhaseStop`/`SkipAndRecord` without needing a real
-    gateway failure to trigger one.
+    for `media`'s content-addressed download path. `collectors` overrides the
+    default active list entirely — used by tests to inject a stub that raises
+    `HardStop`/`PhaseStop`/`SkipAndRecord` without needing a real gateway
+    failure to trigger one.
     """
     ctx = CollectContext(gateway, store, settings, target, None, None, "stranger", log, profile)
     include_media = media or (phases is not None and "media" in phases)

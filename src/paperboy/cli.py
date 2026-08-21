@@ -131,7 +131,7 @@ async def _run_doctor(settings, secrets, profile: str, store):
 def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
-    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history,media"),
+    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history,graph,media"),
     join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
     media: bool = typer.Option(
         False, "--media", help="Also download message media (opt-in; off by default)."
@@ -140,7 +140,8 @@ def collect(
     max_rpc: int = typer.Option(None, "--max-rpc"),
     unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
 ) -> None:
-    """Collect channel metadata + full message history for TARGET."""
+    """Collect channel metadata, full message history, and the discovery/
+    relationship graph for TARGET."""
     if join:
         console.print(
             "[yellow]--join is accepted but not implemented in core v1 — "
@@ -159,22 +160,26 @@ def collect(
     parsed_target = parse_target(target)
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
-    if phase_list is not None and "channel" not in phase_list and (
-        "history" in phase_list or "media" in phase_list
-    ):
+    _dependent_phases = [
+        p for p in ("history", "graph", "media") if phase_list and p in phase_list
+    ]
+    if phase_list is not None and _dependent_phases and "channel" not in phase_list:
         # `channel` populates `CollectContext.input_channel`/`channel_id` (the
         # channel's numeric id + access_hash) for every later collector in
         # *this run* — it is per-process context, not reloaded from
         # `channels` even if a prior run already stored that channel, since
         # `access_hash` can rotate and isn't persisted. Selecting `history`
-        # or `media` without `channel` in the same run leaves that context
-        # unset and the collector would crash on its own assertion; reject it
-        # here instead, before any RPC (or even doctor/store setup) runs,
-        # with a clear, actionable message.
+        # `history`/`graph`/`media` each need `input_channel`/`channel_id`
+        # (the channel's numeric id + access_hash), which the `channel` phase
+        # sets for every later collector in the SAME run — it's per-process
+        # context, not reloaded from the store (access_hash can rotate and
+        # isn't persisted). Running any of them without `channel` leaves that
+        # context unset and the collector would crash; reject it here, before
+        # any RPC (or even doctor/store setup) runs, with a clear message.
         console.print(
-            "[red]--phases history/media requires channel in the same run[/] "
-            "(channel resolves the access hash they need — it isn't "
-            "persisted between runs). Pass --phases channel,history[,media], "
+            f"[red]--phases {','.join(_dependent_phases)} requires channel in the "
+            "same run[/] (channel resolves the access hash they need — it isn't "
+            "persisted between runs). Pass e.g. --phases channel,history,graph, "
             "or omit --phases to run the default set."
         )
         raise typer.Exit(code=1)

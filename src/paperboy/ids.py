@@ -31,6 +31,22 @@ def msg_uri(channel_id: int, msg_id: int) -> str:
     return f"{_SCHEME}:msg:{channel_id}/{msg_id}"
 
 
+def username_uri(name: str) -> str:
+    """A pseudo-URI for a bare `@name`/`t.me/name` reference that hasn't been
+    resolved to a numeric peer id (the `graph` collector's mention scan does
+    not spend an RPC resolving these — see its module docstring). Not one of
+    `parse_uri`'s numeric-id kinds — construct-only, never parsed back."""
+    return f"{_SCHEME}:username:{name}"
+
+
+def invite_uri(hash_: str) -> str:
+    """A pseudo-URI for a `t.me/+<hash>`/`t.me/joinchat/<hash>` invite link,
+    keyed by the hash itself rather than a numeric id (unjoined invite
+    previews carry no chat id — see the `graph` collector). Not one of
+    `parse_uri`'s numeric-id kinds — construct-only, never parsed back."""
+    return f"{_SCHEME}:invite:{hash_}"
+
+
 def primary_username(obj: dict) -> str | None:
     """Extract the canonical username from a TL `Channel`/`Chat`/`User` dict.
 
@@ -95,6 +111,60 @@ def parse_uri(uri: str) -> tuple[str, tuple[int, ...]]:
     except ValueError as e:
         raise ValueError(f"malformed paperboy URI: {uri!r}") from e
     return kind, ids
+
+
+def utf16_slice(text: str, offset: int, length: int) -> str:
+    """Slice `text` by UTF-16 code-unit offset/length, the unit Telegram's
+    `MessageEntity.offset`/`length` are always expressed in (not Python
+    `str` index, which counts codepoints) — matters once `text` contains any
+    character outside the Basic Multilingual Plane (most emoji), which
+    Python encodes as one codepoint but UTF-16 as a surrogate pair.
+    `errors="ignore"` guards a slice that lands mid-pair rather than raising.
+    """
+    encoded = text.encode("utf-16-le")
+    start, end = offset * 2, (offset + length) * 2
+    return encoded[start:end].decode("utf-16-le", errors="ignore")
+
+
+_TME_HOSTS = {"t.me", "telegram.me", "telegram.dog"}
+
+
+def parse_tme_link(url: str) -> tuple[str, str] | None:
+    """Parse a `t.me`/`telegram.me`/`telegram.dog` URL into `("username", name)`
+    or `("invite", hash)`, or `None` if `url` isn't a recognized Telegram link.
+
+    Handles `t.me/name` (and its `t.me/name/123` message-link / `t.me/s/name`
+    preview variants, both reduced to the bare username — resolving the
+    specific message is out of scope for this pass), `t.me/+hash`, and the
+    older `t.me/joinchat/hash` invite form. Not exhaustive: reserved paths
+    Telegram serves off `t.me` for other purposes (`t.me/share/...`,
+    `t.me/addstickers/...`, `t.me/proxy?...`, ...) are not denylisted, so
+    (username, "share") etc. is possible for those, a known limitation left
+    as a follow-up rather than a hand-maintained keyword list.
+    """
+    from urllib.parse import urlsplit
+
+    candidate = url if "://" in url else f"//{url}"
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if host not in _TME_HOSTS:
+        return None
+    segments = [s for s in parts.path.split("/") if s]
+    if not segments:
+        return None
+    first = segments[0]
+    if first.startswith("+") and len(first) > 1:
+        return ("invite", first[1:])
+    if first == "joinchat" and len(segments) > 1:
+        return ("invite", segments[1])
+    if first == "s" and len(segments) > 1:
+        first = segments[1]
+    if not first or first.startswith("+"):
+        return None
+    return ("username", first)
 
 
 def to_iso(dt: datetime | int) -> str:
