@@ -41,6 +41,7 @@ from paperboy.targets import Target
 _RECOMMENDED = "recommended_with"
 _MENTIONS = "mentions"
 _INVITED_VIA = "invited_via"
+_MEMBER_OF = "member_of"
 
 _RESOLVED_INVITE_KINDS = {"chatinvitealready", "chatinvitepeek"}
 
@@ -160,6 +161,28 @@ class GraphCollector:
                     "participants_count": preview.get("participants_count"),
                     "has_photo": preview.get("photo") is not None,
                 }
+
+            # `chatInvite.participants` is a *sample* of the members — the only
+            # roster data Telegram hands an account that has not joined (see
+            # docs/research/sources/mtproto-participants-users.md). It rotates
+            # between calls, so projecting it on every run accumulates real
+            # membership over time while collection stays passive. An unjoined
+            # invite exposes no numeric chat id, so the ChatInvite raw record —
+            # whose context carries the hash — is the only provenance there is.
+            for participant in preview.get("participants") or []:
+                peer_uri = upsert_peer(
+                    ctx.store, participant, raw_id, observed_at,
+                    seen_in_chat=None, seen_in_msg=None,
+                )
+                counts["peers"] += 1
+                add_edge(
+                    ctx.store, peer_uri, _MEMBER_OF, object_uri, observed_at, ctx.tier, raw_id,
+                    # `sampled` marks these as a handful out of
+                    # `participants_count`, so no reader mistakes the rows
+                    # present for the whole membership.
+                    {"sampled": True, "participants_count": preview.get("participants_count")},
+                )
+                counts["edges"] += 1
 
             for m_uri in msg_uris:
                 add_edge(
