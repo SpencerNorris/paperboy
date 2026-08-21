@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 
-from paperboy.ids import channel_uri, chat_uri, msg_uri, to_iso, user_uri
+from paperboy.ids import msg_uri, peer_ref_uri, to_iso
 from paperboy.store.db import Store, dumps
 
 _TOMBSTONE_SETS_DELETED_AT = {"update", "empty"}
@@ -29,20 +29,6 @@ def _iso_or_none(value: int | str | None) -> str | None:
     if isinstance(value, str):
         return value
     return to_iso(value)
-
-
-def _peer_uri(peer: dict | None) -> str | None:
-    """Convert a TL `Peer*`/`InputPeer*` dict to a paperboy URI, or None."""
-    if not peer:
-        return None
-    kind = peer.get("_", "")
-    if kind in ("peerUser", "inputPeerUser"):
-        return user_uri(peer["user_id"])
-    if kind in ("peerChannel", "inputPeerChannel"):
-        return channel_uri(peer["channel_id"])
-    if kind in ("peerChat", "inputPeerChat"):
-        return chat_uri(peer["chat_id"])
-    return None
 
 
 def upsert_message(
@@ -81,7 +67,7 @@ def upsert_message(
 
     date = _iso_or_none(msg.get("date"))
     edit_date = _iso_or_none(msg.get("edit_date"))
-    from_uri = _peer_uri(msg.get("from_id"))
+    from_uri = peer_ref_uri(msg.get("from_id"))
     post_author = msg.get("post_author")
     grouped_id = msg.get("grouped_id")
     via_bot_id = msg.get("via_bot_id")
