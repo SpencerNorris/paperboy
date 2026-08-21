@@ -31,6 +31,7 @@ from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.web import WebCollector
 from paperboy.ids import utc_now_iso
+from paperboy.progress import Progress
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -121,38 +122,51 @@ async def collect_channel(
     selected = set(phases) if phases is not None else {c.name for c in active}
 
     results: list[CollectResult] = []
-    for collector in active:
-        if collector.name not in selected or not collector.applies_to(target):
-            continue
-        try:
-            result = await _run_one(collector, ctx)
-        except SkipAndRecord as exc:
-            # Disposition.SKIP (e.g. ChannelPrivateError, ChatAdminRequiredError,
-            # MsgIdInvalidError, BroadcastForbiddenError, PremiumAccountRequiredError):
-            # skip this one collector, the run continues (spec §8) — this must
-            # never abort the whole run, unlike PhaseStop/HardStop below.
-            log.warning("phase %s skipped: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "skip", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
-            continue
-        except PhaseStop as exc:
-            log.warning("phase %s stopped: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "phase_stop", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="phase_stop"))
-            continue
-        except HardStop as exc:
-            log.error("hard stop during %s: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "hard_stop", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="hard_stop"))
-            break
-        else:
-            _record_run_event(
-                store, ctx.channel_id, collector.name, "complete",
-                {"counts": result.counts, "stopped": result.stopped},
-            )
-            results.append(result)
+    progress = Progress(store, log)
+    progress.begin()
+    try:
+        for collector in active:
+            if collector.name not in selected or not collector.applies_to(target):
+                continue
+            progress.start_phase(collector.name)
+            try:
+                result = await _run_one(collector, ctx)
+            except SkipAndRecord as exc:
+                # Disposition.SKIP (e.g. ChannelPrivateError, ChatAdminRequiredError,
+                # MsgIdInvalidError, BroadcastForbiddenError, PremiumAccountRequiredError):
+                # skip this one collector, the run continues (spec §8) — this must
+                # never abort the whole run, unlike PhaseStop/HardStop below.
+                progress.end_phase(collector.name, None, stopped="skip")
+                log.warning("phase %s skipped: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "skip", {"error": str(exc)}
+                )
+                results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
+                continue
+            except PhaseStop as exc:
+                progress.end_phase(collector.name, None, stopped="phase_stop")
+                log.warning("phase %s stopped: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "phase_stop", {"error": str(exc)}
+                )
+                results.append(CollectResult(name=collector.name, counts={}, stopped="phase_stop"))
+                continue
+            except HardStop as exc:
+                progress.end_phase(collector.name, None, stopped="hard_stop")
+                log.error("hard stop during %s: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "hard_stop", {"error": str(exc)}
+                )
+                results.append(CollectResult(name=collector.name, counts={}, stopped="hard_stop"))
+                break
+            else:
+                progress.end_phase(collector.name, result.counts)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "complete",
+                    {"counts": result.counts, "stopped": result.stopped},
+                )
+                results.append(result)
+    finally:
+        await progress.close()
 
     return results
