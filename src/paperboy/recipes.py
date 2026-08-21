@@ -81,12 +81,12 @@ async def collect_channel(
     *,
     collectors: Sequence[Collector] | None = None,
 ) -> list[CollectResult]:
-    """Run `channel` then `history` (+ its `catch_up`) against `target`.
+    """Run `channel`, then `history` (+ its `catch_up`), then `graph`, against `target`.
 
     `phases` filters which collectors run by name (`None` runs all).
-    `collectors` overrides the default `[ChannelCollector(), HistoryCollector()]`
-    list — used by tests to inject a stub that raises `HardStop`/`PhaseStop`
-    without needing a real gateway failure to trigger one.
+    `collectors` overrides the default `[ChannelCollector(), HistoryCollector(),
+    GraphCollector()]` list — used by tests to inject a stub that raises
+    `HardStop`/`PhaseStop` without needing a real gateway failure to trigger one.
     """
     ctx = CollectContext(gateway, store, settings, target, None, None, "stranger", log)
     active = collectors if collectors is not None else _default_collectors()
