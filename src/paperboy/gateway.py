@@ -157,20 +157,31 @@ class FakeGateway:
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         del input_channel
-        return self._fx_or_raise("channel_recommendations")
+        return self._fx_or_raise(
+            "channel_recommendations", {"_": "messages.chats", "chats": []}
+        )
 
     async def check_chat_invite(self, hash_: str) -> dict:
         table: dict[str, dict] = self._fx.get("chat_invite", {})
-        value = table[hash_]
+        value = table.get(hash_)
+        if value is None:
+            return {"_": "chatInvite", "title": "", "participants_count": 0}
         if isinstance(value, BaseException):
             raise value
         return value
 
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
         del input_channel
-        return self._fx_or_raise("sponsored_messages")
+        return self._fx_or_raise(
+            "sponsored_messages", {"_": "messages.sponsoredMessagesEmpty"}
+        )
 
-    def _fx_or_raise(self, key: str) -> dict:
+    def _fx_or_raise(self, key: str, default: dict | None = None) -> dict:
+        # Missing fixture => a benign, correctly-shaped empty (a channel may
+        # genuinely have no recommendations/sponsored messages), unless the test
+        # configured a BaseException to simulate Budget.call's classification.
+        if key not in self._fx:
+            return {} if default is None else default
         value = self._fx[key]
         if isinstance(value, BaseException):
             raise value

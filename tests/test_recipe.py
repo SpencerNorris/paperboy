@@ -75,7 +75,8 @@ async def test_collect_channel_media_flag_opts_in(tmp_path):
             gw, st, load_settings("default", {"data_dir": tmp_path}), parse_target("@durov"),
             phases=None, log=logging.getLogger("t"), media=True, profile="mediarecipe",
         )
-        assert [r.name for r in results] == ["channel", "history", "media"]
+        # graph is in the default set now (opt-in media appends after it)
+        assert [r.name for r in results] == ["channel", "history", "graph", "media"]
         media_result = next(r for r in results if r.name == "media")
         assert media_result.counts["downloaded"] == 1
         assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1
