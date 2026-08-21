@@ -40,6 +40,9 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         ChannelPrivateError,
         ChatAdminRequiredError,
         ChatNotModifiedError,
+        InviteHashEmptyError,
+        InviteHashExpiredError,
+        InviteHashInvalidError,
         MsgIdInvalidError,
         PremiumAccountRequiredError,
     )
@@ -55,6 +58,12 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         # return" case (no recommendations, ads disabled, invite already
         # known unchanged) — skip that one RPC, the phase continues.
         ChatNotModifiedError,
+        # A t.me/+<hash> invite link in a message can be dead by the time we
+        # preview it (checkChatInvite) — expired / invalid / empty. That is one
+        # dead link, not a run-ending failure: skip that preview, continue.
+        InviteHashExpiredError,
+        InviteHashInvalidError,
+        InviteHashEmptyError,
     )
 
 

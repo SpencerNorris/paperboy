@@ -18,6 +18,19 @@ def test_peer_flood_is_hard_stop():
     assert classify(FakePeerFlood()) == Disposition.HARD_STOP
 
 
+def test_expired_invite_hash_classifies_as_skip():
+    # A t.me/+<hash> invite link can be dead by preview time (checkChatInvite).
+    # It must SKIP that one preview, not abort the whole run.
+    from telethon.errors import (
+        InviteHashEmptyError,
+        InviteHashExpiredError,
+        InviteHashInvalidError,
+    )
+
+    for exc in (InviteHashExpiredError, InviteHashInvalidError, InviteHashEmptyError):
+        assert classify(exc(None)) == Disposition.SKIP
+
+
 def test_unrecognized_exception_is_reraised():
     class Weird(Exception):
         pass
