@@ -488,7 +488,8 @@ a description of whatever they happened to build."
 ### Task 1: Generalize `HistoryCollector`
 
 **Files:**
-- Modify: `src/paperboy/collectors/history.py:45-89`
+- Modify: `src/paperboy/collectors/history.py:45-89` — **this task is the sole
+  owner of this file.** No other task may edit it.
 
 **Interfaces:**
 - Consumes: nothing.
@@ -579,12 +580,35 @@ In `_probe_gaps`, add `input_channel: dict,` after `channel_id: int,` in the sig
             results = await ctx.gateway.get_messages(input_channel, chunk)
 ```
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 6: Add the page-budget stop**
+
+The sweep must not run unbounded. Add a `page_budget: int | None = None`
+keyword to `collect()` (documented as "max pages; `None` = unbounded, the
+Phase 1 default"), and count pages inside the `while True:` loop:
+
+```python
+        pages = 0
+        while True:
+            ...
+            cursor = min(m["id"] for m in page)
+            set_state(ctx.store, "history", str(channel_id), {"offset_id": cursor})
+            pages += 1
+            if page_budget is not None and pages >= page_budget:
+                raise PhaseStop(
+                    f"page budget ({page_budget}) reached at offset_id={cursor}; "
+                    "re-run to continue from the saved cursor"
+                )
+```
+
+The check sits **after** `set_state`, so the cursor is always persisted before
+the stop and a re-run resumes rather than restarts.
+
+- [ ] **Step 7: Run the tests**
 
 Run: `uv run pytest tests/test_collector_history.py tests/test_history_catchup.py -q`
 Expected: all pass, including the five new ones. **If you needed to edit any pre-existing test, revert and rethink — that is the regression contract failing.**
 
-- [ ] **Step 7: Lint, type-check, commit**
+- [ ] **Step 8: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -749,6 +773,7 @@ fail rather than being assumed."
 **Files:**
 - Create: `src/paperboy/collectors/discussion.py`
 - Modify: `src/paperboy/config.py:49` — add `discussion_page_budget: int = 500`
+- **Must not touch** `src/paperboy/collectors/history.py` (Task 1 owns it).
 
 **Interfaces:**
 - Consumes: `HistoryCollector.collect(ctx, *, channel_id, input_channel, probe_gaps)` from Task 1; `backfill_recent_repliers(store, channel_id, tier) -> int` from Task 2. Code against these signatures — do not wait for those tasks to land.
@@ -927,24 +952,10 @@ class DiscussionCollector:
         return mirrors
 ```
 
-- [ ] **Step 4: Enforce the page budget**
+- [ ] **Step 4: Pass the page budget down**
 
-`HistoryCollector` has no page cap. Add one, driven by the setting, so the sweep cannot run unbounded. In `src/paperboy/collectors/history.py`, add a `page_budget: int | None = None` keyword to `collect()`, and inside the `while True:` loop count pages:
-
-```python
-        pages = 0
-        while True:
-            ...
-            pages += 1
-            if page_budget is not None and pages >= page_budget:
-                set_state(ctx.store, "history", str(channel_id), {"offset_id": cursor})
-                raise PhaseStop(
-                    f"discussion page budget ({page_budget}) reached at offset_id={cursor}; "
-                    "re-run to continue from the saved cursor"
-                )
-```
-
-Place the check **after** `set_state`, so the cursor is always persisted before the stop. Then in `discussion.py`, pass it:
+`HistoryCollector` owns the page counter (Task 1, Step 6). `discussion` only
+supplies the value:
 
 ```python
         sweep = await HistoryCollector().collect(
@@ -953,7 +964,8 @@ Place the check **after** `set_state`, so the cursor is always persisted before 
         )
 ```
 
-Note for the reviewer: this widens Task 1's interface. It is placed here rather than in Task 1 because only `discussion` needs it and the default keeps `history` unbounded exactly as today.
+**Do not edit `src/paperboy/collectors/history.py` in this task.** Task 1 owns
+that file; touching it here is what would make these two tasks collide.
 
 - [ ] **Step 5: Run the tests**
 
