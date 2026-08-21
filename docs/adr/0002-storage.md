@@ -5,7 +5,7 @@
 ## Problem
 Store an exhaustive, re-queryable, forensically-sound channel corpus that
 survives TL schema growth, supports incremental sync, versions edits, and
-dovetails with the user's Datasette/tapedeck workflow — without prematurely
+dovetails with a Datasette-based analysis workflow — without prematurely
 committing to a graph database.
 
 ## Options
@@ -29,8 +29,7 @@ The corpus is mostly tabular by volume (messages × 30+ fields needing FTS,
 media hashes, counter time-series); the graph part is real but shallow (1–2
 hops), which SQL joins handle trivially. Provenance ("seen at T, at tier X,
 from record R") is three columns in SQL but needs reification/RDF-star in a
-triple store. The user's whole toolchain (FTS5, Datasette, tapedeck) is
-SQLite. We keep the triple shape so nothing is lost.
+triple store. The target toolchain (FTS5, Datasette) is SQLite. We keep the triple shape so nothing is lost.
 
 ## Consequences
 - A layer bump means re-parsing `raw_records`, not re-scraping.
