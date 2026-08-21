@@ -4,7 +4,10 @@ Runs `channel` (which populates `CollectContext.input_channel`/`channel_id`/
 `tier` for everything after it), then `history` (backfill, immediately
 followed by one `pts` catch-up so the channel's sync state is current as of
 *now*, not as of whenever backfill started — both folded into one `history`
-CollectResult). `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
+CollectResult), then `graph` (similar-channel recommendations, entity-derived
+mentions, invite-link previews, sponsored-message provenance — all consume
+`history`'s stored messages/`channel`'s context, so they run last).
+`SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
 marked stopped, but later phases still run; `HardStop` is recorded and the
 whole run ends there (spec §8). A `run_events` row is written for every phase.
 """
@@ -18,6 +21,7 @@ from typing import TYPE_CHECKING
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
+from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.ids import utc_now_iso
 from paperboy.store.db import dumps
@@ -31,7 +35,7 @@ if TYPE_CHECKING:
 
 
 def _default_collectors() -> list[Collector]:
-    return [ChannelCollector(), HistoryCollector()]
+    return [ChannelCollector(), HistoryCollector(), GraphCollector()]
 
 
 def _record_run_event(
