@@ -175,6 +175,46 @@ LUKS on Linux, BitLocker/VeraCrypt on Windows. Every TL object is stored raw in
 `raw_records` before it is projected into the normalized tables, so a Telegram
 schema bump can be re-parsed rather than re-scraped.
 
+## What's in the database
+
+The store is one SQLite file with an FTS index — browse it with
+[Datasette](https://datasette.io) (`uvx datasette ./data/default/paperboy.sqlite`)
+or query it with `sqlite3`. The tables you'll actually read:
+
+| Table | What it holds |
+|---|---|
+| `channels` | the channel itself — id, username, title, `participants_count`, about, flags |
+| `messages` | current state of every message — `text`, `date`, `from_uri`, `media_kind`, `deleted_at`, `content_hash` |
+| `message_revisions` | append-only edit history — every version of a message you've observed |
+| `message_tombstones` | deleted messages, with how the deletion was detected (`update`/`empty`/`gap`) |
+| `message_metrics` | time series of `views` / `forwards` / `replies` per message |
+| `edges` | the graph — `(subject, predicate, object)`, e.g. `forwarded_from` |
+| `peers` | every user/channel seen, with `min`-provenance |
+| `raw_records` | every raw Telegram object as received — the system of record |
+| `messages_fts` | full-text index over message text |
+
+A few useful queries:
+
+```sql
+-- recent posts with view counts
+SELECT m.msg_id, substr(m.date,1,10) AS date, m.text, mm.views
+FROM messages m LEFT JOIN message_metrics mm ON mm.message_uri = m.uri
+WHERE m.text <> '' ORDER BY m.msg_id DESC LIMIT 20;
+
+-- full-text search
+SELECT m.msg_id, m.text
+FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+WHERE messages_fts MATCH 'your query' ORDER BY m.msg_id DESC;
+
+-- what got deleted
+SELECT message_uri, evidence, observed_at FROM message_tombstones;
+```
+
+**Full column-by-column reference: [`docs/data-model.md`](docs/data-model.md).**
+Note that message ids are sequential per channel but only non-deleted,
+non-service messages carry text — gaps are deletions (see `message_tombstones`),
+not missing data.
+
 ## Safety & guardrails
 
 paperboy is deliberately constrained (enforced in code, not just docs):
@@ -202,6 +242,7 @@ uv run pyright            # type-check
 ## Documentation
 
 - [`docs/opsec.md`](docs/opsec.md) — operator security runbook.
+- [`docs/data-model.md`](docs/data-model.md) — the database codebook (every table and column).
 - [`docs/features/collect-channel.md`](docs/features/collect-channel.md) — the core feature, with the live smoke transcript.
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.
 - [`docs/superpowers/specs/2026-08-20-paperboy-design.md`](docs/superpowers/specs/2026-08-20-paperboy-design.md) — the design.
