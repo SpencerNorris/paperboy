@@ -1,3 +1,5 @@
+import json
+
 from paperboy.store.db import Store
 from paperboy.store.peers import upsert_peer
 
@@ -56,3 +58,30 @@ def test_channel_typed_peer_stores_title(tmp_path):
         row = st.conn.execute("select kind, title from peers where uri=?", (uri,)).fetchone()
         assert row["kind"] == "channel"
         assert row["title"] == "Durov"
+
+
+def test_join_to_send_flag_is_persisted(tmp_path):
+    """`join_to_send` is the passivity guardrail the `discussion` collector's
+    preflight relies on to decide whether reading a linked group requires
+    membership (design spec §4.3) — `docs/data-model.md` already documents
+    it as a stored flag. `_FLAG_KEYS` currently omits it, so it is silently
+    dropped here: `upsert_peer` of a `Channel` carrying `join_to_send: True`
+    stores `flags_json` with no trace of it, which is a production gap
+    (`_FLAG_KEYS` needs `"join_to_send"` added), not a test-fixture problem.
+    Pinning it here means the discussion-collector test that seeds this
+    flag through `upsert_peer` cannot be made to pass by writing
+    `flags_json` directly in that test's own helper instead of fixing this
+    projection — see `tests/test_collector_discussion.py::
+    test_skips_when_the_group_requires_joining_to_read`."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        chan = {
+            "_": "Channel", "id": 77, "access_hash": 4242, "title": "C Chat",
+            "megagroup": True, "join_to_send": True,
+        }
+        r = st.add_raw("channel", chan, "stranger", None)
+        uri = upsert_peer(
+            st, chan, r, "2026-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None
+        )
+        row = st.conn.execute("select flags_json from peers where uri=?", (uri,)).fetchone()
+        flags = json.loads(row["flags_json"]) if row["flags_json"] else {}
+        assert flags.get("join_to_send") is True

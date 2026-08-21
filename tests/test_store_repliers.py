@@ -1,0 +1,162 @@
+"""`recent_repliers` arrives free inside every stored Message payload."""
+
+from __future__ import annotations
+
+import json
+
+from paperboy.store.repliers import backfill_recent_repliers
+
+from paperboy.store.db import Store
+
+
+def _post(store: Store, channel_id: int, msg_id: int, repliers: list[dict]) -> None:
+    store.add_raw(
+        "Message",
+        {
+            "_": "Message", "id": msg_id, "peer_id": {"_": "PeerChannel", "channel_id": channel_id},
+            "replies": {
+                "_": "MessageReplies", "comments": True, "channel_id": 2918715880,
+                "replies": len(repliers), "recent_repliers": repliers,
+            },
+        },
+        "stranger",
+        {"channel_id": channel_id},
+    )
+
+
+def test_projects_peeruser_repliers_into_peers(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        n = backfill_recent_repliers(st, 5, "stranger")
+        assert n == 1
+        row = st.conn.execute("select kind, is_min from peers where uri='tg:user:111'").fetchone()
+        assert row["kind"] == "user"
+        assert row["is_min"] == 1
+
+
+def test_projects_peerchannel_repliers_too(tmp_path):
+    """The live capture contains a PeerChannel replier — do not assume users."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerChannel", "channel_id": 2207320787}])
+        backfill_recent_repliers(st, 5, "stranger")
+        row = st.conn.execute(
+            "select kind from peers where uri='tg:channel:2207320787'"
+        ).fetchone()
+        assert row is not None
+        assert row["kind"] == "channel"
+
+
+def test_records_min_provenance_pointing_at_the_post(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        backfill_recent_repliers(st, 5, "stranger")
+        row = st.conn.execute(
+            "select seen_in_chat, seen_in_msg from peers where uri='tg:user:111'"
+        ).fetchone()
+        assert row["seen_in_chat"] == 5
+        assert row["seen_in_msg"] == 10
+
+
+def test_emits_commented_on_from_person_to_post(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        backfill_recent_repliers(st, 5, "stranger")
+        row = st.conn.execute(
+            "select subject_uri, object_uri from edges where predicate='commented_on'"
+        ).fetchone()
+        assert row["subject_uri"] == "tg:user:111"
+        assert row["object_uri"] == "tg:msg:5/10"
+
+
+def test_commented_on_evidence_marks_the_recent_repliers_source(tmp_path):
+    """`commented_on` is emitted by two producers (this backfill and the
+    `discussion` sweep's `_write_thread_edges`) — the evidence field is the
+    only way downstream consumers can tell them apart, so pin it here rather
+    than let it silently drift to `None`."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        backfill_recent_repliers(st, 5, "stranger")
+        row = st.conn.execute(
+            "select evidence_json from edges where predicate='commented_on'"
+        ).fetchone()
+        assert row["evidence_json"] is not None
+        assert json.loads(row["evidence_json"])["source"] == "recent_repliers"
+
+
+def test_stores_the_given_tier_on_the_edge(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        backfill_recent_repliers(st, 5, "member")
+        row = st.conn.execute(
+            "select tier from edges where predicate='commented_on'"
+        ).fetchone()
+        assert row["tier"] == "member"
+
+
+def test_counts_distinct_peers_not_occurrences(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        _post(st, 5, 11, [{"_": "PeerUser", "user_id": 111}])
+        assert backfill_recent_repliers(st, 5, "stranger") == 1
+
+
+def test_posts_without_repliers_are_ignored(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        st.add_raw("Message", {"_": "Message", "id": 10}, "stranger", {"channel_id": 5})
+        assert backfill_recent_repliers(st, 5, "stranger") == 0
+        assert st.conn.execute("select count(*) c from peers").fetchone()["c"] == 0
+
+
+def test_unrecognized_replier_kind_is_skipped_not_crashed(tmp_path):
+    """`_peer_stub` only understands `PeerUser`/`PeerChannel`. A `PeerChat`
+    (a legacy basic-group replier, or any future discriminator) must be
+    silently skipped — not raise, and not counted as a projected peer."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerChat", "chat_id": 333}])
+        n = backfill_recent_repliers(st, 5, "stranger")
+        assert n == 0
+        assert st.conn.execute("select count(*) c from peers").fetchone()["c"] == 0
+
+
+def test_scans_only_the_target_channels_raw_messages(tmp_path):
+    """The store is one SQLite file per PROFILE, not per channel/target
+    (`profile_dir(settings, profile)/paperboy.sqlite`) — a second channel's
+    `Message` payloads sitting in the same `raw_records` table must never
+    leak into another channel's backfill. `add_raw` already tags every raw
+    record with `context_json = {"channel_id": ...}`; the scan must filter
+    on it rather than trusting the `channel_id` argument alone to describe
+    what's in the table."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        _post(st, 999, 10, [{"_": "PeerUser", "user_id": 222}])
+        assert backfill_recent_repliers(st, 5, "stranger") == 1
+        assert st.conn.execute(
+            "select count(*) c from peers where uri='tg:user:222'"
+        ).fetchone()["c"] == 0
+        assert st.conn.execute(
+            "select count(*) c from edges where object_uri='tg:msg:5/10' "
+            "and subject_uri='tg:user:222'"
+        ).fetchone()["c"] == 0
+
+
+def test_repeated_backfill_does_not_duplicate_the_peer_row(tmp_path):
+    """`edges` is an append-only observation log by design (ADR-0002):
+    `store/edges.py::add_edge` is a bare INSERT and `edges` carries no
+    unique index (`migrations/0001_init.sql` gives it only a plain
+    `idx_edges_subject`), and the same is true of every other edge producer
+    in this codebase (`channel`, `history`, `graph`). Asserting a fixed
+    `commented_on` row count after two runs is therefore not something the
+    spec calls for, and forcing it here would desynchronize this producer's
+    dedup semantics from the sweep's `_write_thread_edges`, which re-scans
+    and re-emits every edge on every run with no dedup story of its own
+    either. What IS promised — and what actually matters for correctness —
+    is that the peer projection (`upsert_peer`) is idempotent and that the
+    backfill's distinct-peer count is stable across repeated runs."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
+        first = backfill_recent_repliers(st, 5, "stranger")
+        second = backfill_recent_repliers(st, 5, "stranger")
+        assert first == second == 1
+        assert st.conn.execute(
+            "select count(*) c from peers where uri='tg:user:111'"
+        ).fetchone()["c"] == 1

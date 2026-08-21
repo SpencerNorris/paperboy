@@ -1,0 +1,65 @@
+[
+  {
+    "_": "Message",
+    "id": 4102,
+    "message": "",
+    "date": 1767322445,
+    "peer_id": { "_": "PeerChannel", "channel_id": 2918715880 },
+    "fwd_from": {
+      "_": "MessageFwdHeader",
+      "channel_post": 801,
+      "from_id": { "_": "PeerChannel", "channel_id": 2541889325 }
+    }
+  },
+  {
+    "_": "Message",
+    "id": 4105,
+    "message": "this is a huge win",
+    "date": 1767322500,
+    "peer_id": { "_": "PeerChannel", "channel_id": 2918715880 },
+    "from_id": { "_": "PeerUser", "user_id": 8867058919 },
+    "reply_to": {
+      "_": "MessageReplyHeader",
+      "reply_to_msg_id": 4102,
+      "reply_to_top_id": 4102
+    }
+  },
+  {
+    "_": "Message",
+    "id": 4106,
+    "message": "agreed, this changes things",
+    "date": 1767322560,
+    "peer_id": { "_": "PeerChannel", "channel_id": 2918715880 },
+    "from_id": { "_": "PeerUser", "user_id": 6877317589 },
+    "reply_to": {
+      "_": "MessageReplyHeader",
+      "reply_to_msg_id": 4105,
+      "reply_to_top_id": 4102
+    }
+  },
+  {
+    "_": "Message",
+    "id": 4107,
+    "message": "-",
+    "date": 1767322610,
+    "peer_id": { "_": "PeerChannel", "channel_id": 2918715880 },
+    "from_id": { "_": "PeerChannel", "channel_id": 2207320787 },
+    "reply_to": {
+      "_": "MessageReplyHeader",
+      "reply_to_msg_id": 4102,
+      "reply_to_top_id": 4102
+    }
+  },
+  {
+    "_": "Message",
+    "id": 4110,
+    "message": "does anyone have a source for this",
+    "date": 1767322700,
+    "peer_id": { "_": "PeerChannel", "channel_id": 2918715880 },
+    "reply_to": {
+      "_": "MessageReplyHeader",
+      "reply_to_msg_id": 9999,
+      "reply_to_top_id": 9999
+    }
+  }
+]
