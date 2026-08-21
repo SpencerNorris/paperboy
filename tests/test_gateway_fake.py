@@ -33,10 +33,10 @@ async def test_fake_history_respects_limit():
 
 @pytest.mark.asyncio
 async def test_fake_get_messages_fills_unknown_ids_with_message_empty():
-    gw = FakeGateway({"get_messages": {3: {"_": "messageEmpty", "id": 3}}})
+    gw = FakeGateway({"get_messages": {3: {"_": "MessageEmpty", "id": 3}}})
     result = await gw.get_messages({"channel_id": 7}, [3, 4])
-    assert result[0] == {"_": "messageEmpty", "id": 3}
-    assert result[1] == {"_": "messageEmpty", "id": 4}
+    assert result[0] == {"_": "MessageEmpty", "id": 3}
+    assert result[1] == {"_": "MessageEmpty", "id": 4}
 
 
 @pytest.mark.asyncio

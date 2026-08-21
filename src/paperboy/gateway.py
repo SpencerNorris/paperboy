@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
-    from telethon.tl.tlobject import TLObject
     from telethon.tl.types import InputChannel, InputPeerChannel
 
     from paperboy.budget import Budget
@@ -98,7 +97,7 @@ class FakeGateway:
     async def get_messages(self, input_channel: dict, ids: list[int]) -> list[dict]:
         del input_channel
         table: dict[int, dict] = self._fx.get("get_messages", {})
-        return [table.get(i, {"_": "messageEmpty", "id": i}) for i in ids]
+        return [table.get(i, {"_": "MessageEmpty", "id": i}) for i in ids]
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         del input_channel, pts, limit
@@ -219,6 +218,7 @@ class TelethonGateway:
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         from telethon.tl.functions.updates import GetChannelDifferenceRequest
+        from telethon.tl.tlobject import TLObject
         from telethon.tl.types import ChannelMessagesFilterEmpty
 
         channel = _input_channel(input_channel)

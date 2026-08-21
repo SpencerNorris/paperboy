@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 
-from paperboy.ids import channel_uri
+from paperboy.ids import channel_uri, primary_username
 from paperboy.store.db import Store, dumps
 
 _FLAG_KEYS = (
@@ -41,7 +41,7 @@ def upsert_channel(
     id_ = chan["id"]
     uri = channel_uri(id_)
     title = chan.get("title")
-    username = chan.get("username")
+    username = primary_username(chan)
     about = full.get("about")
     kind = _channel_kind(chan)
     # `chan["date"]` is a join/observed date, not creation; left for a future

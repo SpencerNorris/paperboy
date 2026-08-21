@@ -25,7 +25,9 @@ _PRIVACY_KEYS = ("phone", "lastseen", "photo")
 # rules at all is *not* actually possible from a real getPrivacy response,
 # but an empty list is treated the same as AllowAll — Telegram's own default)
 # counts as restrictive.
-_PERMISSIVE_RULE = "privacyValueAllowAll"
+# Telethon's to_dict() uses the PascalCase class name, not the lowercase TL
+# constructor name — compared case-insensitively below.
+_PERMISSIVE_RULE = "privacyvalueallowall"
 
 
 @dataclass(frozen=True)
@@ -81,7 +83,7 @@ def _check_two_factor(password_state: dict) -> Check:
 
 def _check_privacy(key: str, rules: dict) -> Check:
     rule_list = rules.get("rules", [])
-    permissive = not rule_list or rule_list[0].get("_") == _PERMISSIVE_RULE
+    permissive = not rule_list or rule_list[0].get("_", "").lower() == _PERMISSIVE_RULE
     if permissive:
         return Check(f"privacy_{key}", False, f"{key} privacy is Everyone (AllowAll)", "fail")
     return Check(f"privacy_{key}", True, f"{key} privacy is restricted", "fail")
