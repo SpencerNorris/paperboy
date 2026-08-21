@@ -58,8 +58,8 @@ request. You **can** be:
 - **Never open collected documents on your working machine.** Office files,
   PDFs, and HTML can fetch remote resources **when opened**, leaking your IP and
   timing to whoever planted them (issue #1). Open them offline or in a sandbox
-  / air-gapped viewer with external content disabled. This is tapedeck
-  territory — keep the corpus offline.
+  / air-gapped viewer with external content disabled — keep the corpus
+  offline.
 - The tool stores URLs and Telegram's own server-side previews but **never
   fetches** a URL found inside a message.
 - If you encounter CSAM or other illegal material: do **not** download it;

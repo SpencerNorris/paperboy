@@ -22,7 +22,7 @@ doctor; the remaining collectors are Phase 2.
 
 **vNext (designed for, not built):** `dossier-user`, `lookup phone`,
 hashtag/geo story search, multi-seed network maps, watchlists, third-party
-indexer enrichment, tapedeck import adapter.
+indexer enrichment.
 
 **Out of scope permanently:** anything that acts on Telegram (send, react,
 vote, invite, add members), `contacts.getLocated`, phone *enumeration*,
@@ -270,5 +270,5 @@ onset for sequential `getFullUser` at 1 req/s.
 - Canary URLs and phone-home documents: document the threat, enforce the
   allow-list, add a "open collected documents offline/sandboxed" note to
   `docs/opsec.md`, consider a `--strip-remote-content` pass for office files.
-- tapedeck import adapter.
+- Datasette/analytics export interop (generic).
 - Third-party indexer enrichment (tgstat/telemetr) — research not completed.

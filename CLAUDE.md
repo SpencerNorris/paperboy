@@ -73,7 +73,7 @@ started.
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
 [--phases channel,history] [--unsafe]`, `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
-`--profile` (default `default`) from the macOS Keychain (`scripts/store_api.py`,
+`--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `watch`/`lookup` exit 1 with a
 "Phase 2" message — not implemented yet.
 
