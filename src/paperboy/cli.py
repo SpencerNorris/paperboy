@@ -138,6 +138,23 @@ def collect(
     parsed_target = parse_target(target)
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
+    if phase_list is not None and "history" in phase_list and "channel" not in phase_list:
+        # `channel` populates `CollectContext.input_channel`/`channel_id` (the
+        # channel's numeric id + access_hash) for every later collector in
+        # *this run* — it is per-process context, not reloaded from
+        # `channels` even if a prior run already stored that channel, since
+        # `access_hash` can rotate and isn't persisted. Selecting `history`
+        # without `channel` in the same run leaves that context unset and
+        # `HistoryCollector.collect` would crash on its own assertion;
+        # reject it here instead, before any RPC (or even doctor/store setup)
+        # runs, with a clear, actionable message.
+        console.print(
+            "[red]--phases history requires channel in the same run[/] "
+            "(channel resolves the access hash history needs — it isn't "
+            "persisted between runs). Pass --phases channel,history, or "
+            "omit --phases to run both."
+        )
+        raise typer.Exit(code=1)
 
     with composition.build_store(settings, profile) as store:
         results = asyncio.run(
