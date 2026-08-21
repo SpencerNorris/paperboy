@@ -131,8 +131,11 @@ async def _run_doctor(settings, secrets, profile: str, store):
 def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
-    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history"),
+    phases: str = typer.Option(None, "--phases", help="Comma-separated: channel,history,media"),
     join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
+    media: bool = typer.Option(
+        False, "--media", help="Also download message media (opt-in; off by default)."
+    ),
     profile_budget: int = typer.Option(None, "--profile-budget"),
     max_rpc: int = typer.Option(None, "--max-rpc"),
     unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
@@ -156,27 +159,31 @@ def collect(
     parsed_target = parse_target(target)
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
-    if phase_list is not None and "history" in phase_list and "channel" not in phase_list:
+    if phase_list is not None and "channel" not in phase_list and (
+        "history" in phase_list or "media" in phase_list
+    ):
         # `channel` populates `CollectContext.input_channel`/`channel_id` (the
         # channel's numeric id + access_hash) for every later collector in
         # *this run* — it is per-process context, not reloaded from
         # `channels` even if a prior run already stored that channel, since
         # `access_hash` can rotate and isn't persisted. Selecting `history`
-        # without `channel` in the same run leaves that context unset and
-        # `HistoryCollector.collect` would crash on its own assertion;
-        # reject it here instead, before any RPC (or even doctor/store setup)
-        # runs, with a clear, actionable message.
+        # or `media` without `channel` in the same run leaves that context
+        # unset and the collector would crash on its own assertion; reject it
+        # here instead, before any RPC (or even doctor/store setup) runs,
+        # with a clear, actionable message.
         console.print(
-            "[red]--phases history requires channel in the same run[/] "
-            "(channel resolves the access hash history needs — it isn't "
-            "persisted between runs). Pass --phases channel,history, or "
-            "omit --phases to run both."
+            "[red]--phases history/media requires channel in the same run[/] "
+            "(channel resolves the access hash they need — it isn't "
+            "persisted between runs). Pass --phases channel,history[,media], "
+            "or omit --phases to run the default set."
         )
         raise typer.Exit(code=1)
 
     with composition.build_store(settings, profile) as store:
         results = _run_async_or_exit(
-            _run_collect(settings, secrets, profile, store, parsed_target, phase_list, log, unsafe)
+            _run_collect(
+                settings, secrets, profile, store, parsed_target, phase_list, log, unsafe, media
+            )
         )
 
     table = Table(title=f"collect {target}")
@@ -188,7 +195,7 @@ def collect(
     console.print(table)
 
 
-async def _run_collect(settings, secrets, profile, store, target, phase_list, log, unsafe):
+async def _run_collect(settings, secrets, profile, store, target, phase_list, log, unsafe, media):
     gateway = await composition.build_gateway(settings, secrets, profile, store)
     if not unsafe:
         checks = await run_doctor(gateway, settings)
@@ -198,7 +205,9 @@ async def _run_collect(settings, secrets, profile, store, target, phase_list, lo
                 "Run `paperboy doctor` for details, or pass --unsafe to override."
             )
             raise typer.Exit(code=1)
-    return await collect_channel(gateway, store, settings, target, phase_list, log)
+    return await collect_channel(
+        gateway, store, settings, target, phase_list, log, media=media, profile=profile
+    )
 
 
 @app.command()

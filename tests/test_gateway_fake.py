@@ -57,3 +57,11 @@ async def test_fake_channel_difference():
     diff = {"_": "updates.channelDifference", "pts": 50}
     gw = FakeGateway({"channel_difference": diff})
     assert await gw.get_channel_difference({"channel_id": 5}, pts=40, limit=100) == diff
+
+
+@pytest.mark.asyncio
+async def test_fake_download_media_returns_fixture_bytes_by_msg_id():
+    gw = FakeGateway({"media": {7: b"file bytes"}})
+    assert await gw.download_media({"channel_id": 5}, {"id": 7}) == b"file bytes"
+    assert await gw.download_media({"channel_id": 5}, {"id": 8}) is None
+    assert gw.download_media_calls == [7, 8]

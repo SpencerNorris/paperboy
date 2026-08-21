@@ -10,7 +10,7 @@ call routed through `Budget.call`).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
@@ -59,6 +59,14 @@ class Gateway(Protocol):
         """`account.getPrivacy` for one key (`phone`/`lastseen`/`photo`) — `{"rules": [...]}`."""
         ...
 
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        """Download one message's media (`upload.getFile`, via Telethon's own
+        `download_media` helper) as raw bytes — `None` if the media is gone/
+        unavailable server-side. `message` need only carry enough to
+        re-resolve the live message (its `id`); read-only, never mutates
+        anything on Telegram's side."""
+        ...
+
 
 class FakeGateway:
     """Replays recorded fixture dicts — no network, no `Budget` involved.
@@ -66,11 +74,17 @@ class FakeGateway:
     `fixtures` keys: `resolve`, `full_channel`, `self`, `history` (a flat
     list, newest-first), `get_messages` (a `{id: message_dict}` lookup),
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
-    `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`).
+    `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`),
+    `media` (a `{msg_id: bytes}` lookup for `download_media`).
     """
 
     def __init__(self, fixtures: dict) -> None:
         self._fx = fixtures
+        # Test introspection: every msg id `download_media` was actually
+        # asked to fetch, in call order — lets a dedup test assert a
+        # duplicate never reaches the gateway at all, not just that its
+        # result was discarded.
+        self.download_media_calls: list[int] = []
 
     async def resolve(self, target_value: str) -> dict:
         del target_value
@@ -111,6 +125,12 @@ class FakeGateway:
 
     async def get_privacy(self, key: str) -> dict:
         return self._fx["privacy"][key]
+
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        del input_channel
+        self.download_media_calls.append(message["id"])
+        table: dict[int, bytes] = self._fx.get("media", {})
+        return table.get(message["id"])
 
 
 def _input_channel(input_channel: dict) -> InputChannel:
@@ -308,3 +328,71 @@ class TelethonGateway:
             ),
         )
         return result.to_dict()
+
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        """Re-fetch the live message (`channels.getMessages`) and download its
+        media in-memory (`file=bytes` tells Telethon to return bytes instead
+        of writing to disk). A fresh fetch carries a fresh `file_reference`;
+        if the download still races an expiry (`FileReferenceExpiredError`
+        isn't in `errors.classify`'s tables, so `Budget.call` re-raises it
+        verbatim rather than converting it), re-fetch once more and retry
+        exactly once. A second consecutive expiry is converted to
+        `SkipAndRecord` here — skip this one file, spec §8's "no exception
+        is swallowed" honored by recording *why*, not by crashing the run.
+        """
+        from telethon.errors import FileReferenceExpiredError
+        from telethon.tl.functions.channels import GetMessagesRequest
+        from telethon.tl.types import InputMessageID, Message
+        from telethon.tl.types.messages import Messages
+
+        from paperboy.budget import SkipAndRecord
+
+        channel = _input_channel(input_channel)
+        msg_id = message["id"]
+
+        async def _fetch_message() -> Message | None:
+            result = cast(
+                Messages,
+                await self.budget.call(
+                    "channels.getMessages",
+                    lambda: self.client(
+                        GetMessagesRequest(channel=channel, id=[InputMessageID(id=msg_id)])
+                    ),
+                ),
+            )
+            # `channels.getMessages` returning a non-`Message` (e.g.
+            # `MessageEmpty`, for an id that's since been deleted) is
+            # possible but not media-bearing; the `cast` here matches every
+            # other Telethon-response cast in this module (ADR-0001) — a
+            # typing aid verified against the installed layer, not a
+            # runtime behavior change.
+            return cast(Message, result.messages[0]) if result.messages else None
+
+        async def _download(tl_message: Message) -> bytes | None:
+            # `file=bytes` is Telethon's own documented idiom for "download
+            # in-memory and return it as a bytestring" — untyped in its
+            # stubs (`hints.FileLike` has no meta-type case for it), so the
+            # `Any` cast is a stub gap, not a real type mismatch.
+            return cast(
+                bytes | None,
+                await self.budget.call(
+                    "upload.getFile",
+                    lambda: self.client.download_media(tl_message, file=cast(Any, bytes)),
+                ),
+            )
+
+        tl_message = await _fetch_message()
+        if tl_message is None:
+            return None
+        try:
+            return await _download(tl_message)
+        except FileReferenceExpiredError:
+            tl_message = await _fetch_message()
+            if tl_message is None:
+                return None
+            try:
+                return await _download(tl_message)
+            except FileReferenceExpiredError as exc:
+                raise SkipAndRecord(
+                    f"media download skipped: file_reference expired twice for msg {msg_id}"
+                ) from exc
