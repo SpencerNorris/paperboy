@@ -1,12 +1,14 @@
 """The `history` collector: newest->oldest backfill with gap-based deletion
-tombstones (this file), and `pts` catch-up (`catch_up`, added in the next
-change).
+tombstones, plus `pts`-based catch-up (`catch_up`) applying edits and
+deletions delivered via `updates.getChannelDifference` (ADR-0004).
 
 Resumability has two independent layers: a per-run `offset_id` cursor in
 `sync_state('history', ...)` lets a killed/Ctrl-C'd backfill continue paging
 from where it stopped, while `sync_ranges` records which numeric message-id
 spans have been fully swept *and* gap-probed — the two are deliberately not
-conflated (see the module-level note on `_gap_candidates`).
+conflated (see the note on `_probe_gaps`). `catch_up` uses a third, separate
+cursor: `sync_state('channel', ...)`'s `pts`, seeded by the `channel`
+collector from `channelFull.pts`.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from paperboy.targets import Target
 
 _HISTORY_PAGE_SIZE = 100
 _GET_MESSAGES_CHUNK = 200
+_CHANNEL_DIFFERENCE_LIMIT = 100
 
 
 def _latest_revision_hash(ctx: CollectContext, uri: str) -> str | None:
@@ -140,3 +143,50 @@ class HistoryCollector:
                 ctx.store.add_raw("messageEmpty", r, ctx.tier, {"channel_id": channel_id})
                 mark_deleted(ctx.store, channel_id, r["id"], "empty", observed_at)
                 counts["tombstones"] += 1
+
+    async def catch_up(self, ctx: CollectContext) -> CollectResult:
+        """Apply everything since the last stored `pts` via `getChannelDifference`.
+
+        `new_messages` are upserted; `other_updates` are applied by kind —
+        `updateEditChannelMessage` appends a revision (via `upsert_message`'s
+        own content-hash check), `updateDeleteChannelMessages` tombstones
+        with `evidence="update"` (spec §7's highest-confidence deletion
+        evidence). A `channelDifferenceTooLong` re-seeds `pts` from the
+        payload's `dialog` and returns with `stopped="resynced"` — a full
+        gap probe for this channel is the caller's job (a future `watch`
+        loop iteration or a plain re-run of `history`).
+        """
+        assert ctx.input_channel is not None
+        assert ctx.channel_id is not None
+        channel_id = ctx.channel_id
+        counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
+
+        state = get_state(ctx.store, "channel", str(channel_id)) or {}
+        pts = state.get("pts", 0)
+
+        diff = await ctx.gateway.get_channel_difference(
+            ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
+        )
+        ctx.store.add_raw(
+            diff.get("_", "updates.channelDifference"), diff, ctx.tier, {"channel_id": channel_id}
+        )
+
+        if diff.get("_") == "updates.channelDifferenceTooLong":
+            resynced_pts = diff.get("dialog", {}).get("pts", pts)
+            set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
+            return CollectResult(name=self.name, counts=counts, stopped="resynced")
+
+        for m in diff.get("new_messages", []):
+            self._observe_message(ctx, channel_id, m, counts)
+
+        for update in diff.get("other_updates", []):
+            kind = update.get("_")
+            if kind == "updateEditChannelMessage":
+                self._observe_message(ctx, channel_id, update["message"], counts)
+            elif kind == "updateDeleteChannelMessages":
+                for mid in update.get("messages", []):
+                    mark_deleted(ctx.store, channel_id, mid, "update", utc_now_iso())
+                    counts["tombstones"] += 1
+
+        set_state(ctx.store, "channel", str(channel_id), {"pts": diff.get("pts", pts)})
+        return CollectResult(name=self.name, counts=counts)
