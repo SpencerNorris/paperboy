@@ -52,8 +52,11 @@ _SCHEME_RE = re.compile(r"^(https?://)?(www\.)?t\.me/", re.IGNORECASE)
 # so a bare phone number falls through to `_PHONE_RE` instead.
 _INVITE_PLUS_RE = re.compile(r"^\+(?!\d+$)([A-Za-z0-9_-]+)$")
 _INVITE_JOINCHAT_RE = re.compile(r"^joinchat/([A-Za-z0-9_-]+)$")
-_MSG_LINK_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{3,31})/(\d+)$")
-_USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{3,31})$")
+_MSG_LINK_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{0,31})/(\d+)$")
+# Telegram enforces its own (longer) minimum public-username length; this
+# module only recognizes the *shape* of a username-like token — an invalid
+# or nonexistent one still fails, later, at resolve() time.
+_USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{0,31})$")
 _PHONE_RE = re.compile(r"^\+\d{7,15}$")
 _PEER_ID_RE = re.compile(r"^-?\d+$")
 _HASHTAG_RE = re.compile(r"^#(\w+)$")

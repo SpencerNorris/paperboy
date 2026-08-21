@@ -31,6 +31,24 @@ def msg_uri(channel_id: int, msg_id: int) -> str:
     return f"{_SCHEME}:msg:{channel_id}/{msg_id}"
 
 
+def peer_ref_uri(peer: dict | None) -> str | None:
+    """Convert a TL `Peer*`/`InputPeer*` reference dict (e.g. a message's
+    `from_id` or a forward header's `from_id`) to a paperboy URI, or None if
+    absent/unrecognized. Shared by the message projection and the history
+    collector's forward-edge extraction so both agree on one mapping.
+    """
+    if not peer:
+        return None
+    kind = peer.get("_", "")
+    if kind in ("peerUser", "inputPeerUser"):
+        return user_uri(peer["user_id"])
+    if kind in ("peerChannel", "inputPeerChannel"):
+        return channel_uri(peer["channel_id"])
+    if kind in ("peerChat", "inputPeerChat"):
+        return chat_uri(peer["chat_id"])
+    return None
+
+
 def parse_uri(uri: str) -> tuple[str, tuple[int, ...]]:
     """Parse a ``tg:<kind>:<ids>`` URI back into (kind, ids).
 
