@@ -36,6 +36,20 @@ def _settings_with_overrides(profile: str, **overrides: object) -> Settings:
     return load_settings(profile, clean)
 
 
+def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
+    """`asyncio.run(coro)`, translating a missing-credentials `ConfigError`
+    (raised by `composition.build_client`/`build_gateway` when no `api_id`/
+    `api_hash` is configured for this profile) into a clean, actionable CLI
+    exit instead of a raw traceback. Every command that reaches Telethon
+    (`doctor`, `collect`) goes through here before ever touching the network.
+    """
+    try:
+        return asyncio.run(coro)
+    except composition.ConfigError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from None
+
+
 def _find_channel_id(store, username: str) -> int | None:
     row = store.conn.execute(
         "SELECT id FROM channels WHERE username = ?", (username.lstrip("@"),)
@@ -48,7 +62,11 @@ def auth(profile: str = typer.Option("default", "--profile")) -> None:
     """Interactive login: prompts for phone + code on stdin, saves the session to the Keychain."""
     settings = _settings_with_overrides(profile)
     secrets = composition.build_secrets(profile)
-    client = composition.build_client(settings, secrets, profile)
+    try:
+        client = composition.build_client(settings, secrets, profile)
+    except composition.ConfigError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from None
 
     async def _run() -> None:
         # Telethon ships no return-type stubs for these — `start`/`disconnect`
@@ -78,7 +96,7 @@ def doctor(
     secrets = composition.build_secrets(profile)
 
     with composition.build_store(settings, profile) as store:
-        checks = asyncio.run(_run_doctor(settings, secrets, profile, store))
+        checks = _run_async_or_exit(_run_doctor(settings, secrets, profile, store))
 
     table = Table(title=f"paperboy doctor — profile {profile!r}")
     table.add_column("check")
@@ -157,7 +175,7 @@ def collect(
         raise typer.Exit(code=1)
 
     with composition.build_store(settings, profile) as store:
-        results = asyncio.run(
+        results = _run_async_or_exit(
             _run_collect(settings, secrets, profile, store, parsed_target, phase_list, log, unsafe)
         )
 

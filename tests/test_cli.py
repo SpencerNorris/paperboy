@@ -131,6 +131,58 @@ def test_doctor_compliant_exits_zero(tmp_path, monkeypatch):
     assert "PASS" in result.stdout
 
 
+def test_doctor_missing_credentials_exits_cleanly(tmp_path, monkeypatch):
+    # `build_gateway` -> `build_client` -> `resolve_api_id` raises `ConfigError`
+    # when no api_id/api_hash is configured for the profile (found live during
+    # VALIDATE-phase smoke testing: this previously reached `cli.py` as an
+    # uncaught exception and printed a raw traceback instead of `doctor`'s own
+    # actionable message).
+    async def raising_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, store
+        raise composition.ConfigError(f"No api_id configured for profile {profile!r}")
+
+    monkeypatch.setattr(composition, "build_gateway", raising_build_gateway)
+
+    result = runner.invoke(
+        app, ["doctor", "--profile", "clitest_noconfig"], env={"PAPERBOY_DATA_DIR": str(tmp_path)}
+    )
+    assert result.exit_code == 1
+    assert "No api_id configured" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_collect_missing_credentials_exits_cleanly(tmp_path, monkeypatch):
+    async def raising_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, store
+        raise composition.ConfigError(f"No api_id configured for profile {profile!r}")
+
+    monkeypatch.setattr(composition, "build_gateway", raising_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_noconfig2", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 1
+    assert "No api_id configured" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+def test_auth_missing_credentials_exits_cleanly(tmp_path, monkeypatch):
+    def raising_build_client(settings, secrets, profile):
+        del settings, secrets
+        raise composition.ConfigError(f"No api_id configured for profile {profile!r}")
+
+    monkeypatch.setattr(composition, "build_client", raising_build_client)
+
+    result = runner.invoke(
+        app, ["auth", "--profile", "clitest_noconfig3"], env={"PAPERBOY_DATA_DIR": str(tmp_path)}
+    )
+    assert result.exit_code == 1
+    assert "No api_id configured" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_watch_and_lookup_are_phase_2_stubs():
     result = runner.invoke(app, ["watch", "@x"])
     assert result.exit_code != 0

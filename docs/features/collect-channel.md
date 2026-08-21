@@ -271,3 +271,105 @@ All three are fixed in `fix: match Telethon's real PascalCase TL
 discriminators, not lowercase`; the full local suite (115 tests, ruff,
 pyright) stayed green throughout, and every scenario above was re-run
 against live Telegram after the fix to confirm it.
+
+## VALIDATE-phase findings (`feat/core-fixes`, second pass)
+
+Two more rounds of bugs surfaced after the transcript above, none of them
+caught by the (still-green) unit suite because every existing `collect`/
+`doctor` test monkeypatches `composition.build_gateway` — no test exercised
+the real credential-resolution or the real recipe-level exception handling.
+
+### Correctness-review fixes (`fix: correctness-review findings — SkipAndRecord, history guards, handler redaction`)
+
+1. **`SkipAndRecord` propagated uncaught out of `collect_channel`.**
+   `Budget.call` already classified `CHAT_ADMIN_REQUIRED`/`ChannelPrivateError`/
+   etc. into `SkipAndRecord` (confirmed live against `@durov` above via a
+   direct `Budget.call`, item 4) — but `recipes.collect_channel`'s `except`
+   clauses only listed `PhaseStop`/`HardStop`. Collecting any
+   private/inaccessible channel crashed the whole run instead of skipping
+   that phase and continuing. Fixed by adding a `except SkipAndRecord`
+   branch that records a `run_events(kind='skip')` row and marks the phase
+   `stopped="skip"`, matching spec §8.
+2. **`HistoryCollector.collect()`/`catch_up()` raised a bare
+   `AssertionError`** when `ctx.input_channel`/`channel_id` weren't set —
+   which happens whenever `channel` stops early (e.g. finding #1's
+   `SkipAndRecord`, or a long-`FLOOD_WAIT` `PhaseStop`) but `history` still
+   runs next in the same pass. Fixed by raising a handled `PhaseStop`
+   instead.
+3. **`RedactionFilter` was attached to the `paperboy` logger, not its
+   handlers.** The app logs exclusively through child loggers
+   (`paperboy.cli`, the `log` threaded into recipes/collectors);
+   `Logger.callHandlers` never re-checks an ancestor logger's own filters
+   for a record bubbling up from a child, so secrets logged through any
+   child logger reached the log file unmasked. Fixed by attaching one
+   shared `RedactionFilter` instance to each handler instead.
+4. **`Budget._record_flood` wrote spurious `flood_log` rows for transient
+   network errors.** `ConnectionError`/`TimeoutError`/`OSError` classify as
+   `Disposition.RETRY` too, but carry no `.seconds`; `getattr(exc,
+   "seconds", 0)` silently fell back to 0, writing a `(seconds=0)` row into
+   `flood_log` on every ordinary transient-network retry. Fixed by only
+   recording when `seconds > 0`.
+
+Re-validated without live Telegram (this session's sandbox denied
+keychain/credential access — see below): a script written independently of
+the implementer's own smoke test drives finding #1 end-to-end through the
+*real* `ChannelCollector`+`HistoryCollector` (not stub collectors), with a
+genuine `telethon.errors.ChatAdminRequiredError` routed through a real
+`Budget` instance — confirming `channel` is marked `stopped="skip"` and
+`history` (which runs next by default) hits guard #2 and is marked
+`stopped="phase_stop"`, never an uncaught exception. Findings #3 and #4 were
+re-confirmed directly: a secret registered via `register_secret` and logged
+through `logging.getLogger("paperboy.cli")` (and a grandchild logger) comes
+back masked in the file handler's JSON output; `ConnectionError`/
+`TimeoutError`/`OSError` retries leave `flood_log` empty while a genuine
+`telethon.errors.FloodWaitError` (not the `FakeFlood` test double) still
+records normally. Full transcript in the DoD report for this validation
+pass.
+
+Also included in `feat/core-fixes`: `fix: reject --phases history without
+channel instead of crashing` — `--phases history` alone now exits 1 with an
+actionable message from `cli.py`, before any RPC/doctor/store setup runs,
+instead of reaching `HistoryCollector`'s (now-fixed) guard. Re-confirmed via
+the real CLI in this validation pass (see the DoD report).
+
+### Missing-credentials failure mode (found and fixed during VALIDATE)
+
+`doctor`, `collect`, and `auth` all reach `composition.build_client`, which
+raises `app.ConfigError` — a deliberately actionable exception ("No api_id
+configured for profile ...: set PAPERBOY_API_ID or run ...") — when no
+`api_id`/`api_hash` is configured for the profile. Nothing in `cli.py`
+caught it: it reached the user as a raw Rich-rendered Python traceback
+instead of `ConfigError`'s own message. No test caught this either, for the
+same reason as the four findings above — every `collect`/`doctor` test
+monkeypatches `build_gateway` entirely, bypassing credential resolution.
+
+Fixed in `cli.py`: a `_run_async_or_exit` helper (used by `doctor`/
+`collect`) and a direct `try/except` in `auth` now catch `ConfigError` and
+exit 1 with its message, no traceback. Three new regression tests
+(`test_doctor_missing_credentials_exits_cleanly`,
+`test_collect_missing_credentials_exits_cleanly`,
+`test_auth_missing_credentials_exits_cleanly`) monkeypatch
+`build_gateway`/`build_client` to raise `ConfigError` and assert a clean
+exit + no `"Traceback"` in stdout. Re-confirmed live against the real CLI
+with a profile that genuinely has no stored credentials (`doctor`,
+`collect`, and `auth` each now print the actionable message and exit 1) —
+transcript in the DoD report.
+
+## Live-Telegram scenarios not re-run in this validation pass
+
+This VALIDATE session ran in a sandbox where keychain/credential access was
+denied by the harness's own permission policy (a deliberate safety boundary
+against an autonomous agent placing unsupervised live calls against a real
+Telegram account) — so the live-network portions of the DoD checklist
+(`CHAT_ADMIN_REQUIRED` skip via a real `paperboy collect` run against a
+genuinely inaccessible channel, a real `FLOOD_WAIT` sleep against Telegram,
+Ctrl-C-resume against live network, `doctor`-FAIL-blocks-`collect` against a
+real non-compliant account) were not re-executed here. They were already
+demonstrated live in the transcript above, prior to the fixes in this
+section; the specific defect finding #1 fixes (`SkipAndRecord` crashing
+`collect_channel`) was never actually exercised end-to-end live even in that
+earlier pass — the "CHAT_ADMIN_REQUIRED" item there drove `Budget.call`
+directly, not the full `collect_channel` recipe. A live confirmation of
+finding #1 (`paperboy collect <a private/no-admin channel> --unsafe` no
+longer crashing) is recommended as a follow-up by whoever next has
+interactive keychain access — see the DoD report for the exact command.
