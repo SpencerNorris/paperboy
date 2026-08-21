@@ -14,7 +14,11 @@ from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_DATA_DIR = Path("~/.local/share/paperboy")
+# Repo-relative by default so collected data lands in `./data/` next to the
+# code, not somewhere on the filesystem you have to hunt for. `./data` is
+# gitignored. Override with `PAPERBOY_DATA_DIR` (absolute or `~`-relative) to
+# put it elsewhere.
+DEFAULT_DATA_DIR = Path("data")
 
 
 class DeviceIdentity(BaseModel):

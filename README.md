@@ -26,8 +26,13 @@ share one store and one set of guardrails.
 
 ## Requirements
 
-- **macOS** (credentials are stored in the macOS Keychain).
 - **Python ≥ 3.12** and [**uv**](https://docs.astral.sh/uv/).
+- **macOS, Windows, or Linux.** Credentials are stored in your OS's native
+  encrypted keychain via the [`keyring`](https://pypi.org/project/keyring/)
+  library — macOS Keychain, Windows Credential Manager, or the Linux Secret
+  Service (GNOME Keyring / KWallet). Currently tested on macOS. Headless Linux
+  and WSL boxes without a Secret Service need extra setup — tracked in
+  [issue #10](https://github.com/SpencerNorris/paperboy/issues/10).
 - A **dedicated Telegram account** for research (not your personal one — see
   [Safety](#safety--guardrails)) and its `api_id` / `api_hash` from
   [my.telegram.org](https://my.telegram.org).
@@ -55,7 +60,7 @@ development tools**, and create an app to obtain an `api_id` (integer) and
 
 ### 2. Store the credentials and log in
 
-Credentials go in the macOS Keychain — never a file, never the repo. Two ways:
+Credentials go in your OS keychain — never a file, never the repo. Two ways:
 
 ```bash
 # a) guided helper scripts (run them yourself; hidden input, nothing printed)
@@ -113,7 +118,7 @@ The store is a plain SQLite file with an FTS index, so you can also browse it
 with [Datasette](https://datasette.io):
 
 ```bash
-uvx datasette ~/.local/share/paperboy/default/paperboy.sqlite
+uvx datasette ./data/default/paperboy.sqlite
 ```
 
 ### 6. Export
@@ -146,7 +151,7 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 
 | Setting (`PAPERBOY_…`) | Default | Meaning |
 |---|---|---|
-| `DATA_DIR` | `~/.local/share/paperboy` | Root for `<data_dir>/<profile>/paperboy.sqlite` + media. |
+| `DATA_DIR` | `./data` | Root for `<data_dir>/<profile>/paperboy.sqlite` + media (repo-relative). |
 | `PROXY` | *(unset)* | `socks5://…` or `mtproxy://…` to route Telegram traffic. |
 | `REQUIRE_PROXY` | `true` | `doctor` fails (and `collect` refuses) without a proxy. |
 | `MIN_SESSION_AGE_DAYS` | `7` | Guards bulk work on fresh accounts. |
@@ -157,13 +162,16 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 ## Where your data lives
 
 ```
-~/.local/share/paperboy/<profile>/
+./data/<profile>/        # in the repo dir by default; gitignored
   paperboy.sqlite     # system of record: raw_records + normalized tables + FTS5
   paperboy.log        # credential-redacted JSON log
   media/              # (Phase 2) downloaded files, content-addressed
 ```
 
-Keep this directory on an **encrypted volume**. Every TL object is stored raw in
+The default data dir is `./data` (relative to where you run `paperboy`), so
+collected data lands next to the code and is gitignored. Override it with
+`PAPERBOY_DATA_DIR`. Keep it on an **encrypted volume** — FileVault on macOS,
+LUKS on Linux, BitLocker/VeraCrypt on Windows. Every TL object is stored raw in
 `raw_records` before it is projected into the normalized tables, so a Telegram
 schema bump can be re-parsed rather than re-scraped.
 
