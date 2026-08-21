@@ -7,9 +7,14 @@ discoverable and their public profiles, the forward/mention/similar-channel
 graph, and web-archive snapshots — for open-source investigation and
 journalism. Everything runs on your machine; nothing is uploaded.
 
-**Status:** design complete, implementation not started. Start with
-`docs/research/telegram-extraction-surface.md` and
-`docs/superpowers/specs/2026-08-20-paperboy-design.md`.
+**Status:** Phase 1 (core) shipped — channel metadata, full message history
+with edit revisions and deletion tombstones, `pts`-based incremental sync,
+JSONL export, and an opsec preflight (`paperboy doctor`) all work end to end
+against live Telegram. Media, comment threads, people discovery, the graph,
+and web-archive snapshots are Phase 2, not yet built. Start with
+`docs/research/telegram-extraction-surface.md`,
+`docs/superpowers/specs/2026-08-20-paperboy-design.md`, and
+`docs/features/collect-channel.md`.
 
 ## Disclaimer
 
