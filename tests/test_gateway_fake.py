@@ -1,5 +1,6 @@
 import pytest
 
+from paperboy.budget import SkipAndRecord
 from tests.fakes import FakeGateway
 
 
@@ -57,3 +58,37 @@ async def test_fake_channel_difference():
     diff = {"_": "updates.channelDifference", "pts": 50}
     gw = FakeGateway({"channel_difference": diff})
     assert await gw.get_channel_difference({"channel_id": 5}, pts=40, limit=100) == diff
+
+
+@pytest.mark.asyncio
+async def test_fake_download_media_returns_fixture_bytes_by_msg_id():
+    gw = FakeGateway({"media": {7: b"file bytes"}})
+    assert await gw.download_media({"channel_id": 5}, {"id": 7}) == b"file bytes"
+    assert await gw.download_media({"channel_id": 5}, {"id": 8}) is None
+    assert gw.download_media_calls == [7, 8]
+
+async def test_fake_channel_recommendations():
+    fx = {"channel_recommendations": {"_": "messages.ChatsSlice", "count": 5, "chats": []}}
+    gw = FakeGateway(fx)
+    assert await gw.get_channel_recommendations({"channel_id": 5}) == fx["channel_recommendations"]
+
+
+@pytest.mark.asyncio
+async def test_fake_channel_recommendations_raises_configured_skip():
+    gw = FakeGateway({"channel_recommendations": SkipAndRecord("CHAT_NOT_MODIFIED")})
+    with pytest.raises(SkipAndRecord):
+        await gw.get_channel_recommendations({"channel_id": 5})
+
+
+@pytest.mark.asyncio
+async def test_fake_check_chat_invite_keyed_by_hash():
+    preview = {"_": "ChatInvite", "title": "X", "participants_count": 3}
+    gw = FakeGateway({"chat_invite": {"abc123": preview}})
+    assert await gw.check_chat_invite("abc123") == preview
+
+
+@pytest.mark.asyncio
+async def test_fake_sponsored_messages():
+    fx = {"sponsored_messages": {"_": "messages.SponsoredMessagesEmpty"}}
+    gw = FakeGateway(fx)
+    assert await gw.get_sponsored_messages({"channel_id": 5}) == fx["sponsored_messages"]

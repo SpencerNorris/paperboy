@@ -10,7 +10,7 @@ call routed through `Budget.call`).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
@@ -59,6 +59,32 @@ class Gateway(Protocol):
         """`account.getPrivacy` for one key (`phone`/`lastseen`/`photo`) — `{"rules": [...]}`."""
         ...
 
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        """Download one message's media (`upload.getFile`, via Telethon's own
+        `download_media` helper) as raw bytes — `None` if the media is gone/
+        unavailable server-side. `message` need only carry enough to
+        re-resolve the live message (its `id`); read-only, never mutates
+        anything on Telegram's side."""
+        ...
+
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        """`channels.getChannelRecommendations` — a `Chats`/`ChatsSlice` dict
+        (the latter's `count` is the true total, even though at most ~10 `chats` come
+        back). May raise `SkipAndRecord` (e.g. `CHAT_NOT_MODIFIED`, `PREMIUM_ACCOUNT_REQUIRED`)."""
+        ...
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        """`messages.checkChatInvite` — never joins. Returns a `ChatInvite` dict
+        (unjoined preview: title/photo/participants_count, no chat id) or a
+        `ChatInviteAlready`/`ChatInvitePeek` dict (a real `Chat`, if already known)."""
+        ...
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        """`messages.getSponsoredMessages` — a `SponsoredMessages` or
+        `SponsoredMessagesEmpty` dict. May raise `SkipAndRecord` (e.g.
+        `CHAT_ADMIN_REQUIRED`, `PREMIUM_ACCOUNT_REQUIRED` on some accounts)."""
+        ...
+
 
 class FakeGateway:
     """Replays recorded fixture dicts — no network, no `Budget` involved.
@@ -66,11 +92,22 @@ class FakeGateway:
     `fixtures` keys: `resolve`, `full_channel`, `self`, `history` (a flat
     list, newest-first), `get_messages` (a `{id: message_dict}` lookup),
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
-    `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`).
+    `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`),
+    `media` (a `{msg_id: bytes}` lookup for `download_media`).
+    `channel_recommendations`, `sponsored_messages`, `chat_invite` (a
+    `{hash: dict}` lookup). Any of these three graph-collector fixture
+    values may instead be a `BaseException` instance (e.g. a `SkipAndRecord`)
+    to simulate `Budget.call`'s classification without going through it —
+    `FakeGateway` never touches `Budget`.
     """
 
     def __init__(self, fixtures: dict) -> None:
         self._fx = fixtures
+        # Test introspection: every msg id `download_media` was actually
+        # asked to fetch, in call order — lets a dedup test assert a
+        # duplicate never reaches the gateway at all, not just that its
+        # result was discarded.
+        self.download_media_calls: list[int] = []
 
     async def resolve(self, target_value: str) -> dict:
         del target_value
@@ -111,6 +148,46 @@ class FakeGateway:
 
     async def get_privacy(self, key: str) -> dict:
         return self._fx["privacy"][key]
+
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        del input_channel
+        self.download_media_calls.append(message["id"])
+        value = self._fx.get("media", {}).get(message["id"])
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        del input_channel
+        return self._fx_or_raise(
+            "channel_recommendations", {"_": "messages.chats", "chats": []}
+        )
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        table: dict[str, dict] = self._fx.get("chat_invite", {})
+        value = table.get(hash_)
+        if value is None:
+            return {"_": "chatInvite", "title": "", "participants_count": 0}
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        del input_channel
+        return self._fx_or_raise(
+            "sponsored_messages", {"_": "messages.sponsoredMessagesEmpty"}
+        )
+
+    def _fx_or_raise(self, key: str, default: dict | None = None) -> dict:
+        # Missing fixture => a benign, correctly-shaped empty (a channel may
+        # genuinely have no recommendations/sponsored messages), unless the test
+        # configured a BaseException to simulate Budget.call's classification.
+        if key not in self._fx:
+            return {} if default is None else default
+        value = self._fx[key]
+        if isinstance(value, BaseException):
+            raise value
+        return value
 
 
 def _input_channel(input_channel: dict) -> InputChannel:
@@ -305,6 +382,115 @@ class TelethonGateway:
             await self.budget.call(
                 f"account.getPrivacy:{key}",
                 lambda: self.client(GetPrivacyRequest(key=input_key)),
+            ),
+        )
+        return result.to_dict()
+
+    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        """Re-fetch the live message (`channels.getMessages`) and download its
+        media in-memory (`file=bytes` tells Telethon to return bytes instead
+        of writing to disk). A fresh fetch carries a fresh `file_reference`;
+        if the download still races an expiry (`FileReferenceExpiredError`
+        isn't in `errors.classify`'s tables, so `Budget.call` re-raises it
+        verbatim rather than converting it), re-fetch once more and retry
+        exactly once. A second consecutive expiry is converted to
+        `SkipAndRecord` here — skip this one file, spec §8's "no exception
+        is swallowed" honored by recording *why*, not by crashing the run.
+        """
+        from telethon.errors import FileReferenceExpiredError
+        from telethon.tl.functions.channels import GetMessagesRequest
+        from telethon.tl.types import InputMessageID, Message
+        from telethon.tl.types.messages import Messages
+
+        from paperboy.budget import SkipAndRecord
+
+        channel = _input_channel(input_channel)
+        msg_id = message["id"]
+
+        async def _fetch_message() -> Message | None:
+            result = cast(
+                Messages,
+                await self.budget.call(
+                    "channels.getMessages",
+                    lambda: self.client(
+                        GetMessagesRequest(channel=channel, id=[InputMessageID(id=msg_id)])
+                    ),
+                ),
+            )
+            # `channels.getMessages` returning a non-`Message` (e.g.
+            # `MessageEmpty`, for an id that's since been deleted) is
+            # possible but not media-bearing; the `cast` here matches every
+            # other Telethon-response cast in this module (ADR-0001) — a
+            # typing aid verified against the installed layer, not a
+            # runtime behavior change.
+            return cast(Message, result.messages[0]) if result.messages else None
+
+        async def _download(tl_message: Message) -> bytes | None:
+            # `file=bytes` is Telethon's own documented idiom for "download
+            # in-memory and return it as a bytestring" — untyped in its
+            # stubs (`hints.FileLike` has no meta-type case for it), so the
+            # `Any` cast is a stub gap, not a real type mismatch.
+            return cast(
+                bytes | None,
+                await self.budget.call(
+                    "upload.getFile",
+                    lambda: self.client.download_media(tl_message, file=cast(Any, bytes)),
+                ),
+            )
+
+        tl_message = await _fetch_message()
+        if tl_message is None:
+            return None
+        try:
+            return await _download(tl_message)
+        except FileReferenceExpiredError:
+            tl_message = await _fetch_message()
+            if tl_message is None:
+                return None
+            try:
+                return await _download(tl_message)
+            except FileReferenceExpiredError as exc:
+                raise SkipAndRecord(
+                    f"media download skipped: file_reference expired twice for msg {msg_id}"
+                ) from exc
+
+    async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        from telethon.tl.functions.channels import GetChannelRecommendationsRequest
+        from telethon.tl.tlobject import TLObject
+
+        channel = _input_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "channels.getChannelRecommendations",
+                lambda: self.client(GetChannelRecommendationsRequest(channel=channel)),
+            ),
+        )
+        return result.to_dict()
+
+    async def check_chat_invite(self, hash_: str) -> dict:
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.tlobject import TLObject
+
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "messages.checkChatInvite",
+                lambda: self.client(CheckChatInviteRequest(hash=hash_)),
+            ),
+        )
+        return result.to_dict()
+
+    async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        from telethon.tl.functions.messages import GetSponsoredMessagesRequest
+        from telethon.tl.tlobject import TLObject
+
+        peer = _input_peer_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "messages.getSponsoredMessages",
+                lambda: self.client(GetSponsoredMessagesRequest(peer=peer)),
             ),
         )
         return result.to_dict()

@@ -1,0 +1,14 @@
+{
+  "_": "ChatsSlice",
+  "count": 37,
+  "chats": [
+    {
+      "_": "Channel", "id": 501, "access_hash": 1001, "title": "Similar One",
+      "username": "similarone", "broadcast": true
+    },
+    {
+      "_": "Channel", "id": 502, "access_hash": 1002, "title": "Similar Two",
+      "username": "similartwo", "broadcast": true
+    }
+  ]
+}
