@@ -10,7 +10,7 @@ richer stored profile with blanks.
 
 from __future__ import annotations
 
-from paperboy.ids import channel_uri, chat_uri, user_uri
+from paperboy.ids import channel_uri, chat_uri, primary_username, user_uri
 from paperboy.store.db import Store, dumps
 
 _FLAG_KEYS = (
@@ -20,8 +20,14 @@ _FLAG_KEYS = (
 
 
 def _classify(obj: dict) -> tuple[str, str, int]:
-    """Map a TL peer-ish dict's `_` discriminator to (kind, uri, numeric id)."""
-    tag = obj["_"]
+    """Map a TL peer-ish dict's `_` discriminator to (kind, uri, numeric id).
+
+    Telethon's `to_dict()` uses the PascalCase class name (`"Channel"`,
+    `"ChannelForbidden"`, ...), not the lowercase TL constructor name — this
+    lowercases before matching so both that and any hand-authored lowercase
+    test fixture work.
+    """
+    tag = obj["_"].lower()
     id_ = obj["id"]
     if tag.startswith("user"):
         return "user", user_uri(id_), id_
@@ -80,7 +86,7 @@ def upsert_peer(
         """,
         (
             uri, kind, id_, obj.get("access_hash"), int(is_min), seen_in_chat, seen_in_msg,
-            obj.get("username"), obj.get("first_name"), obj.get("last_name"), obj.get("title"),
+            primary_username(obj), obj.get("first_name"), obj.get("last_name"), obj.get("title"),
             flags_json, source_raw_id, observed_at, observed_at,
         ),
     )

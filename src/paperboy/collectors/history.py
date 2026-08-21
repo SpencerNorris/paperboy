@@ -85,7 +85,7 @@ class HistoryCollector:
     ) -> None:
         observed_at = utc_now_iso()
         raw_id = ctx.store.add_raw(
-            m.get("_", "message"), m, ctx.tier, {"channel_id": channel_id}
+            m.get("_", "Message"), m, ctx.tier, {"channel_id": channel_id}
         )
         uri = msg_uri(channel_id, m["id"])
         before = _latest_revision_hash(ctx, uri)
@@ -96,11 +96,11 @@ class HistoryCollector:
             counts["revisions"] += 1
 
         from_id = m.get("from_id")
-        if from_id and from_id.get("_") == "peerUser":
+        if from_id and from_id.get("_", "").lower() == "peeruser":
             # We only have the bare peer reference here (no username/name) —
             # record it as `min`, honestly reflecting how little we know; a
             # Phase 2 `profiles` collector fills in the rest.
-            stub = {"_": "user", "id": from_id["user_id"], "min": True}
+            stub = {"_": "User", "id": from_id["user_id"], "min": True}
             upsert_peer(
                 ctx.store, stub, raw_id, observed_at,
                 seen_in_chat=channel_id, seen_in_msg=m["id"],
@@ -137,10 +137,10 @@ class HistoryCollector:
             chunk = candidates[start : start + _GET_MESSAGES_CHUNK]
             results = await ctx.gateway.get_messages(ctx.input_channel, chunk)
             for r in results:
-                if r.get("_") != "messageEmpty":
+                if r.get("_", "").lower() != "messageempty":
                     continue
                 observed_at = utc_now_iso()
-                ctx.store.add_raw("messageEmpty", r, ctx.tier, {"channel_id": channel_id})
+                ctx.store.add_raw("MessageEmpty", r, ctx.tier, {"channel_id": channel_id})
                 mark_deleted(ctx.store, channel_id, r["id"], "empty", observed_at)
                 counts["tombstones"] += 1
 
@@ -168,10 +168,10 @@ class HistoryCollector:
             ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
         )
         ctx.store.add_raw(
-            diff.get("_", "updates.channelDifference"), diff, ctx.tier, {"channel_id": channel_id}
+            diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id}
         )
 
-        if diff.get("_") == "updates.channelDifferenceTooLong":
+        if diff.get("_", "").lower() == "channeldifferencetoolong":
             resynced_pts = diff.get("dialog", {}).get("pts", pts)
             set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
             return CollectResult(name=self.name, counts=counts, stopped="resynced")
@@ -180,10 +180,10 @@ class HistoryCollector:
             self._observe_message(ctx, channel_id, m, counts)
 
         for update in diff.get("other_updates", []):
-            kind = update.get("_")
-            if kind == "updateEditChannelMessage":
+            kind = update.get("_", "").lower()
+            if kind == "updateeditchannelmessage":
                 self._observe_message(ctx, channel_id, update["message"], counts)
-            elif kind == "updateDeleteChannelMessages":
+            elif kind == "updatedeletechannelmessages":
                 for mid in update.get("messages", []):
                     mark_deleted(ctx.store, channel_id, mid, "update", utc_now_iso())
                     counts["tombstones"] += 1

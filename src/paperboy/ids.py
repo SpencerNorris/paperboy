@@ -31,20 +31,46 @@ def msg_uri(channel_id: int, msg_id: int) -> str:
     return f"{_SCHEME}:msg:{channel_id}/{msg_id}"
 
 
+def primary_username(obj: dict) -> str | None:
+    """Extract the canonical username from a TL `Channel`/`Chat`/`User` dict.
+
+    Accounts/channels enrolled in Telegram's multi-username feature (extra
+    handles bought via Fragment, or just claimed) report the legacy
+    singular `username` field as null and list every handle in `usernames`
+    instead (`[{"username": ..., "editable": ..., "active": ...}, ...]`).
+    `editable: True` marks the account's own chosen primary handle;
+    verified against a live multi-username channel (Task 17 DoD smoke).
+    """
+    legacy = obj.get("username")
+    if legacy:
+        return legacy
+    usernames = obj.get("usernames") or []
+    for entry in usernames:
+        if entry.get("editable"):
+            return entry.get("username")
+    for entry in usernames:
+        if entry.get("active"):
+            return entry.get("username")
+    return None
+
+
 def peer_ref_uri(peer: dict | None) -> str | None:
     """Convert a TL `Peer*`/`InputPeer*` reference dict (e.g. a message's
     `from_id` or a forward header's `from_id`) to a paperboy URI, or None if
     absent/unrecognized. Shared by the message projection and the history
     collector's forward-edge extraction so both agree on one mapping.
+
+    Matched case-insensitively: Telethon's `to_dict()` uses the PascalCase
+    class name (`"PeerUser"`, ...), not the lowercase TL constructor name.
     """
     if not peer:
         return None
-    kind = peer.get("_", "")
-    if kind in ("peerUser", "inputPeerUser"):
+    kind = peer.get("_", "").lower()
+    if kind in ("peeruser", "inputpeeruser"):
         return user_uri(peer["user_id"])
-    if kind in ("peerChannel", "inputPeerChannel"):
+    if kind in ("peerchannel", "inputpeerchannel"):
         return channel_uri(peer["channel_id"])
-    if kind in ("peerChat", "inputPeerChat"):
+    if kind in ("peerchat", "inputpeerchat"):
         return chat_uri(peer["chat_id"])
     return None
 

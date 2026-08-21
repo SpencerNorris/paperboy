@@ -14,8 +14,10 @@ from paperboy.targets import Target
 
 
 def _pick_channel(chats: list[dict]) -> dict:
+    # Telethon's to_dict() uses the PascalCase class name ("Channel",
+    # "ChannelForbidden"), not the lowercase TL constructor name.
     for chat in chats:
-        if chat.get("_", "").startswith("channel"):
+        if chat.get("_", "").lower().startswith("channel"):
             return chat
     raise ValueError("resolve() returned no channel-typed chat for a channel-like target")
 
@@ -32,14 +34,14 @@ class ChannelCollector:
 
         resolved = await ctx.gateway.resolve(ctx.target.value)
         resolve_raw_id = ctx.store.add_raw(
-            resolved.get("_", "resolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw}
+            resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw}
         )
         chan = _pick_channel(resolved.get("chats", []))
         input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
 
         full = await ctx.gateway.get_full_channel(input_channel)
         full_raw_id = ctx.store.add_raw(
-            full.get("_", "messages.chatFull"), full, ctx.tier, {"channel_id": chan["id"]}
+            full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": chan["id"]}
         )
         full_chat = full["full_chat"]
         # Prefer the richer `chat` object returned alongside getFullChannel
@@ -76,7 +78,7 @@ class ChannelCollector:
             ctx.tier = "admin"
 
         self_user = await ctx.gateway.get_self()
-        self_raw_id = ctx.store.add_raw(self_user.get("_", "user"), self_user, "self", None)
+        self_raw_id = ctx.store.add_raw(self_user.get("_", "User"), self_user, "self", None)
         self_uri = upsert_peer(
             ctx.store, self_user, self_raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
         )

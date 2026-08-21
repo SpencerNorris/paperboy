@@ -71,7 +71,7 @@ def upsert_message(
     post_author = msg.get("post_author")
     grouped_id = msg.get("grouped_id")
     via_bot_id = msg.get("via_bot_id")
-    is_service = 1 if msg.get("_") == "messageService" else 0
+    is_service = 1 if msg.get("_", "").lower() == "messageservice" else 0
     chash = content_hash(text, media_json)
 
     store.conn.execute(

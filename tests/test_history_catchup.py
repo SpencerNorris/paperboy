@@ -88,8 +88,8 @@ async def test_catchup_new_message_is_inserted(tmp_path):
 @pytest.mark.asyncio
 async def test_catchup_too_long_resyncs_pts_and_flags_resynced(tmp_path):
     diff = {
-        "_": "updates.channelDifferenceTooLong",
-        "dialog": {"_": "dialog", "pts": 999},
+        "_": "ChannelDifferenceTooLong",
+        "dialog": {"_": "Dialog", "pts": 999},
         "messages": [], "chats": [], "users": [],
     }
     gw = FakeGateway({"channel_difference": diff})
