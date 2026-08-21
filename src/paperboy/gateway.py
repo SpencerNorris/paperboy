@@ -44,7 +44,20 @@ class Gateway(Protocol):
         ...
 
     async def get_self(self) -> dict:
-        """The collecting account's own basic user dict."""
+        """The collecting account's own user dict, `about` merged in from `getFullUser`."""
+        ...
+
+    async def get_authorizations(self) -> dict:
+        """`account.getAuthorizations` — `{"authorizations": [...]}`, used by `doctor` for
+        session age (the entry with `current: True`)."""
+        ...
+
+    async def get_password_state(self) -> dict:
+        """`account.getPassword` — includes `has_password` (2FA presence), used by `doctor`."""
+        ...
+
+    async def get_privacy(self, key: str) -> dict:
+        """`account.getPrivacy` for one key (`phone`/`lastseen`/`photo`) — `{"rules": [...]}`."""
         ...
 
 
@@ -53,7 +66,8 @@ class FakeGateway:
 
     `fixtures` keys: `resolve`, `full_channel`, `self`, `history` (a flat
     list, newest-first), `get_messages` (a `{id: message_dict}` lookup),
-    `channel_difference`.
+    `channel_difference`, `authorizations`, `password_state`, `privacy` (a
+    `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`).
     """
 
     def __init__(self, fixtures: dict) -> None:
@@ -89,6 +103,15 @@ class FakeGateway:
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         del input_channel, pts, limit
         return self._fx["channel_difference"]
+
+    async def get_authorizations(self) -> dict:
+        return self._fx["authorizations"]
+
+    async def get_password_state(self) -> dict:
+        return self._fx["password_state"]
+
+    async def get_privacy(self, key: str) -> dict:
+        return self._fx["privacy"][key]
 
 
 def _input_channel(input_channel: dict) -> InputChannel:
@@ -229,5 +252,59 @@ class TelethonGateway:
             ),
         )
         # UserFull wraps the actual User under `.users[0]`; expose the user,
-        # not the full-profile wrapper, matching `resolve`/history peers.
-        return result.users[0].to_dict()
+        # not the full-profile wrapper, matching `resolve`/history peers —
+        # but merge in `about` (bio), which only `full_user` carries and
+        # `doctor`'s minimal-profile check needs.
+        user_dict = result.users[0].to_dict()
+        user_dict["about"] = getattr(result.full_user, "about", None)
+        return user_dict
+
+    async def get_authorizations(self) -> dict:
+        from telethon.tl.functions.account import GetAuthorizationsRequest
+        from telethon.tl.types.account import Authorizations
+
+        result = cast(
+            Authorizations,
+            await self.budget.call(
+                "account.getAuthorizations", lambda: self.client(GetAuthorizationsRequest())
+            ),
+        )
+        return result.to_dict()
+
+    async def get_password_state(self) -> dict:
+        from telethon.tl.functions.account import GetPasswordRequest
+        from telethon.tl.types.account import Password
+
+        result = cast(
+            Password,
+            await self.budget.call(
+                "account.getPassword", lambda: self.client(GetPasswordRequest())
+            ),
+        )
+        return result.to_dict()
+
+    async def get_privacy(self, key: str) -> dict:
+        from telethon.tl.functions.account import GetPrivacyRequest
+        from telethon.tl.types import (
+            InputPrivacyKeyPhoneNumber,
+            InputPrivacyKeyProfilePhoto,
+            InputPrivacyKeyStatusTimestamp,
+        )
+        from telethon.tl.types.account import PrivacyRules
+
+        input_keys = {
+            "phone": InputPrivacyKeyPhoneNumber,
+            "lastseen": InputPrivacyKeyStatusTimestamp,
+            "photo": InputPrivacyKeyProfilePhoto,
+        }
+        if key not in input_keys:
+            raise ValueError(f"unknown privacy key: {key!r}")
+        input_key = input_keys[key]()
+        result = cast(
+            PrivacyRules,
+            await self.budget.call(
+                f"account.getPrivacy:{key}",
+                lambda: self.client(GetPrivacyRequest(key=input_key)),
+            ),
+        )
+        return result.to_dict()
