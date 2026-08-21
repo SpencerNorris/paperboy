@@ -1,0 +1,7 @@
+{
+  "_": "ChatInviteAlready",
+  "chat": {
+    "_": "Channel", "id": 777, "access_hash": 555, "title": "Known Group",
+    "username": "knowngroup", "megagroup": true
+  }
+}
