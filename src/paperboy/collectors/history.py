@@ -27,6 +27,22 @@ _GET_MESSAGES_CHUNK = 200
 _CHANNEL_DIFFERENCE_LIMIT = 100
 
 
+def _author_stub(from_id: dict | None) -> dict | None:
+    """A minimal `min` peer object for a message's `from_id`, or None.
+
+    Matched case-insensitively: Telethon's `to_dict()` emits the PascalCase
+    class name (`"PeerUser"`), not the lowercase TL constructor name.
+    """
+    if from_id is None:
+        return None
+    kind = from_id.get("_", "").lower()
+    if kind == "peeruser":
+        return {"_": "User", "id": from_id["user_id"], "min": True}
+    if kind == "peerchannel":
+        return {"_": "Channel", "id": from_id["channel_id"], "min": True}
+    return None
+
+
 def _latest_revision_hash(ctx: CollectContext, uri: str) -> str | None:
     row = ctx.store.conn.execute(
         "SELECT content_hash FROM message_revisions WHERE message_uri=? "
@@ -42,8 +58,18 @@ class HistoryCollector:
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
 
-    async def collect(self, ctx: CollectContext) -> CollectResult:
-        if ctx.input_channel is None or ctx.channel_id is None:
+    async def collect(
+        self,
+        ctx: CollectContext,
+        *,
+        channel_id: int | None = None,
+        input_channel: dict | None = None,
+        probe_gaps: bool = True,
+        page_budget: int | None = None,
+    ) -> CollectResult:
+        channel_id = channel_id if channel_id is not None else ctx.channel_id
+        input_channel = input_channel if input_channel is not None else ctx.input_channel
+        if input_channel is None or channel_id is None:
             # The `channel` phase didn't complete (e.g. it raised `PhaseStop`
             # on a FLOOD_WAIT during resolve()/getFullChannel before setting
             # these) — a handled disposition the recipe layer records and
@@ -52,11 +78,16 @@ class HistoryCollector:
                 "history skipped: channel context not established "
                 "(channel phase did not complete)"
             )
-        channel_id = ctx.channel_id
         counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
 
         resume = get_state(ctx.store, "history", str(channel_id)) or {}
-        cursor: int = resume.get("offset_id", 0)
+        sweep = get_state(ctx.store, "history_sweep", str(channel_id)) or {}
+        high_water: int = sweep.get("max_id_seen", 0)
+        complete: bool = sweep.get("backfill_complete", False)
+        incremental = complete
+        prior_high = high_water
+        cursor: int = 0 if incremental else resume.get("offset_id", 0)
+        pages = 0
 
         ids_seen: set[int] = set()
         min_id: int | None = None
@@ -66,10 +97,11 @@ class HistoryCollector:
             page = [
                 m
                 async for m in ctx.gateway.iter_history(
-                    ctx.input_channel, offset_id=cursor, limit=_HISTORY_PAGE_SIZE
+                    input_channel, offset_id=cursor, limit=_HISTORY_PAGE_SIZE
                 )
             ]
             if not page:
+                complete = True
                 break
 
             for m in page:
@@ -80,10 +112,30 @@ class HistoryCollector:
                 max_id = mid if max_id is None else max(max_id, mid)
 
             cursor = min(m["id"] for m in page)
+            high_water = max(high_water, max(m["id"] for m in page))
             set_state(ctx.store, "history", str(channel_id), {"offset_id": cursor})
+            set_state(ctx.store, "history_sweep", str(channel_id),
+                      {"max_id_seen": high_water, "backfill_complete": complete})
+            pages += 1
+            if page_budget is not None and pages >= page_budget:
+                raise PhaseStop(
+                    f"page budget ({page_budget}) reached at offset_id={cursor}; "
+                    "re-run to continue from the saved cursor"
+                )
+            if incremental and cursor <= prior_high:
+                break
 
-        if min_id is not None and max_id is not None:
-            await self._probe_gaps(ctx, channel_id, min_id, max_id, ids_seen, counts)
+        set_state(ctx.store, "history_sweep", str(channel_id),
+                  {"max_id_seen": high_water, "backfill_complete": complete})
+
+        # `add_range` records a span as *verified-complete* — "every id was
+        # either stored or probed" (store/sync.py). With probing off that is
+        # untrue, so writing it would make `missing_ids()` report zero gaps for
+        # this channel forever. Both go together or neither does.
+        if probe_gaps and min_id is not None and max_id is not None:
+            await self._probe_gaps(
+                ctx, channel_id, input_channel, min_id, max_id, ids_seen, counts
+            )
             add_range(ctx.store, channel_id, min_id, max_id)
 
         return CollectResult(name=self.name, counts=counts)
@@ -103,12 +155,14 @@ class HistoryCollector:
         if after != before:
             counts["revisions"] += 1
 
-        from_id = m.get("from_id")
-        if from_id and from_id.get("_", "").lower() == "peeruser":
-            # We only have the bare peer reference here (no username/name) —
-            # record it as `min`, honestly reflecting how little we know; a
-            # Phase 2 `profiles` collector fills in the rest.
-            stub = {"_": "User", "id": from_id["user_id"], "min": True}
+        # We only have the bare peer reference here (no username/name) — record
+        # it as `min`, honestly reflecting how little we know; a Phase 2
+        # `profiles` collector fills in the rest. Channel-typed authors count
+        # too: in a linked discussion group an anonymous or channel-authored
+        # comment arrives as `PeerChannel`, and those commenters are exactly
+        # the people-discovery data the `discussion` phase exists to collect.
+        stub = _author_stub(m.get("from_id"))
+        if stub is not None:
             upsert_peer(
                 ctx.store, stub, raw_id, observed_at,
                 seen_in_chat=channel_id, seen_in_msg=m["id"],
@@ -127,6 +181,7 @@ class HistoryCollector:
         self,
         ctx: CollectContext,
         channel_id: int,
+        input_channel: dict,
         min_id: int,
         max_id: int,
         ids_seen: set[int],
@@ -139,11 +194,10 @@ class HistoryCollector:
         previously verified-complete range at all, useful across separate
         runs, not within one).
         """
-        assert ctx.input_channel is not None
         candidates = sorted(set(range(min_id, max_id + 1)) - ids_seen)
         for start in range(0, len(candidates), _GET_MESSAGES_CHUNK):
             chunk = candidates[start : start + _GET_MESSAGES_CHUNK]
-            results = await ctx.gateway.get_messages(ctx.input_channel, chunk)
+            results = await ctx.gateway.get_messages(input_channel, chunk)
             for r in results:
                 if r.get("_", "").lower() != "messageempty":
                     continue
