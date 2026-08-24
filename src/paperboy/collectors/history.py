@@ -82,11 +82,21 @@ class HistoryCollector:
 
         resume = get_state(ctx.store, "history", str(channel_id)) or {}
         sweep = get_state(ctx.store, "history_sweep", str(channel_id)) or {}
-        high_water: int = sweep.get("max_id_seen", 0)
+        committed_high: int = sweep.get("max_id_seen", 0)
         complete: bool = sweep.get("backfill_complete", False)
+        resuming: bool = sweep.get("incremental_in_progress", False)
+
+        # Backfill always resumes from its stored cursor. A *fresh* incremental
+        # run starts at the newest message instead — but one that a page budget
+        # interrupted must resume from where it stopped, or every id between
+        # that stop and the previous high-water mark is fetched by nobody, ever.
         incremental = complete
-        prior_high = high_water
-        cursor: int = 0 if incremental else resume.get("offset_id", 0)
+        cursor: int = 0 if (incremental and not resuming) else resume.get("offset_id", 0)
+        stop_at = committed_high if incremental else 0
+        # The highest id seen so far by a sweep that has not finished yet. It
+        # must survive across budget stops: the true maximum is observed on the
+        # FIRST page of a catch-up, which is usually the run the budget kills.
+        pending_high: int = sweep.get("pending_high", committed_high)
         pages = 0
 
         ids_seen: set[int] = set()
@@ -112,21 +122,37 @@ class HistoryCollector:
                 max_id = mid if max_id is None else max(max_id, mid)
 
             cursor = min(m["id"] for m in page)
-            high_water = max(high_water, max(m["id"] for m in page))
+            pending_high = max(pending_high, max(m["id"] for m in page))
             set_state(ctx.store, "history", str(channel_id), {"offset_id": cursor})
-            set_state(ctx.store, "history_sweep", str(channel_id),
-                      {"max_id_seen": high_water, "backfill_complete": complete})
+            # `max_id_seen` deliberately does NOT advance here. Promoting it
+            # before the span below has been walked would make the next run's
+            # stop test fire on its own first page, stranding everything in
+            # between. It is committed only on a clean finish, below.
+            set_state(ctx.store, "history_sweep", str(channel_id), {
+                "max_id_seen": committed_high,
+                "pending_high": pending_high,
+                "backfill_complete": complete,
+                "incremental_in_progress": incremental,
+            })
+
+            # Caught up beats out of budget: if we have paged back into known
+            # territory the run is finished, budget or no budget.
+            if incremental and cursor <= stop_at:
+                break
             pages += 1
             if page_budget is not None and pages >= page_budget:
                 raise PhaseStop(
                     f"page budget ({page_budget}) reached at offset_id={cursor}; "
                     "re-run to continue from the saved cursor"
                 )
-            if incremental and cursor <= prior_high:
-                break
 
-        set_state(ctx.store, "history_sweep", str(channel_id),
-                  {"max_id_seen": high_water, "backfill_complete": complete})
+        settled = max(committed_high, pending_high)
+        set_state(ctx.store, "history_sweep", str(channel_id), {
+            "max_id_seen": settled,
+            "pending_high": settled,
+            "backfill_complete": complete,
+            "incremental_in_progress": False,
+        })
 
         # `add_range` records a span as *verified-complete* — "every id was
         # either stored or probed" (store/sync.py). With probing off that is
