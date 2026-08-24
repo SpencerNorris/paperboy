@@ -108,21 +108,35 @@ class FakeGateway:
         # duplicate never reaches the gateway at all, not just that its
         # result was discarded.
         self.download_media_calls: list[int] = []
+        # Every protocol method invoked, in call order. Lets a test assert that
+        # a code path made NO RPC at all, or exactly one — an assertion that is
+        # otherwise unfalsifiable, because a fake that records nothing looks
+        # identical whether it was called or not.
+        self.calls: list[str] = []
+        # Every `input_channel` `iter_history` was pointed at. The only way to
+        # catch a sweep silently aimed at the wrong channel or built with a
+        # stale access hash.
+        self.history_targets: list[dict] = []
 
     async def resolve(self, target_value: str) -> dict:
+        self.calls.append("resolve")
         del target_value
         return self._fx["resolve"]
 
     async def get_full_channel(self, input_channel: dict) -> dict:
+        self.calls.append("get_full_channel")
         del input_channel
         return self._fx["full_channel"]
 
     async def get_self(self) -> dict:
+        self.calls.append("get_self")
         return self._fx["self"]
 
     async def iter_history(
         self, input_channel: dict, *, offset_id: int, limit: int
     ) -> AsyncIterator[dict]:
+        self.calls.append("iter_history")
+        self.history_targets.append(dict(input_channel))
         del input_channel
         history = self._fx.get("history", [])
         # Mirrors real getHistory semantics: offset_id=0 means "from the
@@ -132,24 +146,30 @@ class FakeGateway:
             yield m
 
     async def get_messages(self, input_channel: dict, ids: list[int]) -> list[dict]:
+        self.calls.append("get_messages")
         del input_channel
         table: dict[int, dict] = self._fx.get("get_messages", {})
         return [table.get(i, {"_": "MessageEmpty", "id": i}) for i in ids]
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
+        self.calls.append("get_channel_difference")
         del input_channel, pts, limit
         return self._fx["channel_difference"]
 
     async def get_authorizations(self) -> dict:
+        self.calls.append("get_authorizations")
         return self._fx["authorizations"]
 
     async def get_password_state(self) -> dict:
+        self.calls.append("get_password_state")
         return self._fx["password_state"]
 
     async def get_privacy(self, key: str) -> dict:
+        self.calls.append("get_privacy")
         return self._fx["privacy"][key]
 
     async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        self.calls.append("download_media")
         del input_channel
         self.download_media_calls.append(message["id"])
         value = self._fx.get("media", {}).get(message["id"])
@@ -158,12 +178,14 @@ class FakeGateway:
         return value
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        self.calls.append("get_channel_recommendations")
         del input_channel
         return self._fx_or_raise(
             "channel_recommendations", {"_": "messages.chats", "chats": []}
         )
 
     async def check_chat_invite(self, hash_: str) -> dict:
+        self.calls.append("check_chat_invite")
         table: dict[str, dict] = self._fx.get("chat_invite", {})
         value = table.get(hash_)
         if value is None:
@@ -173,6 +195,7 @@ class FakeGateway:
         return value
 
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        self.calls.append("get_sponsored_messages")
         del input_channel
         return self._fx_or_raise(
             "sponsored_messages", {"_": "messages.sponsoredMessagesEmpty"}

@@ -103,6 +103,28 @@ def test_counts_distinct_peers_not_occurrences(tmp_path):
         _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
         _post(st, 5, 11, [{"_": "PeerUser", "user_id": 111}])
         assert backfill_recent_repliers(st, 5, "stranger") == 1
+        # One peer, but TWO posts, so TWO distinct triples. Amendment 4's
+        # dedup is on the whole (subject, predicate, object) — a guard that
+        # forgot `object_uri` would collapse these to one and still return 1.
+        assert st.conn.execute(
+            "select count(*) c from edges where predicate='commented_on'"
+        ).fetchone()["c"] == 2
+
+
+def test_two_repliers_on_one_post_each_get_an_edge(tmp_path):
+    """The other axis: same post, different people.
+
+    A dedup guard that forgot `subject_uri` would keep only the first
+    commenter and still look correct everywhere else.
+    """
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111},
+                          {"_": "PeerUser", "user_id": 222}])
+        assert backfill_recent_repliers(st, 5, "stranger") == 2
+        subjects = [r["subject_uri"] for r in st.conn.execute(
+            "select subject_uri from edges where predicate='commented_on' order by subject_uri"
+        )]
+        assert subjects == ["tg:user:111", "tg:user:222"]
 
 
 def test_posts_without_repliers_are_ignored(tmp_path):
