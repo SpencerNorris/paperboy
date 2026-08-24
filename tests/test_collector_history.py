@@ -348,3 +348,30 @@ async def test_incremental_catch_up_across_budget_stops_loses_no_messages(tmp_pa
         sweep = get_state(st, "history_sweep", "5")
         assert sweep is not None
         assert sweep["max_id_seen"] == 800
+
+
+@pytest.mark.asyncio
+async def test_incremental_catch_up_stops_at_the_high_water_mark(tmp_path):
+    """The stop condition must FIRE, not merely avoid losing anything.
+
+    Without `if incremental and cursor <= stop_at: break` every catch-up
+    re-sweeps the whole channel and still passes every other assertion here —
+    no id is lost, the counts are right, the state is right. Only the RPC
+    count betrays it: on the live ~35k-message group that is ~351
+    `messages.getHistory` calls per run instead of 1, forever, plus a
+    `raw_records` and `message_metrics` row per message re-observed.
+    """
+    gw = FakeGateway({"history": [_m(i) for i in range(250, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        assert get_state(st, "history_sweep", "5")["backfill_complete"] is True
+
+        # Two new messages arrive. Catching up must cost ONE page, not a
+        # re-sweep: the first page reaches id 152 <= max_id_seen 250, so the
+        # loop breaks before even the terminating empty-page call.
+        gw2 = FakeGateway({"history": [_m(i) for i in range(252, 0, -1)], "get_messages": {}})
+        await HistoryCollector().collect(_ctx(st, gw2), probe_gaps=False)
+        assert gw2.calls.count("iter_history") == 1
+        assert {r["msg_id"] for r in st.conn.execute("select msg_id from messages")} == set(
+            range(1, 253)
+        )

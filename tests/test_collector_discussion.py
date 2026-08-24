@@ -963,6 +963,13 @@ async def test_a_second_run_collects_new_group_messages_via_the_high_water_mark(
         # A new comment (id 300) arrives after the first sweep completed.
         gw2 = _gw([_comment(300, 100, 999), _comment(200, 100, 111), _mirror(100, 42)])
         res2 = await DiscussionCollector().collect(_ctx(st, gw2))
+        # The stop condition must actually FIRE, not merely not-lose-anything.
+        # Exactly one page: the data page returns cursor=100 <= stop_at=200, so
+        # the loop breaks BEFORE the terminating empty-page call. Without the
+        # high-water-mark stop this is a full re-sweep of the group on every
+        # run — ~351 RPCs instead of 1 on the live target — and every other
+        # assertion here still passes. Do not "fix" this to 2.
+        assert gw2.calls.count("iter_history") == 1
 
         assert st.conn.execute(
             "select count(*) c from messages where channel_id=? and msg_id=300", (GROUP_ID,)
@@ -1206,3 +1213,25 @@ async def test_real_capture_fixture_maps_and_counts_correctly(tmp_path):
         ).fetchone()
         assert unmapped_reply is not None
         assert unmapped_reply["object_uri"] == f"tg:msg:{_REAL_GROUP_ID}/9999"
+
+
+@pytest.mark.asyncio
+async def test_one_commenter_on_two_posts_keeps_both_edges(tmp_path):
+    """Amendment 4's dedup is on the FULL triple, not on (subject, predicate).
+
+    A guard written as `WHERE subject_uri=? AND predicate=?` — the natural
+    misreading of "one commented_on per commenter" — passes every other test
+    in this suite while silently keeping only the first post each regular ever
+    commented on. On the live group that is the difference between a real
+    person-to-post graph and a single edge per person.
+    """
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        gw = _gw([_comment(201, 101, 111), _comment(200, 100, 111),
+                  _mirror(101, 43), _mirror(100, 42)])
+        await DiscussionCollector().collect(_ctx(st, gw))
+        objects = [r["object_uri"] for r in st.conn.execute(
+            "select object_uri from edges where predicate='commented_on' "
+            "and subject_uri='tg:user:111' order by object_uri"
+        )]
+        assert objects == [f"tg:msg:{CHANNEL_ID}/42", f"tg:msg:{CHANNEL_ID}/43"]
