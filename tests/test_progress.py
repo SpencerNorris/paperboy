@@ -16,10 +16,12 @@ def test_human_bytes():
 def test_phase_status_reads_store(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         st.conn.execute(
-            "INSERT INTO media (sha256, kind, size, downloaded_at) VALUES ('a', 'photo', 1048576, 't')"
+            "INSERT INTO media (sha256, kind, size, downloaded_at) "
+            "VALUES ('a', 'photo', 1048576, 't')"
         )
         st.conn.execute(
-            "INSERT INTO media (sha256, kind, size, downloaded_at) VALUES ('b', 'document', 2097152, 't')"
+            "INSERT INTO media (sha256, kind, size, downloaded_at) "
+            "VALUES ('b', 'document', 2097152, 't')"
         )
         assert phase_status(st, "media") == "2 files · 3.0 MB"
         assert phase_status(st, "channel") == "resolving…"

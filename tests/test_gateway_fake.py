@@ -146,3 +146,37 @@ async def test_calls_log_records_every_protocol_method():
     }
     assert expected <= set(gw.calls)
     assert len(gw.calls) == len(expected)  # one call each above, no duplicates
+
+
+@pytest.mark.asyncio
+async def test_iter_history_instrumentation_is_per_call_not_per_message():
+    """`test_calls_log_records_every_protocol_method` above can't distinguish
+    one append per *call* from one append per *yielded message* — its
+    `history` fixture is a single message, so `len(gw.calls) ==
+    len(expected)` holds either way. That distinction matters:
+    `test_skips_when_the_group_requires_joining_to_read` and
+    `test_skips_when_the_group_access_hash_is_unknown` (in
+    `tests/test_collector_discussion.py`) both build their gateway with an
+    EMPTY history and assert `gw.calls == []` to prove the sweep never ran.
+    Under per-message instrumentation a call returning zero rows leaves no
+    trace, so those assertions would pass even if the collector ignored the
+    guardrail and swept the group anyway — paperboy's passivity guardrail
+    would lose its detection mechanism entirely. Amendment 8 specifies the
+    correct placement: at the top of `iter_history`, before the existing
+    `del input_channel`. Pin one call per `iter_history` invocation
+    regardless of how many (or how few) messages it yields, for both
+    `calls` and `history_targets`."""
+    fx = {"history": [{"_": "message", "id": i, "date": 1767322445} for i in (3, 2, 1)]}
+    gw = FakeGateway(fx)
+    ic = {"channel_id": 5, "access_hash": 1}
+
+    async for _ in gw.iter_history(ic, offset_id=0, limit=100):
+        pass
+    assert gw.calls.count("iter_history") == 1
+    assert len(gw.history_targets) == 1
+
+    empty_gw = FakeGateway({"history": []})
+    async for _ in empty_gw.iter_history(ic, offset_id=0, limit=100):
+        pass
+    assert empty_gw.calls.count("iter_history") == 1
+    assert len(empty_gw.history_targets) == 1
