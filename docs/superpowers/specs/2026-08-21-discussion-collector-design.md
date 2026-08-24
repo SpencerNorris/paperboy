@@ -37,6 +37,7 @@ groups-only, so it belongs with `participants`); joining anything.
 | Relationship to `history` | **Generalize `HistoryCollector`** to take an explicit target | One page loop, one set of resumability semantics, no duplicated FLOOD_WAIT/cursor logic that would drift. |
 | Deletion gap-probing | **Off** for the discussion group | On ~35k ids where members delete routinely, probing is a second pass the size of the sweep. `evidence='gap'` is documented as the weak tier anyway (`docs/data-model.md`). |
 | Storage | Reuse `messages` under `channel_id = <group id>` | **No migration.** `(channel_id, msg_id)` is already the unique index; `reply_to_msg_id`/`reply_to_top_id` already exist; `sync_state`/`sync_ranges` are already keyed by channel id. |
+| Re-collection | **High-water mark**: `max_id_seen` alongside `offset_id` | Without it the sweep is one-shot. `HistoryCollector` never resets its cursor on loop exhaustion, so after a full sweep it pages strictly *older* forever. The channel is rescued by pts-based `catch_up()`; the linked group has no pts seed, so it would freeze at day one. |
 | Edge shape | Both `person → post` and `comment → parent` | Two questions, two predicates, each answerable without a join. Both are in the `docs/data-model.md` vocabulary. |
 
 ## 4. Preflight
@@ -46,7 +47,17 @@ groups-only, so it belongs with `participants`); joining anything.
    discussion group.
 2. Build `input_channel` for the group from the `peers` row's `access_hash` —
    already captured from ChatFull's `chats` array by the `channel` collector.
-   **No `resolve` RPC.** If no `peers` row or no `access_hash`, skip and record.
+   **No `resolve` RPC.** If there is no `peers` row, or `access_hash` is absent
+   **or falsy** (a stored `0` is not a usable hash — it yields `CHANNEL_INVALID`
+   against live Telegram, a phase error rather than the clean skip promised
+   here), skip and record.
+
+   **The two skip reasons must be lexically disjoint**, because tests assert on
+   them: the no-group reason is `"no linked discussion group"` and the hash
+   reason is `"discussion group {id}: no access hash known"`. Neither is a
+   substring-match for the other. A reason containing both "linked" and "access"
+   would let a test pass on the wrong branch — including on the falsy-`0` bug
+   above.
 3. If the group's `join_to_send` flag is set, reading requires membership.
    `SkipAndRecord` — never a hard failure, and never an implicit join.
 
@@ -72,7 +83,42 @@ them is a design violation, not a test fix — this is the only part of this
 feature with blast radius into shipped Phase 1 code.
 
 `sync_state` scope stays `"history"`, keyed by the *target* channel id, so the
-channel and its group resume independently without a new namespace.
+channel and its group resume independently without a new namespace. Its value
+gains two fields:
+
+```python
+{"offset_id": int, "max_id_seen": int, "backfill_complete": bool}
+```
+
+**Two modes, one page loop.** They differ only in the stop condition:
+
+- **Backfill** (`backfill_complete` false) — page oldest-ward from `offset_id`
+  exactly as today. Stop on an empty page; on that stop set
+  `backfill_complete = True` and reset `offset_id = 0`.
+- **Incremental** (`backfill_complete` true) — page from `offset_id = 0`, i.e.
+  newest-first, and stop as soon as the page's lowest id is `<= max_id_seen`.
+  Reset `offset_id = 0` on that stop so the next run also starts from newest.
+
+`max_id_seen` advances to the highest id observed in either mode and is
+persisted with the cursor on every page, so a run killed mid-page resumes
+without re-fetching what it already stored.
+
+Absent state, both fields default to `offset_id = 0`, `max_id_seen = 0`,
+`backfill_complete = False` — which is exactly today's behaviour, so `history`
+is unaffected.
+
+**`add_range` is called only when `probe_gaps` is true.** `store/sync.py`
+documents a range as "verified-complete — every id in the span was either
+stored or probed". With probing off that invariant is false, so writing the
+range would make `missing_ids()` report zero gaps for the group forever. The
+discussion group therefore gets no `sync_ranges` rows at all.
+
+**Comment authors that are channels.** `_observe_message` currently upserts a
+peer only for a `PeerUser` `from_id`. Anonymous and channel-authored comments
+carry `PeerChannel`, and they are people-discovery data too, so the projection
+widens to both. This lives here, in `history.py`, because that is where message
+observation happens — `discussion.py` must not grow a second, divergent peer
+pass.
 
 ## 6. Comment → post mapping
 
@@ -96,6 +142,15 @@ comment whose `reply_to_top_id` resolves to no known mirror still gets stored
 and still gets its `replied_to` edge — it just gets no `commented_on` edge.
 Unmapped comments are counted and reported, never silently dropped.
 
+**`unmapped` counts mapping *failures*, not non-candidates.** A message is a
+candidate only if it carries a `reply_to_top_id`. Ordinary in-group replies
+(`reply_to_top_id` NULL) and plain chatter were never comment-thread posts, so
+they get their `replied_to` edge where applicable and are **not** counted as
+unmapped. Counting them would put tens of thousands of ordinary messages into
+the counter on the live target and destroy the only signal §13.3 relies on to
+detect a mis-attribution regression. A candidate that resolves to no mirror, or
+that has no resolvable author, is counted exactly once.
+
 ## 7. Edges emitted
 
 | Subject | Predicate | Object |
@@ -104,6 +159,17 @@ Unmapped comments are counted and reported, never silently dropped.
 | `tg:msg:<group_id>/<comment_id>` | `replied_to` | `tg:msg:<group_id>/<parent_id>` |
 
 Both carry `observed_at`, `tier`, and `source_raw_id` like every other edge.
+
+**Both are idempotent on `(subject_uri, predicate, object_uri)`.**
+`_write_thread_edges` re-scans every stored group row on every run — it must, so
+that a comment paged in before its mirror still maps later — so an unguarded
+insert would append a fresh row, with a fresh `observed_at` and the *previous*
+run's `source_raw_id`, for evidence this run never gathered. On the live target
+that is roughly 70k phantom rows per re-run, and it multiplies every degree
+count an analyst reads off `edges`. These two predicates are structural facts
+("X commented on Y"), not observations that vary over time like
+`message_metrics`, so re-observing them carries no information. Skip the insert
+when an identical triple already exists.
 `commented_on` evidence records the comment URI it was derived from.
 
 Anonymous/channel-authored comments produce a `tg:channel:<id>` subject rather
@@ -195,7 +261,7 @@ invite-roster fix was.
 
 | File | Change |
 |---|---|
-| `src/paperboy/collectors/history.py` | Generalize `collect()`; defaults preserve behaviour |
+| `src/paperboy/collectors/history.py` | Generalize `collect()`; high-water-mark state; `add_range` gated on `probe_gaps`; `PeerChannel` authors projected. Defaults preserve behaviour. **Sole owner: Task 1.** |
 | `src/paperboy/collectors/discussion.py` | New |
 | `src/paperboy/config.py` | `discussion_page_budget` |
 | `src/paperboy/recipes.py` | Register after `history` |
