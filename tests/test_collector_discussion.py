@@ -1,6 +1,17 @@
 """The `discussion` collector: linked-group sweep, comment→post mapping, edges."""
 
-from __future__ import annotations
+# `paperboy.collectors.discussion` does not exist yet (Task 3), so ruff's
+# isort currently classifies it third-party and sorts it next to `pytest`
+# below. Once Task 3 lands, that same module becomes first-party and isort
+# will want it moved into the `paperboy.*` group instead — flipping the
+# "correct" ordering out from under this file with no test-side edit
+# possible, since import classification is filesystem-existence-driven and
+# Task 2/Task 3 create their modules independently and in no fixed order.
+# Suppressing I001 here keeps this file's own ordering stable (and importable
+# either way) across every intermediate state instead of chasing a moving
+# target; `ruff check --fix` still finds and fixes real ordering mistakes
+# everywhere else.
+from __future__ import annotations  # noqa: I001
 
 import json
 import logging
@@ -963,7 +974,9 @@ async def test_a_second_run_collects_new_group_messages_via_the_high_water_mark(
         ).fetchone()
         assert row is not None
         assert row["object_uri"] == f"tg:msg:{CHANNEL_ID}/42"
-        assert get_state(st, "history_sweep", str(GROUP_ID))["max_id_seen"] == 300
+        sweep = get_state(st, "history_sweep", str(GROUP_ID))
+        assert sweep is not None
+        assert sweep["max_id_seen"] == 300
 
 
 @pytest.mark.asyncio
@@ -997,16 +1010,26 @@ async def test_thread_edges_do_not_leak_across_channels(tmp_path):
     channel (id `CHANNEL_ID`) with a mirror-shaped and a reply-shaped
     message the way `history` already would have, via a direct
     `HistoryCollector` run against `ctx.channel_id`, then confirm the
-    group's own sweep produces only the edges its own comments earn."""
+    group's own sweep produces only the edges its own comments earn.
+
+    `_mirror(300, 999)` is seeded under `CHANNEL_ID`'s own message space —
+    mirror-shaped and origin-valid, so a `_mirror_map` that forgets its
+    `WHERE channel_id=?` predicate would happily fold it in. The group's own
+    sweep then carries `_comment(201, 300, 112)`, a comment whose
+    `reply_to_top_id` (300) matches that foreign row's id but which the
+    group has no mirror for at all. A correct, channel-scoped map cannot
+    resolve id 300 within the group, so the comment must land in
+    `unmapped`, and 112 must never appear as a `commented_on` subject — that
+    is the only way this test can tell the two implementations apart."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st, GROUP_ID)
         await HistoryCollector().collect(
-            _ctx(st, _gw([_mirror(9001, 42), _comment(9002, 9001, 555)]))
+            _ctx(st, _gw([_mirror(9001, 42), _comment(9002, 9001, 555), _mirror(300, 999)]))
         )
         res = await DiscussionCollector().collect(
-            _ctx(st, _gw([_comment(200, 100, 111), _mirror(100, 42)]))
+            _ctx(st, _gw([_comment(200, 100, 111), _mirror(100, 42), _comment(201, 300, 112)]))
         )
-        assert res.counts["unmapped"] == 0
+        assert res.counts["unmapped"] == 1
         commented = {
             r["subject_uri"]: r["object_uri"]
             for r in st.conn.execute(
@@ -1018,6 +1041,59 @@ async def test_thread_edges_do_not_leak_across_channels(tmp_path):
             "select count(*) c from edges where predicate='replied_to' and subject_uri=?",
             (f"tg:msg:{CHANNEL_ID}/9002",),
         ).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_member_forwards_do_not_crash_the_mirror_map(tmp_path):
+    """Ordinary member forwards are the most common message shape in a real
+    discussion group, and every `fwd_from`-bearing fixture elsewhere in this
+    file is mirror-shaped (a `PeerChannel` origin plus `channel_post`). A
+    member forward's `fwd_from.from_id` is a `PeerUser` with no
+    `channel_post` at all, and a hidden-origin forward carries only
+    `from_name` with `from_id` absent entirely. `_mirror_map` must treat
+    both as "not a mirror" and move on rather than raising `TypeError`/
+    `KeyError` — `recipes.collect_channel` only catches
+    `SkipAndRecord`/`PhaseStop`/`HardStop` (src/paperboy/recipes.py), so
+    anything else here would escape the `discussion` phase and crash the
+    whole collect run against a live target."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        user_forward = {
+            "_": "Message", "id": 301, "message": "fwd", "date": 1767322445,
+            "peer_id": {"_": "PeerChannel", "channel_id": GROUP_ID},
+            "from_id": {"_": "PeerUser", "user_id": 113},
+            "fwd_from": {"_": "MessageFwdHeader", "from_id": {"_": "PeerUser", "user_id": 900}},
+        }
+        hidden_forward = {
+            "_": "Message", "id": 302, "message": "fwd2", "date": 1767322445,
+            "peer_id": {"_": "PeerChannel", "channel_id": GROUP_ID},
+            "from_id": {"_": "PeerUser", "user_id": 114},
+            "fwd_from": {"_": "MessageFwdHeader", "from_name": "Anon"},
+        }
+        res = await DiscussionCollector().collect(
+            _ctx(
+                st,
+                _gw([user_forward, hidden_forward, _comment(200, 100, 111), _mirror(100, 42)]),
+            )
+        )
+        # Neither forward is reply-shaped, so neither is an unmapped
+        # candidate (amendment 5) -- only the plain comment's mapping counts.
+        assert res.counts["unmapped"] == 0
+        stored = {
+            r["msg_id"]
+            for r in st.conn.execute(
+                "select msg_id from messages where channel_id=?", (GROUP_ID,)
+            ).fetchall()
+        }
+        assert {301, 302}.issubset(stored)
+        commented_subjects = {
+            r["subject_uri"]
+            for r in st.conn.execute(
+                "select subject_uri from edges where predicate='commented_on'"
+            ).fetchall()
+        }
+        assert "tg:user:113" not in commented_subjects
+        assert "tg:user:114" not in commented_subjects
 
 
 def test_applies_to_channel_like_targets():
