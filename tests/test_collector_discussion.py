@@ -11,10 +11,12 @@ from paperboy.collectors.discussion import DiscussionCollector
 
 from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext
+from paperboy.collectors.history import HistoryCollector
 from paperboy.config import load_settings
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
 from paperboy.store.peers import upsert_peer
+from paperboy.store.sync import get_state
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
 
@@ -95,6 +97,11 @@ async def test_skips_cleanly_when_there_is_no_linked_group(tmp_path):
         res = await DiscussionCollector().collect(_ctx(st, _gw([])))
         assert res.stopped is not None
         assert "linked" in res.stopped.lower()
+        # Amendment 6: the two skip reasons must be lexically disjoint — the
+        # old pair both contained "linked", which let a test asserting only
+        # "linked" in stopped pass on the wrong branch, including on the
+        # falsy-`0` access-hash bug that branch existed to catch.
+        assert "access" not in res.stopped.lower()
 
 
 @pytest.mark.asyncio
@@ -108,6 +115,7 @@ async def test_skips_cleanly_when_linked_chat_id_is_zero(tmp_path):
         res = await DiscussionCollector().collect(_ctx(st, _gw([])))
         assert res.stopped is not None
         assert "linked" in res.stopped.lower()
+        assert "access" not in res.stopped.lower()
 
 
 @pytest.mark.asyncio
@@ -132,6 +140,28 @@ async def test_skips_when_the_group_access_hash_is_unknown(tmp_path):
         res = await DiscussionCollector().collect(_ctx(st, gw))
         assert res.stopped is not None
         assert "access" in res.stopped.lower()
+        assert "linked" not in res.stopped.lower()
+        assert gw.calls == []
+
+
+@pytest.mark.asyncio
+async def test_skips_when_the_group_access_hash_is_zero(tmp_path):
+    """Amendment 6 / spec §4.2: a stored `0` is not a usable hash — it
+    yields `CHANNEL_INVALID` against live Telegram, a phase error rather
+    than the clean skip promised here. `upsert_peer` stores
+    `obj.get("access_hash")` verbatim, so a `min` Channel with
+    `access_hash: 0` puts a real `0` in the row; a guard written as
+    `peer["access_hash"] is None` (the plan's own verbatim code) misses it
+    entirely and the collector proceeds to sweep with an unusable hash."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        st.conn.execute("update peers set access_hash=0 where uri=?",
+                        (f"tg:channel:{GROUP_ID}",))
+        gw = _gw([])
+        res = await DiscussionCollector().collect(_ctx(st, gw))
+        assert res.stopped is not None
+        assert "access" in res.stopped.lower()
+        assert "linked" not in res.stopped.lower()
         assert gw.calls == []
 
 
@@ -151,6 +181,7 @@ async def test_skips_when_there_is_no_peers_row_for_the_group_at_all(tmp_path):
         res = await DiscussionCollector().collect(_ctx(st, _gw([])))
         assert res.stopped is not None
         assert "access" in res.stopped.lower()
+        assert "linked" not in res.stopped.lower()
 
 
 @pytest.mark.asyncio
@@ -362,7 +393,12 @@ async def test_a_mirror_paged_in_after_its_comments_still_maps_within_one_run(tm
     which on the live ~35k-message/~350-page target is nearly all of them."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st, GROUP_ID)
-        comments = [_comment(1000 + i, 100, 111) for i in range(149, -1, -1)]
+        # Distinct author per comment (amendment 4: thread edges are
+        # idempotent on the (subject, predicate, object) triple, so 150
+        # comments from the SAME author would collapse into 1 stored edge —
+        # that would make this test assert the dedup guard's absence, not
+        # the mirror-rebuild behaviour it's actually pinning).
+        comments = [_comment(1000 + i, 100, 111 + i) for i in range(149, -1, -1)]
         history = comments + [_mirror(100, 42)]
         res = await DiscussionCollector().collect(_ctx(st, _gw(history)))
         assert res.counts["unmapped"] == 0
@@ -386,7 +422,11 @@ async def test_resumed_run_maps_comments_stored_before_their_mirror_arrived(tmp_
     `_write_thread_edges` rebuilds the map from stored rows."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st, GROUP_ID)
-        comments = [_comment(1000 + i, 100, 111) for i in range(149, -1, -1)]
+        # Distinct author per comment — see the comment in
+        # test_a_mirror_paged_in_after_its_comments_still_maps_within_one_run
+        # for why a shared author would make this test vacuous under
+        # amendment 4's dedup guard.
+        comments = [_comment(1000 + i, 100, 111 + i) for i in range(149, -1, -1)]
         history = comments + [_mirror(100, 42)]
         gw = _gw(history)
 
@@ -415,31 +455,25 @@ async def test_resumed_run_maps_comments_stored_before_their_mirror_arrived(tmp_
 
 
 @pytest.mark.asyncio
-async def test_rerunning_collect_reappends_thread_edges_append_only(tmp_path):
-    """`edges` is an append-only observation log by design (ADR-0002):
-    `store/edges.py::add_edge` is a bare `INSERT` and `edges` carries no
-    unique index (`migrations/0001_init.sql` gives it only a plain
-    `idx_edges_subject`) — the same is true of every other edge producer in
-    the codebase (`channel`, `history`, `graph`). `_write_thread_edges`
-    re-scans every stored group row on every run, so a second identical
-    `collect()` re-emits every `commented_on`/`replied_to` edge the first
-    run did. `tests/test_store_repliers.py::
-    test_repeated_backfill_does_not_duplicate_the_peer_row` documents the
-    identical stance for the `recent_repliers` backfill's own `commented_on`
-    edges, and deliberately does NOT assert a fixed edge-row count after two
-    runs, for the same reason — a previous version of *this* test asserted
-    the opposite (a fixed count after two runs), which both contradicted
-    `add_edge`'s bare-INSERT semantics and desynchronized this producer's
-    dedup story from the backfill's, so the suite disagreed with itself
-    about one predicate. This version keeps the two files consistent:
-    neither producer promises edge-row dedup. Whether the export/degree-
-    count layer should collapse repeated observations later is tracked as
-    its own follow-up (github.com/SpencerNorris/paperboy/issues/19), not
-    invented here as a side effect of a test assertion.
+async def test_rerunning_collect_does_not_duplicate_thread_edges(tmp_path):
+    """Amendment 4 (authoritative, supersedes the ADR-0002-citing stance this
+    test previously took): `_write_thread_edges` re-scans every stored group
+    row on every run — it must, so a comment paged in before its mirror
+    still maps on a later run — so an unguarded `add_edge` call would append
+    a fresh `commented_on`/`replied_to` row, with a fresh `observed_at` and
+    the *previous* run's `source_raw_id`, for evidence this run never
+    gathered: ~70k phantom rows per re-run on the live target, inflating
+    every degree count an analyst reads off `edges`. Both edges are
+    therefore idempotent on `(subject_uri, predicate, object_uri)` — skip
+    the insert when an identical triple already exists (`idx_edges_subject`
+    already covers that lookup). `tests/test_store_repliers.py::
+    test_repeated_backfill_does_not_duplicate_the_peer_row` pins the same
+    stance for the `recent_repliers` backfill's own `commented_on` edges.
 
-    What repeated re-running must NOT do is duplicate `messages` rows —
+    Repeated re-running also must not duplicate `messages` rows —
     `(channel_id, msg_id)` is a unique index (`migrations/0001_init.sql`),
-    so that side is a genuine idempotence guarantee and is asserted here."""
+    so that side is a genuine idempotence guarantee and is asserted here
+    too."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st, GROUP_ID)
         # 201 is a nested reply to 200; 200 is a DIRECT reply to the thread
@@ -465,8 +499,8 @@ async def test_rerunning_collect_reappends_thread_edges_append_only(tmp_path):
         second_replied = st.conn.execute(
             "select count(*) c from edges where predicate='replied_to'"
         ).fetchone()["c"]
-        assert second_commented == first_commented * 2
-        assert second_replied == first_replied * 2
+        assert second_commented == first_commented
+        assert second_replied == first_replied
 
         assert st.conn.execute(
             "select count(*) c from messages where channel_id=?", (GROUP_ID,)
@@ -844,7 +878,13 @@ async def test_a_plain_in_group_reply_with_no_thread_top_id_still_gets_a_replied
     only comment threads, and the shape every other `replied_to` test in
     this file exercises via `_comment`, which always sets `reply_to_top_id`)
     would silently drop this shape — the dominant reply shape in ordinary
-    group chatter, as opposed to channel-post comment threads."""
+    group chatter, as opposed to channel-post comment threads.
+
+    Amendment 5: a NULL `reply_to_top_id` was never a comment-thread
+    candidate in the first place, so it must not inflate `unmapped` either —
+    the widened query amendment 7 requires (`reply_to_msg_id IS NOT NULL OR
+    reply_to_top_id IS NOT NULL`) makes this row reachable by the same loop
+    that computes `unmapped`, so the guard has to be checked explicitly."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st, GROUP_ID)
         reply = {
@@ -854,9 +894,10 @@ async def test_a_plain_in_group_reply_with_no_thread_top_id_still_gets_a_replied
             "reply_to": {"_": "MessageReplyHeader", "reply_to_msg_id": 700,
                          "reply_to_top_id": None},
         }
-        await DiscussionCollector().collect(
+        res = await DiscussionCollector().collect(
             _ctx(st, _gw([reply, _plain(700, 112)]))
         )
+        assert res.counts["unmapped"] == 0
         row = st.conn.execute(
             "select object_uri from edges where predicate='replied_to' and subject_uri=?",
             (f"tg:msg:{GROUP_ID}/720",),
@@ -884,6 +925,99 @@ async def test_cursor_after_a_completed_sweep_reflects_the_oldest_id_seen(tmp_pa
             _ctx(st, _gw([_comment(200, 100, 111), _mirror(100, 42)]))
         )
         assert get_state(st, "history", str(GROUP_ID)) == {"offset_id": 100}
+
+
+@pytest.mark.asyncio
+async def test_a_second_run_collects_new_group_messages_via_the_high_water_mark(tmp_path):
+    """Spec §3's 'Re-collection' row is the entire reason `history_sweep`/
+    `max_id_seen` exists: 'the linked group has no `pts` seed, so it would
+    freeze at day one' without it. The high-water-mark mechanism itself is
+    already pinned at the `HistoryCollector` level
+    (`tests/test_collector_history.py::
+    test_incremental_run_stopped_by_budget_resumes_where_it_stopped`), but
+    nothing previously drove a SECOND `DiscussionCollector.collect()` at
+    all, so a regression that dropped the delegation (e.g. `discussion`
+    accidentally passing `page_budget=None` and always starting a full
+    backfill, or never reaching `history_sweep` state) would go unnoticed
+    here."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        gw1 = _gw([_comment(200, 100, 111), _mirror(100, 42)])
+        await DiscussionCollector().collect(_ctx(st, gw1))
+        assert get_state(st, "history_sweep", str(GROUP_ID)) == {
+            "max_id_seen": 200, "pending_high": 200,
+            "backfill_complete": True, "incremental_in_progress": False,
+        }
+
+        # A new comment (id 300) arrives after the first sweep completed.
+        gw2 = _gw([_comment(300, 100, 999), _comment(200, 100, 111), _mirror(100, 42)])
+        res2 = await DiscussionCollector().collect(_ctx(st, gw2))
+
+        assert st.conn.execute(
+            "select count(*) c from messages where channel_id=? and msg_id=300", (GROUP_ID,)
+        ).fetchone()["c"] == 1
+        assert res2.counts["unmapped"] == 0
+        row = st.conn.execute(
+            "select object_uri from edges where predicate='commented_on' and subject_uri=?",
+            ("tg:user:999",),
+        ).fetchone()
+        assert row is not None
+        assert row["object_uri"] == f"tg:msg:{CHANNEL_ID}/42"
+        assert get_state(st, "history_sweep", str(GROUP_ID))["max_id_seen"] == 300
+
+
+@pytest.mark.asyncio
+async def test_probing_off_writes_no_sync_ranges_for_the_group(tmp_path):
+    """Amendment 2 / spec §5: `add_range` fires only when `probe_gaps` is
+    true, and `discussion` sweeps the group with probing off (it is not the
+    channel being backfilled). Writing a verified range for an unprobed
+    span would make `missing_ids()` report zero gaps for the group forever
+    — previously unpinned in this file; only the channel-scoped case was
+    covered (`tests/test_collector_history.py::
+    test_backfill_records_verified_range`)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        await DiscussionCollector().collect(
+            _ctx(st, _gw([_comment(200, 100, 111), _mirror(100, 42)]))
+        )
+        assert st.conn.execute(
+            "select count(*) c from sync_ranges where channel_id=?", (GROUP_ID,)
+        ).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_thread_edges_do_not_leak_across_channels(tmp_path):
+    """`_mirror_map` and `_write_thread_edges` both filter `WHERE
+    channel_id=?` (spec §6/§7). Every other test in this file seeds
+    messages only for the swept group, so cross-channel bleed is
+    structurally untested: without that predicate, a broadcast-channel
+    message carrying `fwd_from.channel_post` would enter the mirror map,
+    and the broadcast channel's own reply-shaped rows would earn
+    `replied_to` edges misattributed to the group. Seed the broadcast
+    channel (id `CHANNEL_ID`) with a mirror-shaped and a reply-shaped
+    message the way `history` already would have, via a direct
+    `HistoryCollector` run against `ctx.channel_id`, then confirm the
+    group's own sweep produces only the edges its own comments earn."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        await HistoryCollector().collect(
+            _ctx(st, _gw([_mirror(9001, 42), _comment(9002, 9001, 555)]))
+        )
+        res = await DiscussionCollector().collect(
+            _ctx(st, _gw([_comment(200, 100, 111), _mirror(100, 42)]))
+        )
+        assert res.counts["unmapped"] == 0
+        commented = {
+            r["subject_uri"]: r["object_uri"]
+            for r in st.conn.execute(
+                "select subject_uri, object_uri from edges where predicate='commented_on'"
+            ).fetchall()
+        }
+        assert commented == {"tg:user:111": f"tg:msg:{CHANNEL_ID}/42"}
+        assert st.conn.execute(
+            "select count(*) c from edges where predicate='replied_to' and subject_uri=?",
+            (f"tg:msg:{CHANNEL_ID}/9002",),
+        ).fetchone()["c"] == 0
 
 
 def test_applies_to_channel_like_targets():

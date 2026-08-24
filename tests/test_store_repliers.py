@@ -140,18 +140,22 @@ def test_scans_only_the_target_channels_raw_messages(tmp_path):
 
 
 def test_repeated_backfill_does_not_duplicate_the_peer_row(tmp_path):
-    """`edges` is an append-only observation log by design (ADR-0002):
-    `store/edges.py::add_edge` is a bare INSERT and `edges` carries no
-    unique index (`migrations/0001_init.sql` gives it only a plain
-    `idx_edges_subject`), and the same is true of every other edge producer
-    in this codebase (`channel`, `history`, `graph`). Asserting a fixed
-    `commented_on` row count after two runs is therefore not something the
-    spec calls for, and forcing it here would desynchronize this producer's
-    dedup semantics from the sweep's `_write_thread_edges`, which re-scans
-    and re-emits every edge on every run with no dedup story of its own
-    either. What IS promised — and what actually matters for correctness —
-    is that the peer projection (`upsert_peer`) is idempotent and that the
-    backfill's distinct-peer count is stable across repeated runs."""
+    """Amendment 4 (authoritative; supersedes the ADR-0002-citing docstring
+    this test previously carried): both `commented_on` producers —
+    `_write_thread_edges` and this backfill — are idempotent on
+    `(subject_uri, predicate, object_uri)`. `backfill_recent_repliers`
+    re-scans every stored `Message` payload on every run (spec §8: it runs
+    unconditionally, before preflight, on every `discussion` invocation), so
+    an unguarded insert would append a fresh `commented_on` edge for every
+    recent replier on every re-run — a fresh `observed_at` and the previous
+    run's `source_raw_id` attached to evidence this run never re-gathered,
+    inflating exactly the degree counts amendment 4 protects for the
+    sibling thread-edge producer. Left unpinned here, the suite would
+    disagree with itself about one predicate: dedup enforced for
+    `_write_thread_edges`, forbidden-by-omission for the backfill. The skip-
+    if-triple-exists guard belongs inside `repliers.py`, not inside
+    `store/edges.py::add_edge` — `channel`, `history`, and `graph` all still
+    depend on `add_edge`'s append-only semantics for their own edges."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _post(st, 5, 10, [{"_": "PeerUser", "user_id": 111}])
         first = backfill_recent_repliers(st, 5, "stranger")
@@ -159,4 +163,7 @@ def test_repeated_backfill_does_not_duplicate_the_peer_row(tmp_path):
         assert first == second == 1
         assert st.conn.execute(
             "select count(*) c from peers where uri='tg:user:111'"
+        ).fetchone()["c"] == 1
+        assert st.conn.execute(
+            "select count(*) c from edges where predicate='commented_on'"
         ).fetchone()["c"] == 1

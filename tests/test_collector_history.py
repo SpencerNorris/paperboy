@@ -199,6 +199,29 @@ async def test_probe_gaps_false_writes_no_tombstones(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_probe_gaps_false_writes_no_verified_range(tmp_path):
+    """Amendment 2 / spec §5: `add_range` is called only when `probe_gaps`
+    is true. `store/sync.py` defines a range as verified-complete — "every
+    id in the span was either stored or probed" — which is false with
+    probing off, and writing one anyway makes `missing_ids()` report zero
+    gaps for that span forever. Previously unpinned: `grep -rn sync_ranges
+    tests/` found only `test_store_sync.py`'s direct unit tests and
+    `test_backfill_records_verified_range` (the probe_gaps=True case), so
+    nothing in the suite would catch `add_range` being moved back outside
+    the `if probe_gaps:` branch — which is exactly what the plan's own
+    verbatim Task 1 Step 4 code still shows."""
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        assert st.conn.execute(
+            "select count(*) c from sync_ranges where channel_id=5"
+        ).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
 async def test_probe_gaps_true_still_tombstones(tmp_path):
     gw = FakeGateway({
         "history": [_m(3), _m(1)],
