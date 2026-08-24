@@ -15,7 +15,7 @@ from paperboy.store.db import Store, dumps
 
 _FLAG_KEYS = (
     "verified", "scam", "fake", "restricted", "bot", "premium", "deleted",
-    "broadcast", "megagroup", "gigagroup", "forum",
+    "broadcast", "megagroup", "gigagroup", "forum", "join_to_send", "join_request",
 )
 
 
