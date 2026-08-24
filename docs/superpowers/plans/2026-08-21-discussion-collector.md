@@ -42,15 +42,32 @@ Opus gate caught it by applying the patch and running the file.
 The satisfiable design, now implemented and committed in `66f5e93`:
 
 - `sync_state('history', <id>)` **keeps its shipped `{"offset_id": int}` shape.**
-- Sweep progress moves to a new scope:
-  `sync_state('history_sweep', <id>) = {"max_id_seen": int, "backfill_complete": bool}`.
+- Sweep progress moves to a new scope, with four keys:
+  `sync_state('history_sweep', <id>) = {"max_id_seen": int, "pending_high": int,
+  "backfill_complete": bool, "incremental_in_progress": bool}`.
+- **`max_id_seen` advances only on a clean finish.** Promoting it mid-sweep
+  makes the next run's stop test fire on its own first page and strands every
+  id in between — a silent, permanent loss that no number of re-runs recovers.
+  `pending_high` carries the in-flight maximum and is itself persisted, because
+  the true maximum is observed on the FIRST page of a catch-up, which is
+  precisely the run a page budget kills.
+- **An interrupted incremental run resumes from its cursor.** A *fresh*
+  incremental run starts at the newest message; one that a budget stopped must
+  honour `offset_id`, which is what `incremental_in_progress` records.
+- **Caught-up beats out-of-budget.** The `cursor <= stop_at` check runs before
+  the page-budget check: having reached known territory ends the run regardless.
 - The cursor is **never reset**. Incremental mode ignores the stored cursor and
   starts from 0 (newest), stopping once `cursor <= max_id_seen-as-of-run-start`.
   Comparing against the run-start value, not the live one, is essential — the
   live value would stop the loop on its own first page.
 
 Verified: `uv run pytest tests/test_collector_history.py tests/test_history_catchup.py -q`
-→ **21 passed**, no test edited. Full suite 220 passed. ruff and pyright clean.
+→ **23 passed**, no pre-existing test edited. Full suite 222 passed; ruff and
+pyright clean. The two appended regression tests
+(`test_incremental_run_stopped_by_budget_resumes_where_it_stopped`,
+`test_incremental_catch_up_across_budget_stops_loses_no_messages`) reproduce the
+data-loss bug the gate found in the first cut of this amendment: 300 of 800 ids
+were unreachable by any future run.
 
 **Task 1 needs no implementer.** `src/paperboy/collectors/history.py` and
 `src/paperboy/store/peers.py` are done. Amendments 2 and 3 below are also
