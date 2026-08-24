@@ -24,6 +24,113 @@
 
 ---
 
+## Amendments (2026-08-24) — these supersede any conflicting code below
+
+The Opus test gate rejected the first attempt three times. Every surviving
+finding was a defect in the **spec**, not in the tests, so the spec was
+corrected and this block carries the deltas. Where the verbatim code further
+down disagrees with anything here, **this block wins**.
+
+**1. The sweep was one-shot.** `HistoryCollector` never resets its cursor when
+the page loop exhausts, so after a full sweep it pages strictly older forever.
+`history` survives that only because `recipes._run_one` folds in pts-based
+`catch_up()`; the linked group has no pts seed, so `discussion` would freeze at
+day one. Task 1 now owns a high-water mark. `sync_state('history', <id>)`
+becomes `{"offset_id": int, "max_id_seen": int, "backfill_complete": bool}`,
+and `collect()`'s loop becomes:
+
+```python
+        state = get_state(ctx.store, "history", str(channel_id)) or {}
+        cursor: int = state.get("offset_id", 0)
+        high_water: int = state.get("max_id_seen", 0)
+        complete: bool = state.get("backfill_complete", False)
+
+        pages = 0
+        while True:
+            page = [
+                m
+                async for m in ctx.gateway.iter_history(
+                    input_channel, offset_id=cursor, limit=_HISTORY_PAGE_SIZE
+                )
+            ]
+            if not page:
+                # Bottom reached: the backfill is done, and the next run starts
+                # from the newest message rather than paging below the floor.
+                complete, cursor = True, 0
+                break
+
+            for m in page:
+                self._observe_message(ctx, channel_id, m, counts)
+                mid = m["id"]
+                ids_seen.add(mid)
+                min_id = mid if min_id is None else min(min_id, mid)
+                max_id = mid if max_id is None else max(max_id, mid)
+
+            cursor = min(m["id"] for m in page)
+            high_water = max(high_water, max(m["id"] for m in page))
+            set_state(ctx.store, "history", str(channel_id), {
+                "offset_id": cursor,
+                "max_id_seen": high_water,
+                "backfill_complete": complete,
+            })
+
+            pages += 1
+            if page_budget is not None and pages >= page_budget:
+                raise PhaseStop(
+                    f"page budget ({page_budget}) reached at offset_id={cursor}; "
+                    "re-run to continue from the saved cursor"
+                )
+            if complete and cursor <= state.get("max_id_seen", 0):
+                # Incremental mode: we have paged back into known territory.
+                cursor = 0
+                break
+
+        set_state(ctx.store, "history", str(channel_id), {
+            "offset_id": cursor,
+            "max_id_seen": high_water,
+            "backfill_complete": complete,
+        })
+```
+
+Note `state.get("max_id_seen", 0)` in the stop test, not the live `high_water`
+— the comparison is against what was known *before* this run, otherwise the
+loop stops on its own first page. Absent state the defaults are
+`0 / 0 / False`, which is exactly today's behaviour, so `history` is unchanged.
+
+**2. `add_range` only when `probe_gaps` is true.** `store/sync.py` defines a
+range as "verified-complete — every id in the span was either stored or
+probed". With probing off that is false, and writing it makes `missing_ids()`
+report zero gaps for the group forever. Move the call inside the
+`if probe_gaps:` branch. The group gets no `sync_ranges` rows.
+
+**3. `PeerChannel` authors are projected — and Task 1 owns it.**
+`_observe_message` upserts a peer only for `PeerUser` today. Anonymous and
+channel-authored comments carry `PeerChannel` and are people-discovery data, so
+widen it to both. This belongs in `history.py`; Task 3 must not grow a second
+peer pass.
+
+**4. Both thread edges are idempotent on `(subject_uri, predicate, object_uri)`.**
+`_write_thread_edges` re-scans every stored group row on every run — it must, so
+a comment paged in before its mirror still maps — so an unguarded insert appends
+a fresh row with a fresh `observed_at` and the *previous* run's `source_raw_id`,
+for evidence this run never gathered: ~70k phantom rows per re-run on the live
+target. Skip the insert when an identical triple already exists.
+
+**5. `unmapped` counts mapping failures, not non-candidates.** Only a message
+carrying a `reply_to_top_id` is a candidate. Ordinary in-group replies
+(`reply_to_top_id` NULL) get their `replied_to` edge and are **not** unmapped.
+Counting them would swamp the counter on the live target and destroy the only
+signal risk §13.3 relies on.
+
+**6. The two skip reasons must be lexically disjoint.** Use
+`"no linked discussion group"` and `"discussion group {id}: no access hash
+known"`. The old pair both contained "linked", so a test asserting
+`"linked" in stopped` passed on the wrong branch — including on the falsy-`0`
+bug it existed to catch. Also guard a **falsy** `access_hash`, not just `None`:
+a stored `0` yields `CHANNEL_INVALID` against live Telegram.
+
+---
+
 ## File Structure
 
 | File | Responsibility |
