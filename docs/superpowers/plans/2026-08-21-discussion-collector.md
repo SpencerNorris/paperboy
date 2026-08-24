@@ -31,79 +31,38 @@ finding was a defect in the **spec**, not in the tests, so the spec was
 corrected and this block carries the deltas. Where the verbatim code further
 down disagrees with anything here, **this block wins**.
 
-**1. The sweep was one-shot.** `HistoryCollector` never resets its cursor when
-the page loop exhausts, so after a full sweep it pages strictly older forever.
-`history` survives that only because `recipes._run_one` folds in pts-based
-`catch_up()`; the linked group has no pts seed, so `discussion` would freeze at
-day one. Task 1 now owns a high-water mark. `sync_state('history', <id>)`
-becomes `{"offset_id": int, "max_id_seen": int, "backfill_complete": bool}`,
-and `collect()`'s loop becomes:
+**1. The sweep was one-shot — CORRECTED, AND TASK 1 IS ALREADY DONE.**
+The first version of this amendment was *unsatisfiable*: it wrote a three-key
+dict into `sync_state('history', <id>)` and reset `offset_id` to 0 on
+exhaustion, while the protected `test_backfill_persists_resume_cursor` asserts
+exact equality with `{"offset_id": 3}` and `set_state` replaces `value_json`
+wholesale. The spec contradicted the regression contract it also stated. The
+Opus gate caught it by applying the patch and running the file.
 
-```python
-        state = get_state(ctx.store, "history", str(channel_id)) or {}
-        cursor: int = state.get("offset_id", 0)
-        high_water: int = state.get("max_id_seen", 0)
-        complete: bool = state.get("backfill_complete", False)
+The satisfiable design, now implemented and committed in `66f5e93`:
 
-        pages = 0
-        while True:
-            page = [
-                m
-                async for m in ctx.gateway.iter_history(
-                    input_channel, offset_id=cursor, limit=_HISTORY_PAGE_SIZE
-                )
-            ]
-            if not page:
-                # Bottom reached: the backfill is done, and the next run starts
-                # from the newest message rather than paging below the floor.
-                complete, cursor = True, 0
-                break
+- `sync_state('history', <id>)` **keeps its shipped `{"offset_id": int}` shape.**
+- Sweep progress moves to a new scope:
+  `sync_state('history_sweep', <id>) = {"max_id_seen": int, "backfill_complete": bool}`.
+- The cursor is **never reset**. Incremental mode ignores the stored cursor and
+  starts from 0 (newest), stopping once `cursor <= max_id_seen-as-of-run-start`.
+  Comparing against the run-start value, not the live one, is essential — the
+  live value would stop the loop on its own first page.
 
-            for m in page:
-                self._observe_message(ctx, channel_id, m, counts)
-                mid = m["id"]
-                ids_seen.add(mid)
-                min_id = mid if min_id is None else min(min_id, mid)
-                max_id = mid if max_id is None else max(max_id, mid)
+Verified: `uv run pytest tests/test_collector_history.py tests/test_history_catchup.py -q`
+→ **21 passed**, no test edited. Full suite 220 passed. ruff and pyright clean.
 
-            cursor = min(m["id"] for m in page)
-            high_water = max(high_water, max(m["id"] for m in page))
-            set_state(ctx.store, "history", str(channel_id), {
-                "offset_id": cursor,
-                "max_id_seen": high_water,
-                "backfill_complete": complete,
-            })
+**Task 1 needs no implementer.** `src/paperboy/collectors/history.py` and
+`src/paperboy/store/peers.py` are done. Amendments 2 and 3 below are also
+already implemented there. Do not re-do or re-open that file.
 
-            pages += 1
-            if page_budget is not None and pages >= page_budget:
-                raise PhaseStop(
-                    f"page budget ({page_budget}) reached at offset_id={cursor}; "
-                    "re-run to continue from the saved cursor"
-                )
-            if complete and cursor <= state.get("max_id_seen", 0):
-                # Incremental mode: we have paged back into known territory.
-                cursor = 0
-                break
-
-        set_state(ctx.store, "history", str(channel_id), {
-            "offset_id": cursor,
-            "max_id_seen": high_water,
-            "backfill_complete": complete,
-        })
-```
-
-Note `state.get("max_id_seen", 0)` in the stop test, not the live `high_water`
-— the comparison is against what was known *before* this run, otherwise the
-loop stops on its own first page. Absent state the defaults are
-`0 / 0 / False`, which is exactly today's behaviour, so `history` is unchanged.
-
-**2. `add_range` only when `probe_gaps` is true.** `store/sync.py` defines a
+**2. `add_range` only when `probe_gaps` is true.** *(done in `66f5e93`)* `store/sync.py` defines a
 range as "verified-complete — every id in the span was either stored or
 probed". With probing off that is false, and writing it makes `missing_ids()`
 report zero gaps for the group forever. Move the call inside the
 `if probe_gaps:` branch. The group gets no `sync_ranges` rows.
 
-**3. `PeerChannel` authors are projected — and Task 1 owns it.**
+**3. `PeerChannel` authors are projected.** *(done in `66f5e93`)*
 `_observe_message` upserts a peer only for `PeerUser` today. Anonymous and
 channel-authored comments carry `PeerChannel` and are people-discovery data, so
 widen it to both. This belongs in `history.py`; Task 3 must not grow a second
@@ -128,6 +87,29 @@ known"`. The old pair both contained "linked", so a test asserting
 `"linked" in stopped` passed on the wrong branch — including on the falsy-`0`
 bug it existed to catch. Also guard a **falsy** `access_hash`, not just `None`:
 a stored `0` yields `CHANNEL_INVALID` against live Telegram.
+
+
+**7. `_write_thread_edges`'s verbatim code in Task 3 is wrong in two ways.**
+The plan's version guards the reply edge with
+`if row["reply_to_msg_id"] and row["reply_to_msg_id"] != row["reply_to_top_id"]`
+and selects `WHERE channel_id=? AND reply_to_top_id IS NOT NULL`. Four committed
+tests contradict both. **Drop the `!=` clause** (keep the truthiness check) — a
+direct reply to a thread root still earns a `replied_to` edge. **Widen the
+query** to `WHERE channel_id=? AND (reply_to_msg_id IS NOT NULL OR
+reply_to_top_id IS NOT NULL)` — an ordinary in-group reply carries
+`reply_to_msg_id` with a NULL `reply_to_top_id`, and amendment 5 already says it
+gets its edge. `unmapped` still increments only for rows that carry a
+`reply_to_top_id`.
+
+**8. `FakeGateway` needs `history_targets`, and Task 2 owns it.**
+`test_sweeps_the_linked_groups_own_peer_not_the_broadcast_channels` asserts on
+`gw.history_targets` — the only test able to catch a sweep silently pointed at
+the broadcast channel or built with the wrong access hash. Add
+`self.history_targets: list[dict] = []` in `FakeGateway.__init__` and
+`self.history_targets.append(dict(input_channel))` at the top of
+`iter_history`, *before* the existing `del input_channel`, alongside the `calls`
+entry. Note the test expects **two** entries for a completed sweep: a page loop
+always makes a final empty call to terminate.
 
 ---
 
