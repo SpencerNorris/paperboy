@@ -308,8 +308,10 @@ async def test_incremental_run_stopped_by_budget_resumes_where_it_stopped(tmp_pa
     gw = FakeGateway({"history": [_m(i) for i in range(300, 0, -1)], "get_messages": {}})
     with Store.open(tmp_path / "p.sqlite") as st:
         await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
-        assert get_state(st, "history_sweep", "5")["backfill_complete"] is True
-        assert get_state(st, "history_sweep", "5")["max_id_seen"] == 300
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["backfill_complete"] is True
+        assert sweep["max_id_seen"] == 300
 
         # 500 new messages arrive; catch up two pages at a time.
         gw2 = FakeGateway({"history": [_m(i) for i in range(800, 0, -1)], "get_messages": {}})
@@ -318,8 +320,12 @@ async def test_incremental_run_stopped_by_budget_resumes_where_it_stopped(tmp_pa
 
         # The committed high-water mark must NOT have jumped to 800: the span
         # 301..600 has not been walked yet, and promoting it strands them.
-        assert get_state(st, "history_sweep", "5")["max_id_seen"] == 300
-        assert get_state(st, "history", "5")["offset_id"] == 601
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["max_id_seen"] == 300
+        history_state = get_state(st, "history", "5")
+        assert history_state is not None
+        assert history_state["offset_id"] == 601
 
 
 @pytest.mark.asyncio
@@ -339,4 +345,6 @@ async def test_incremental_catch_up_across_budget_stops_loses_no_messages(tmp_pa
         stored = {r["msg_id"] for r in st.conn.execute("select msg_id from messages")}
         missing = sorted(set(range(1, 801)) - stored)
         assert not missing, f"{len(missing)} ids never fetched, e.g. {missing[:10]}"
-        assert get_state(st, "history_sweep", "5")["max_id_seen"] == 800
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["max_id_seen"] == 800

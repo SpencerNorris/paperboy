@@ -13,7 +13,12 @@ for the two CLI-level phase-selection tests, which *do* exercise the real
 default collector list and therefore do depend on Task 4).
 """
 
-from __future__ import annotations
+# See the matching comment in tests/test_collector_discussion.py: ruff's
+# isort classifies `paperboy.collectors.discussion` third-party until Task 3
+# creates it, then first-party — a moving target no static import order can
+# satisfy for every intermediate task state, so I001 is suppressed here
+# rather than chased.
+from __future__ import annotations  # noqa: I001
 
 import logging
 from collections import Counter
