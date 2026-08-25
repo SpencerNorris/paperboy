@@ -12,6 +12,7 @@ import json
 from paperboy.store.repliers import backfill_recent_repliers
 
 from paperboy.store.db import Store
+from paperboy.store.sync import set_state
 
 
 def _post(store: Store, channel_id: int, msg_id: int, repliers: list[dict]) -> None:
@@ -37,6 +38,24 @@ def test_projects_peeruser_repliers_into_peers(tmp_path):
         row = st.conn.execute("select kind, is_min from peers where uri='tg:user:111'").fetchone()
         assert row["kind"] == "user"
         assert row["is_min"] == 1
+
+
+def test_self_replier_is_not_projected_or_counted(tmp_path):
+    # If the collecting account appears among a post's recent_repliers, it is
+    # excluded from peers (issue #12) — and must not be counted in the returned
+    # backfilled_peers total either (upsert_peer returns None for self).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "account", "self", {"uri": "tg:user:900", "id": 900})
+        _post(st, 5, 10, [{"_": "PeerUser", "user_id": 900},
+                          {"_": "PeerUser", "user_id": 111}])
+        n = backfill_recent_repliers(st, 5, "stranger")
+        assert n == 1, "self must not be counted among backfilled peers"
+        assert st.conn.execute(
+            "select 1 from peers where uri='tg:user:900'"
+        ).fetchone() is None
+        assert st.conn.execute(
+            "select 1 from peers where uri='tg:user:111'"
+        ).fetchone() is not None
 
 
 def test_projects_peerchannel_repliers_too(tmp_path):

@@ -129,6 +129,14 @@ async def test_skips_cleanly_when_linked_chat_id_is_zero(tmp_path):
         assert "access" not in res.stopped.lower()
 
 
+def _ctx_join(st, gw, tier="stranger"):
+    """A context with `--join` (allow_join) enabled."""
+    return CollectContext(
+        gw, st, load_settings("default", {"allow_join": True}), parse_target("@x"),
+        {"channel_id": CHANNEL_ID, "access_hash": 9}, CHANNEL_ID, tier, logging.getLogger("t"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_skips_when_the_group_requires_joining_to_read(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
@@ -136,9 +144,70 @@ async def test_skips_when_the_group_requires_joining_to_read(tmp_path):
         gw = _gw([])
         res = await DiscussionCollector().collect(_ctx(st, gw))
         assert res.stopped is not None
-        assert "join" in res.stopped.lower()
-        # Never an implicit join: the sweep must not run at all on this path.
+        assert "join_to_send" in res.stopped
+        # Never an implicit join: no join RPC, and the sweep must not run.
         assert gw.calls == []
+
+
+@pytest.mark.asyncio
+async def test_join_flag_joins_the_group_then_reads_it(tmp_path):
+    # With --join, a join_to_send group is joined (an explicit write) and then
+    # swept. The join is recorded in run_events as an active act (issue #20).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID, {"join_to_send": True})
+        gw = _gw([])  # empty history: the group is now readable, just empty
+        res = await DiscussionCollector().collect(_ctx_join(st, gw))
+        assert res.stopped is None, "a joined group is read, not skipped"
+        assert "join_channel" in gw.calls
+        # the sweep ran after the join (join precedes the read)
+        assert gw.calls.index("join_channel") < gw.calls.index("iter_history")
+        event = st.conn.execute(
+            "SELECT kind, detail_json FROM run_events WHERE kind='join'"
+        ).fetchone()
+        assert event is not None, "the join must be recorded as a run event"
+        assert str(GROUP_ID) in event["detail_json"]
+
+
+@pytest.mark.asyncio
+async def test_join_flag_with_a_failed_join_skips_with_a_distinct_reason(tmp_path):
+    # --join was given but the join was refused (e.g. approval-gated group):
+    # a clean skip, distinguishable from "join_to_send set, --join not given".
+    from paperboy.budget import SkipAndRecord
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID, {"join_to_send": True})
+        gw = FakeGateway({"history": [], "get_messages": {},
+                          "join": SkipAndRecord("INVITE_REQUEST_SENT")})
+        res = await DiscussionCollector().collect(_ctx_join(st, gw))
+        assert res.stopped is not None
+        assert "failed" in res.stopped and "join_to_send" not in res.stopped
+        assert "join_channel" in gw.calls
+        assert "iter_history" not in gw.calls  # never read after a failed join
+
+
+@pytest.mark.asyncio
+async def test_join_hard_stop_propagates(tmp_path):
+    # PEER_FLOOD on the join is a HardStop and must NOT be swallowed into a skip.
+    from paperboy.budget import HardStop
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID, {"join_to_send": True})
+        gw = FakeGateway({"history": [], "get_messages": {},
+                          "join": HardStop("PEER_FLOOD")})
+        with pytest.raises(HardStop):
+            await DiscussionCollector().collect(_ctx_join(st, gw))
+
+
+@pytest.mark.asyncio
+async def test_join_never_fires_without_join_to_send(tmp_path):
+    # An openly-readable group is never joined, even with --join set: joining
+    # is only ever the escape hatch for join_to_send, never implicit.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)  # no join_to_send
+        gw = _gw([])
+        res = await DiscussionCollector().collect(_ctx_join(st, gw))
+        assert res.stopped is None
+        assert "join_channel" not in gw.calls
 
 
 @pytest.mark.asyncio

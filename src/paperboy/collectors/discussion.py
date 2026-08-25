@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import json
 
-from paperboy.budget import PhaseStop
+from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.history import HistoryCollector
 from paperboy.ids import channel_uri, msg_uri, peer_ref_uri, utc_now_iso
 from paperboy.store.edges import add_edge_once
+from paperboy.store.events import record_run_event
 from paperboy.store.repliers import backfill_recent_repliers
 from paperboy.targets import Target
 
@@ -62,7 +63,12 @@ class DiscussionCollector:
         target = self._linked_group(ctx)
         if isinstance(target, str):
             return CollectResult(name=self.name, counts=counts, stopped=target)
-        group_id, input_channel = target
+        group_id, input_channel, needs_join = target
+
+        if needs_join:
+            skip = await self._join_or_skip(ctx, group_id, input_channel)
+            if skip is not None:
+                return CollectResult(name=self.name, counts=counts, stopped=skip)
 
         # Gap-probing is off: on a churn-heavy group of tens of thousands of
         # messages it is a second pass the size of the sweep, and it yields
@@ -90,12 +96,47 @@ class DiscussionCollector:
         for key in ("messages", "revisions", "tombstones", "edges"):
             counts[key] += sweep.get(key, 0)
 
-    def _linked_group(self, ctx: CollectContext) -> tuple[int, dict] | str:
-        """`(group_id, input_channel)`, or a `stopped` reason string.
+    async def _join_or_skip(
+        self, ctx: CollectContext, group_id: int, input_channel: dict
+    ) -> str | None:
+        """Join a `join_to_send` group under `--join`, or return a skip reason.
 
-        Every failure here is a clean skip, never an exception: a channel with
-        no discussion group, or one that gates reading behind membership, is a
-        normal thing to encounter.
+        Joining is the one WRITE paperboy makes and the single documented
+        exception to read-only (spec §2, issue #20): it happens ONLY under an
+        explicit `--join`, is routed through the budget/guardrail module (so
+        `PEER_FLOOD` is a `HardStop` that ends the run and is deliberately NOT
+        caught here), and is recorded in `run_events` as an active, non-passive
+        act. A refused join (e.g. an approval-gated group -> `INVITE_REQUEST_SENT`)
+        is a clean skip, distinguishable from "join_to_send set, --join not given".
+        """
+        if not ctx.settings.allow_join:
+            return (
+                f"discussion group {group_id}: join_to_send is set; "
+                "re-run with --join to join and read it"
+            )
+        try:
+            await ctx.gateway.join_channel(input_channel)
+        except SkipAndRecord as exc:
+            ctx.log.warning(
+                "discussion: --join join of group %s was refused: %s", group_id, exc
+            )
+            return f"discussion group {group_id}: --join was given but joining failed"
+        record_run_event(
+            ctx.store, ctx.channel_id, self.name, "join",
+            {"group_id": group_id, "method": "channels.joinChannel", "active": True},
+        )
+        ctx.log.warning(
+            "discussion: JOINED group %s via --join — an active, non-passive act", group_id
+        )
+        return None
+
+    def _linked_group(self, ctx: CollectContext) -> tuple[int, dict, bool] | str:
+        """`(group_id, input_channel, needs_join)`, or a `stopped` reason string.
+
+        `needs_join` is True when the group sets `join_to_send` — reading it then
+        requires membership, and `collect` will join under `--join` or skip.
+        Every failure here is a clean skip, never an exception: a channel with no
+        discussion group, or one whose access hash is unknown, is normal.
 
         The reasons are deliberately lexically disjoint — no reason contains
         another's distinguishing word — because tests assert on them, and an
@@ -120,16 +161,12 @@ class DiscussionCollector:
             return f"discussion group {group_id}: no access hash known"
 
         flags = json.loads(peer["flags_json"]) if peer["flags_json"] else {}
-        if flags.get("join_to_send"):
-            # Reading is open to anyone *unless* this flag is set. Honouring it
-            # is what keeps collection passive; `--join` is the (unimplemented)
-            # escape hatch, tracked in issue #20.
-            return (
-                f"discussion group {group_id}: join_to_send is set, so reading it "
-                "requires membership"
-            )
-
-        return group_id, {"channel_id": group_id, "access_hash": peer["access_hash"]}
+        # Reading is open to anyone *unless* `join_to_send` is set. Honouring it
+        # is what keeps collection passive; `--join` (issue #20) is the explicit
+        # escape hatch, applied by `_join_or_skip`.
+        needs_join = bool(flags.get("join_to_send"))
+        input_channel = {"channel_id": group_id, "access_hash": peer["access_hash"]}
+        return group_id, input_channel, needs_join
 
     def _write_thread_edges(
         self, ctx: CollectContext, group_id: int, counts: dict[str, int]
@@ -173,8 +210,11 @@ class DiscussionCollector:
 
             post_id = mirrors.get(top_id)
             if post_id is None or not row["from_uri"]:
-                # No mirror for this thread root, or no resolvable author.
-                # Counted once and reported, never attributed to a guess.
+                # No mirror for this thread root, or no attributable author.
+                # `from_uri` is also NULL for a comment the collecting account
+                # authored (deliberately unattributed, #12), so `unmapped`
+                # includes those — correctly: no commented_on edge is emitted
+                # for them either. Counted once, never attributed to a guess.
                 counts["unmapped"] += 1
                 continue
 
