@@ -31,13 +31,40 @@ def _redact_self(user: dict) -> dict:
     return {k: v for k, v in user.items() if k not in _SELF_CREDENTIAL_FIELDS}
 
 
-def _pick_channel(chats: list[dict]) -> dict:
-    # Telethon's to_dict() uses the PascalCase class name ("Channel",
-    # "ChannelForbidden"), not the lowercase TL constructor name.
+def _pick_channel(chats: list[dict], channel_id: int) -> dict:
+    """The channel-typed chat in `chats` whose id is `channel_id`.
+
+    Never pick by vector position: a linked discussion megagroup serialises as
+    `Channel` too, and Telegram promises no ordering — a group listed first
+    would silently misattribute the entire collect (issue #23). The
+    authoritative id comes from `ResolvedPeer.peer` / `full_chat.id`.
+    """
     for chat in chats:
-        if chat.get("_", "").lower().startswith("channel"):
+        # Telethon's to_dict() uses the PascalCase class name ("Channel",
+        # "ChannelForbidden"), not the lowercase TL constructor name.
+        if chat.get("id") == channel_id and chat.get("_", "").lower().startswith("channel"):
             return chat
-    raise ValueError("resolve() returned no channel-typed chat for a channel-like target")
+    raise ValueError(
+        f"no channel-typed chat with id {channel_id} in the response's chats vector"
+    )
+
+
+def _resolved_channel_id(resolved: dict) -> int:
+    """The channel id `resolve()` actually resolved to, from its `peer` field.
+
+    `contacts.ResolvedPeer` always carries `peer` in the wild; a channel-like
+    target resolving to anything else (a user, a basic group, a malformed
+    payload) means we have no authoritative identity — refuse rather than
+    guess from the `chats` vector.
+    """
+    peer = resolved.get("peer") or {}
+    channel_id = peer.get("channel_id")
+    if not isinstance(channel_id, int):
+        raise ValueError(
+            "target resolved to a non-channel peer "
+            f"({peer.get('_') or 'no peer in response'})"
+        )
+    return channel_id
 
 
 class ChannelCollector:
@@ -54,7 +81,7 @@ class ChannelCollector:
         resolve_raw_id = ctx.store.add_raw(
             resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw}
         )
-        chan = _pick_channel(resolved.get("chats", []))
+        chan = _pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
         input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
 
         full = await ctx.gateway.get_full_channel(input_channel)
@@ -65,7 +92,7 @@ class ChannelCollector:
         # Prefer the richer `chat` object returned alongside getFullChannel
         # (may carry admin_rights/creator not present on the resolve() one).
         full_chats = full.get("chats", [])
-        chan_for_channel = _pick_channel(full_chats) if full_chats else chan
+        chan_for_channel = _pick_channel(full_chats, full_chat["id"]) if full_chats else chan
 
         channel_id = chan_for_channel["id"]
         channel_uri_ = upsert_channel(

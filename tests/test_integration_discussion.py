@@ -69,6 +69,7 @@ def _fixtures(linked_chat_id: int | None) -> dict:
         )
     return {
         "resolve": {
+            "peer": {"_": "PeerChannel", "channel_id": CHANNEL_ID},
             "chats": [
                 {"_": "channel", "id": CHANNEL_ID, "access_hash": 99, "title": "C",
                  "username": "c", "broadcast": True},
