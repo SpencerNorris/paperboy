@@ -262,6 +262,36 @@ async def test_a_wayback_failure_warning_reports_the_real_status(tmp_path, caplo
 
 
 @pytest.mark.asyncio
+async def test_a_json_list_that_is_not_index_shaped_is_a_failure(tmp_path):
+    """One guard deeper than the not-a-list case: a body that IS a JSON list
+    but whose elements are not rows — a list-wrapped error envelope like
+    [{"error": ...}] (a normal API error shape) or a list of strings — is not
+    a CDX index and must not read as an empty index. The CDX index is a list
+    of equal-length lists; anything else here is a failed attempt (issue #24)."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    for body in ('[{"error": "blocked"}]', '["blocked", "denied"]', "[1, 2, 3]"):
+        client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=body))
+        with Store.open(tmp_path / f"p{hash(body)}.sqlite") as st:
+            res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+            assert "wayback_rows" not in res.counts, body
+            assert res.counts.get("wayback_failed") == 200, body
+
+
+@pytest.mark.asyncio
+async def test_a_header_only_cdx_index_is_a_genuine_zero(tmp_path):
+    """The other side: an all-lists array with no data rows (just the header,
+    or rows the parser skips) IS index-shaped — a valid query that found
+    nothing — and stays zero, not a failure."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    header_only = '[["urlkey", "timestamp", "original", "digest"]]'
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=header_only))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
 async def test_a_bom_only_cdx_body_is_a_genuine_zero(tmp_path):
     """A body that is only a BOM (U+FEFF is not str.strip() whitespace) is an
     empty index, not a failure — never a false failure on a genuine zero."""
