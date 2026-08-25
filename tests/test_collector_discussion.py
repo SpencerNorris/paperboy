@@ -1235,3 +1235,41 @@ async def test_one_commenter_on_two_posts_keeps_both_edges(tmp_path):
             "and subject_uri='tg:user:111' order by object_uri"
         )]
         assert objects == [f"tg:msg:{CHANNEL_ID}/42", f"tg:msg:{CHANNEL_ID}/43"]
+
+
+@pytest.mark.asyncio
+async def test_budget_stopped_discussion_reports_its_work_and_writes_edges(tmp_path):
+    """Found by the live smoke, which unit fixtures could not surface: the
+    phase collected 300 real messages and 53 people, then printed `{}`.
+
+    On the live target the budget stop is what happens on EVERY run, so the
+    counts dying with the exception means the collector never reports anything.
+    The thread edges for whatever did land must be written too — the messages
+    are stored, so leaving them unprojected strands usable data until some
+    later run happens to re-walk them.
+    """
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, GROUP_ID)
+        st.add_raw("Message", {
+            "_": "Message", "id": 10,
+            "peer_id": {"_": "PeerChannel", "channel_id": CHANNEL_ID},
+            "replies": {"_": "MessageReplies", "recent_repliers": [
+                {"_": "PeerUser", "user_id": 111}]},
+        }, "stranger", {"channel_id": CHANNEL_ID})
+
+        history = [_comment(i, 100, 500 + i) for i in range(300, 100, -1)]
+        history += [_mirror(100, 42)]
+        ctx = _ctx(st, _gw(history))
+        ctx.settings.discussion_page_budget = 1
+
+        with pytest.raises(PhaseStop) as excinfo:
+            await DiscussionCollector().collect(ctx)
+
+        counts = excinfo.value.counts
+        assert counts["backfilled_peers"] == 1
+        assert counts["messages"] == 100
+        # The 100 comments that landed are reply-shaped, so their `replied_to`
+        # edges must exist even though the phase stopped.
+        assert st.conn.execute(
+            "select count(*) c from edges where predicate='replied_to'"
+        ).fetchone()["c"] == 100

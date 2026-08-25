@@ -67,15 +67,28 @@ class DiscussionCollector:
         # Gap-probing is off: on a churn-heavy group of tens of thousands of
         # messages it is a second pass the size of the sweep, and it yields
         # only the weak `evidence='gap'` tier.
-        sweep = await HistoryCollector().collect(
-            ctx, channel_id=group_id, input_channel=input_channel,
-            probe_gaps=False, page_budget=ctx.settings.discussion_page_budget,
-        )
-        for key in ("messages", "revisions", "tombstones", "edges"):
-            counts[key] += sweep.counts.get(key, 0)
+        try:
+            sweep_counts = (await HistoryCollector().collect(
+                ctx, channel_id=group_id, input_channel=input_channel,
+                probe_gaps=False, page_budget=ctx.settings.discussion_page_budget,
+            )).counts
+        except PhaseStop as stop:
+            # A budget stop is routine on a large group, not a failure. The
+            # messages that landed are stored, so project their edges and
+            # report the work before re-raising — otherwise every run on a
+            # big target reports nothing and strands the rows it collected.
+            self._merge(counts, stop.counts)
+            self._write_thread_edges(ctx, group_id, counts)
+            raise PhaseStop(*stop.args, counts=counts) from stop
 
+        self._merge(counts, sweep_counts)
         self._write_thread_edges(ctx, group_id, counts)
         return CollectResult(name=self.name, counts=counts)
+
+    @staticmethod
+    def _merge(counts: dict[str, int], sweep: dict[str, int]) -> None:
+        for key in ("messages", "revisions", "tombstones", "edges"):
+            counts[key] += sweep.get(key, 0)
 
     def _linked_group(self, ctx: CollectContext) -> tuple[int, dict] | str:
         """`(group_id, input_channel)`, or a `stopped` reason string.
