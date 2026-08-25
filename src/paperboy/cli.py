@@ -132,7 +132,7 @@ def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
     phases: str = typer.Option(
-        None, "--phases", help="Comma-separated: channel,history,graph,web,media"
+        None, "--phases", help="Comma-separated: channel,history,discussion,graph,web,media"
     ),
     join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
     media: bool = typer.Option(
@@ -166,7 +166,8 @@ def collect(
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
-        p for p in ("history", "graph", "media", "web") if phase_list and p in phase_list
+        p for p in ("history", "discussion", "graph", "media", "web")
+        if phase_list and p in phase_list
     ]
     if phase_list is not None and _dependent_phases and "channel" not in phase_list:
         # `channel` populates `CollectContext.input_channel`/`channel_id` (the

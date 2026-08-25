@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
+from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
@@ -48,7 +49,10 @@ def _default_collectors(*, include_media: bool, include_web: bool) -> list[Colle
     # a different trust boundary than the authenticated MTProto session) are
     # OPT-IN (--media / --web, or named in --phases), so a plain `collect`
     # stays Telegram-only: metadata + history + graph.
-    collectors: list[Collector] = [ChannelCollector(), HistoryCollector(), GraphCollector()]
+    collectors: list[Collector] = [
+        ChannelCollector(), HistoryCollector(), DiscussionCollector(),
+        GraphCollector(),
+    ]
     if include_web:
         collectors.append(WebCollector())
     if include_media:
