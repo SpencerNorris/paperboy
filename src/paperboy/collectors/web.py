@@ -300,6 +300,20 @@ class WebCollector:
                 username, response.status_code, type(payload).__name__,
             )
             return {"wayback_failed": response.status_code}
+        # A CDX index is a list of equal-length rows (each itself a list). A
+        # non-empty list whose elements are NOT all lists — a list-wrapped error
+        # envelope like [{"error": ...}], or a list of strings — is not an index,
+        # and reading it as an empty result is the same false zero one guard up
+        # (issue #24). An empty list stays a genuine zero; an all-lists body is
+        # index-shaped and handed to parse_cdx_rows, which itself tolerates a
+        # header-only list (zero rows) and best-effort-skips malformed rows.
+        if payload and not all(isinstance(row, list) for row in payload):
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP %s with a JSON list that is not "
+                "a CDX index — reporting failure, not zero",
+                username, response.status_code,
+            )
+            return {"wayback_failed": response.status_code}
         rows = parse_cdx_rows(payload)
 
         n = 0
