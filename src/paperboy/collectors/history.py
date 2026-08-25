@@ -236,16 +236,22 @@ class HistoryCollector:
     async def catch_up(self, ctx: CollectContext) -> CollectResult:
         """Apply everything since the last stored `pts` via `getChannelDifference`.
 
-        `new_messages` are upserted; `other_updates` are applied by kind —
-        `updateEditChannelMessage` appends a revision (via `upsert_message`'s
-        own content-hash check), `updateDeleteChannelMessages` tombstones
-        with `evidence="update"` (spec §7's highest-confidence deletion
-        evidence). A `channelDifferenceTooLong` projects the recovery
-        messages it carries, re-seeds `pts` from the payload's `dialog`
-        (only when the dialog actually carries an int — issue #22), and
-        returns with `stopped="resynced"` — a full gap probe for this
-        channel is the caller's job (a future `watch` loop iteration or a
-        plain re-run of `history`).
+        Loops the call until the server sets `final`, projecting each page and
+        persisting its `pts` as it lands, so a backlog larger than one page is
+        not truncated (issue #25) and an interruption resumes from the last
+        stored cursor. `new_messages` are upserted; `other_updates` are applied
+        by kind — `updateEditChannelMessage` appends a revision (via
+        `upsert_message`'s own content-hash check), `updateDeleteChannelMessages`
+        tombstones with `evidence="update"` (spec §7's highest-confidence
+        deletion evidence).
+
+        A `channelDifferenceTooLong` projects the recovery messages it carries,
+        re-seeds `pts` from the payload's `dialog` (only when the dialog
+        actually carries an int — issue #22), and returns `stopped="resynced"`
+        — a full gap probe is then the caller's job. The loop stops early on a
+        non-final page that fails to advance `pts` (a misbehaving server, not a
+        backlog) and raises `PhaseStop` — carrying the counts applied so far —
+        when `catchup_page_budget` pages have been pulled in one run.
         """
         if ctx.input_channel is None or ctx.channel_id is None:
             raise PhaseStop(
@@ -260,46 +266,81 @@ class HistoryCollector:
         # {"pts": None} (issue #22), and forwarding None to the gateway dies
         # inside Telethon as a struct.error — outside the disposition system.
         pts = state.get("pts") or 0
+        budget = ctx.settings.catchup_page_budget
 
-        diff = await ctx.gateway.get_channel_difference(
-            ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
-        )
-        ctx.store.add_raw(
-            diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id}
-        )
+        # getChannelDifference returns at most one page (`_CHANNEL_DIFFERENCE_LIMIT`
+        # updates); the TL contract is to keep calling until the server sets
+        # `final` (issue #25). A single call truncated any larger backlog and
+        # reported success. Each page is projected and its pts persisted as it
+        # lands, so an interruption resumes from the last stored cursor.
+        pages = 0
+        while True:
+            diff = await ctx.gateway.get_channel_difference(
+                ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
+            )
+            ctx.store.add_raw(
+                diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id}
+            )
 
-        if diff.get("_", "").lower() == "channeldifferencetoolong":
-            # The resync response carries the newest messages as a recovery
-            # payload — project them; they already reached raw_records above.
-            for m in diff.get("messages", []):
+            if diff.get("_", "").lower() == "channeldifferencetoolong":
+                # The resync response carries the newest messages as a recovery
+                # payload — project them; they already reached raw_records above.
+                for m in diff.get("messages", []):
+                    self._observe_message(ctx, channel_id, m, counts)
+                # `Dialog.pts` is flags.0?int and Telethon emits it present-with-
+                # None when unset, so a `.get("pts", fallback)` never falls back
+                # (issue #22). Never persist a non-int cursor: the next reader
+                # would hand None to Telethon and crash outside the disposition
+                # system. Keeping the old cursor just repeats the resync signal.
+                resynced_pts = (diff.get("dialog") or {}).get("pts")
+                if isinstance(resynced_pts, int):
+                    set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
+                else:
+                    ctx.log.warning(
+                        "history: channelDifferenceTooLong for %s carried no dialog pts; "
+                        "keeping the stored cursor (%s) — full re-sweep required",
+                        channel_id, pts,
+                    )
+                return CollectResult(name=self.name, counts=counts, stopped="resynced")
+
+            for m in diff.get("new_messages", []):
                 self._observe_message(ctx, channel_id, m, counts)
-            # `Dialog.pts` is flags.0?int and Telethon emits it present-with-
-            # None when unset, so a `.get("pts", fallback)` never falls back
-            # (issue #22). Never persist a non-int cursor: the next reader
-            # would hand None to Telethon and crash outside the disposition
-            # system. Keeping the old cursor just repeats the resync signal.
-            resynced_pts = (diff.get("dialog") or {}).get("pts")
-            if isinstance(resynced_pts, int):
-                set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
-            else:
+
+            for update in diff.get("other_updates", []):
+                kind = update.get("_", "").lower()
+                if kind == "updateeditchannelmessage":
+                    self._observe_message(ctx, channel_id, update["message"], counts)
+                elif kind == "updatedeletechannelmessages":
+                    for mid in update.get("messages", []):
+                        mark_deleted(ctx.store, channel_id, mid, "update", utc_now_iso())
+                        counts["tombstones"] += 1
+
+            new_pts = diff.get("pts", pts)
+            if not isinstance(new_pts, int):
+                new_pts = pts
+
+            if diff.get("final"):
+                set_state(ctx.store, "channel", str(channel_id), {"pts": new_pts})
+                return CollectResult(name=self.name, counts=counts)
+
+            # A non-final page that does not advance pts would loop forever — a
+            # misbehaving server, not a real backlog. Stop rather than spin; the
+            # pts-advance guard, not the budget below, is the loop's real bound.
+            if new_pts <= pts:
                 ctx.log.warning(
-                    "history: channelDifferenceTooLong for %s carried no dialog pts; "
-                    "keeping the stored cursor (%s) — full re-sweep required",
-                    channel_id, pts,
+                    "history: getChannelDifference for %s returned a non-final page "
+                    "without advancing pts (%s -> %s); stopping catch-up",
+                    channel_id, pts, new_pts,
                 )
-            return CollectResult(name=self.name, counts=counts, stopped="resynced")
+                return CollectResult(name=self.name, counts=counts)
 
-        for m in diff.get("new_messages", []):
-            self._observe_message(ctx, channel_id, m, counts)
+            set_state(ctx.store, "channel", str(channel_id), {"pts": new_pts})
+            pts = new_pts
+            pages += 1
 
-        for update in diff.get("other_updates", []):
-            kind = update.get("_", "").lower()
-            if kind == "updateeditchannelmessage":
-                self._observe_message(ctx, channel_id, update["message"], counts)
-            elif kind == "updatedeletechannelmessages":
-                for mid in update.get("messages", []):
-                    mark_deleted(ctx.store, channel_id, mid, "update", utc_now_iso())
-                    counts["tombstones"] += 1
-
-        set_state(ctx.store, "channel", str(channel_id), {"pts": diff.get("pts", pts)})
-        return CollectResult(name=self.name, counts=counts)
+            if pages >= budget:
+                raise PhaseStop(
+                    f"catch-up page budget ({budget}) reached at pts={pts}; "
+                    "re-run to continue from the saved cursor",
+                    counts=counts,
+                )
