@@ -11,6 +11,7 @@ runner = CliRunner()
 def _fixtures():
     return {
         "resolve": {
+            "peer": {"_": "PeerChannel", "channel_id": 5},
             "chats": [
                 {
                     "_": "channel", "id": 5, "access_hash": 99, "title": "X", "username": "x",
