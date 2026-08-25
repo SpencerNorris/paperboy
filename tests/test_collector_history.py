@@ -396,3 +396,82 @@ async def test_page_budget_phase_stop_carries_the_counts_collected_so_far(tmp_pa
             await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False, page_budget=1)
         assert excinfo.value.counts["messages"] == 100
         assert st.conn.execute("select count(*) c from messages").fetchone()["c"] == 100
+
+
+# --- a MessageEmpty reaching the backfill loop must never blank a stored row
+#
+# `iter_history` empirically never yields `MessageEmpty` inline (deletes are
+# just omitted; `_probe_gaps`'s explicit-id `get_messages` call is the only
+# place they're seen today) — but nothing in the TL contract guarantees that,
+# and `_observe_message` had no guard against it. If one ever arrived here,
+# `upsert_message`'s `ON CONFLICT DO UPDATE` would write `text=""`,
+# `media=NULL` over a previously-stored populated row, silently downgrading
+# the queryable `messages` copy of a post captured before the channel served
+# a MessageEmpty for it. A re-observation must never do that.
+
+
+@pytest.mark.asyncio
+async def test_message_empty_does_not_blank_a_previously_stored_message(tmp_path):
+    gw1 = FakeGateway({"history": [_m(1)]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw1))
+        stored = st.conn.execute(
+            "select text, deleted_at from messages where uri='tg:msg:5/1'"
+        ).fetchone()
+        assert stored["text"] == "m1"
+        assert stored["deleted_at"] is None
+
+        # A later sweep observes a MessageEmpty for the same id — the
+        # placeholder Telegram serves for a message that no longer resolves.
+        gw2 = FakeGateway({"history": [{"_": "messageEmpty", "id": 1}]})
+        res = await HistoryCollector().collect(_ctx(st, gw2))
+
+        stored = st.conn.execute(
+            "select text, media_json, deleted_at from messages where uri='tg:msg:5/1'"
+        ).fetchone()
+        assert stored["text"] == "m1"  # NOT blanked
+        assert stored["media_json"] is None  # unchanged (was already None)
+        assert stored["deleted_at"] is not None
+        tomb = st.conn.execute(
+            "select evidence from message_tombstones where message_uri='tg:msg:5/1'"
+        ).fetchone()
+        assert tomb is not None
+        assert tomb["evidence"] == "empty"
+        assert res.counts["tombstones"] == 1
+        assert res.counts["messages"] == 0
+
+
+@pytest.mark.asyncio
+async def test_message_empty_for_never_seen_id_tombstones_without_a_blank_row(tmp_path):
+    gw = FakeGateway({"history": [{"_": "messageEmpty", "id": 7}]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["tombstones"] == 1
+        assert res.counts["messages"] == 0
+        assert st.conn.execute(
+            "select count(*) c from messages where uri='tg:msg:5/7'"
+        ).fetchone()["c"] == 0
+        tomb = st.conn.execute(
+            "select evidence from message_tombstones where message_uri='tg:msg:5/7'"
+        ).fetchone()
+        assert tomb is not None
+        assert tomb["evidence"] == "empty"
+
+
+@pytest.mark.asyncio
+async def test_message_service_and_normal_message_still_upsert(tmp_path):
+    """The guard must divert ONLY `MessageEmpty` — a `MessageService` (a join/
+    pin/title-change notice, still a real row) and a normal message must still
+    upsert normally in the same page."""
+    svc = _m(2, _="messageService")
+    gw = FakeGateway({"history": [svc, _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["messages"] == 2
+        assert res.counts["tombstones"] == 0
+        rows = {r["uri"] for r in st.conn.execute("select uri from messages")}
+        assert rows == {"tg:msg:5/1", "tg:msg:5/2"}
+        is_service = st.conn.execute(
+            "select is_service from messages where uri='tg:msg:5/2'"
+        ).fetchone()["is_service"]
+        assert is_service == 1

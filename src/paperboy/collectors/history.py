@@ -170,6 +170,23 @@ class HistoryCollector:
     def _observe_message(
         self, ctx: CollectContext, channel_id: int, m: dict, counts: dict[str, int]
     ) -> None:
+        # `MessageEmpty` is Telegram's placeholder for an id that no longer
+        # resolves (empirically only ever seen via `_probe_gaps`'s explicit
+        # `get_messages` call, never inline from `iter_history` — but nothing
+        # in the TL contract guarantees that stays true). `upsert_message`'s
+        # `ON CONFLICT DO UPDATE` has no concept of "unknown"; it would write
+        # `text=""`/`media=NULL` over a previously-stored populated row,
+        # blanking the queryable copy of a post captured before the channel
+        # served an empty for it. Route it through the same tombstone path
+        # `_probe_gaps` uses instead, and stop before the peer/edge
+        # projection below, which has nothing to project for a placeholder.
+        if m.get("_", "").lower() == "messageempty":
+            observed_at = utc_now_iso()
+            ctx.store.add_raw("MessageEmpty", m, ctx.tier, {"channel_id": channel_id})
+            mark_deleted(ctx.store, channel_id, m["id"], "empty", observed_at)
+            counts["tombstones"] += 1
+            return
+
         observed_at = utc_now_iso()
         raw_id = ctx.store.add_raw(
             m.get("_", "Message"), m, ctx.tier, {"channel_id": channel_id}
