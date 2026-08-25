@@ -197,11 +197,10 @@ class HistoryCollector:
 
         fwd_from = m.get("fwd_from")
         object_uri = peer_ref_uri(fwd_from.get("from_id")) if fwd_from else None
-        if object_uri:
-            add_edge(
-                ctx.store, uri, "forwarded_from", object_uri, observed_at, ctx.tier, raw_id,
-                {"fwd_from": fwd_from},
-            )
+        if object_uri and add_edge(
+            ctx.store, uri, "forwarded_from", object_uri, observed_at, ctx.tier, raw_id,
+            {"fwd_from": fwd_from},
+        ):
             counts["edges"] += 1
 
     async def _probe_gaps(

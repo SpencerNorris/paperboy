@@ -26,6 +26,36 @@ def set_state(store: Store, scope: str, key: str, value: dict) -> None:
         "ON CONFLICT(scope, key) DO UPDATE SET value_json=excluded.value_json",
         (scope, key, dumps(value)),
     )
+    # Prime the is_self cache the moment the collecting account is recorded, so
+    # projections in the same run (which may run before the cache would lazily
+    # load) see it without a re-read (issue #12).
+    if scope == "account" and key == "self":
+        store.__dict__["_self_uri_cache"] = value.get("uri")
+
+
+_UNSET = object()
+
+
+def self_uri(store: Store) -> str | None:
+    """The collecting account's peer URI (from `sync_state('account','self')`).
+
+    Cached per `Store`: primed by `set_state` when the `channel` phase records
+    self, and lazily loaded from the DB on a resumed run where that phase did
+    not run this process. `None` until the account is known.
+    """
+    cached = store.__dict__.get("_self_uri_cache", _UNSET)
+    if cached is _UNSET:
+        state = get_state(store, "account", "self")
+        cached = state.get("uri") if state else None
+        store.__dict__["_self_uri_cache"] = cached
+    return cached
+
+
+def is_self(store: Store, uri: str | None) -> bool:
+    """True when `uri` is the collecting account — the projection layer's single
+    chokepoint for keeping the collector out of the dataset (issue #12).
+    """
+    return uri is not None and uri == self_uri(store)
 
 
 def add_range(store: Store, channel_id: int, lo: int, hi: int) -> None:

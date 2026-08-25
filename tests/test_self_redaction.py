@@ -121,18 +121,51 @@ async def test_redacted_self_record_is_still_recognisable_as_the_self_user(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_self_peer_projection_and_account_state_are_unaffected(tmp_path):
-    """Regression guard: scrubbing must not break what depends on self."""
+async def test_account_state_still_records_self(tmp_path):
+    """Excluding self from the dataset must not break the operational cursor:
+    `sync_state('account','self')` still records the id/uri (issue #12)."""
     st = await _run(tmp_path)
     try:
         assert get_state(st, "account", "self") == {
             "uri": "tg:user:8846802359",
             "id": 8846802359,
         }
-        peer = st.conn.execute(
-            "SELECT first_name FROM peers WHERE uri='tg:user:8846802359'"
-        ).fetchone()
-        assert peer is not None
-        assert peer["first_name"] == "Mark"
     finally:
         st.close()
+
+
+def _fixtures_with_self_in_vector() -> dict:
+    """self also appears in getFullChannel's `users` vector — the incidental
+    path issue #12 names (self rides along in the users/chats of responses),
+    distinct from the explicit get_me() upsert."""
+    fx = _fixtures()
+    full = json.loads((FX / "full_channel.json").read_text())
+    full["users"] = [
+        {"_": "user", "id": 8846802359, "first_name": "Mark", "access_hash": 1},
+        {"_": "user", "id": 555, "first_name": "Someone Else"},
+    ]
+    fx["full_channel"] = full
+    return fx
+
+
+@pytest.mark.asyncio
+async def test_self_is_excluded_from_peers_even_via_a_response_vector(tmp_path):
+    """The collecting account must not land in `peers` — neither from the
+    explicit get_me() nor from riding along in a response's users vector
+    (issue #12). A genuine other peer in the same vector is still stored."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        ctx = CollectContext(
+            FakeGateway(_fixtures_with_self_in_vector()), st,
+            load_settings("default", {}), parse_target("@durov"),
+            None, None, "stranger", logging.getLogger("t"),
+        )
+        await ChannelCollector().collect(ctx)
+        self_row = st.conn.execute(
+            "SELECT uri FROM peers WHERE uri='tg:user:8846802359'"
+        ).fetchone()
+        assert self_row is None, "self must never be a peer row"
+        other = st.conn.execute("SELECT uri FROM peers WHERE uri='tg:user:555'").fetchone()
+        assert other is not None, "a genuine other peer is still stored"
+        # the operational cursor is intact
+        state = get_state(st, "account", "self")
+        assert state is not None and state["id"] == 8846802359
