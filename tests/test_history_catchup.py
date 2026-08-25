@@ -101,6 +101,70 @@ async def test_catchup_too_long_resyncs_pts_and_flags_resynced(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_catchup_too_long_with_unset_dialog_pts_keeps_the_stored_cursor(tmp_path):
+    # `Dialog.pts` is flags.0?int, and Telethon emits it present-with-None when
+    # the flag is unset — a shape the hand-written {"pts": 999} fixture above
+    # can never produce (issue #22). The corrupted-cursor failure only shows at
+    # the gateway boundary, so the assertion is on what the gateway received.
+    diff = {
+        "_": "ChannelDifferenceTooLong",
+        "dialog": {"_": "Dialog", "pts": None},
+        "messages": [], "chats": [], "users": [],
+    }
+    gw = FakeGateway({"channel_difference": diff})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "channel", "5", {"pts": 40})
+        res = await HistoryCollector().catch_up(_ctx(st, gw))
+        assert res.stopped == "resynced"
+        assert get_state(st, "channel", "5") == {"pts": 40}
+        await HistoryCollector().catch_up(_ctx(st, gw))
+        assert None not in gw.channel_difference_pts
+
+
+@pytest.mark.asyncio
+async def test_catchup_too_long_projects_its_recovery_messages(tmp_path):
+    # channelDifferenceTooLong carries the newest messages as a recovery
+    # payload; discarding them strands data that already reached raw_records.
+    diff = {
+        "_": "ChannelDifferenceTooLong",
+        "dialog": {"_": "Dialog", "pts": 999},
+        "messages": [
+            {
+                "_": "message", "id": 30, "message": "carried by the resync",
+                "date": 1767322445, "peer_id": {"channel_id": 5},
+            }
+        ],
+        "chats": [], "users": [],
+    }
+    gw = FakeGateway({"channel_difference": diff})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "channel", "5", {"pts": 1})
+        res = await HistoryCollector().catch_up(_ctx(st, gw))
+        row = st.conn.execute(
+            "select text from messages where uri='tg:msg:5/30'"
+        ).fetchone()
+        assert row is not None and row["text"] == "carried by the resync"
+        assert res.counts["messages"] == 1
+        assert res.stopped == "resynced"
+
+
+@pytest.mark.asyncio
+async def test_catchup_treats_a_corrupted_none_cursor_as_unseeded(tmp_path):
+    # A pre-fix run could have persisted {"pts": None}; reading it back must
+    # not forward None to the gateway (real Telethon dies on it with a
+    # struct.error that bypasses the disposition system).
+    diff = {
+        "_": "updates.channelDifferenceEmpty", "final": True, "pts": 60, "timeout": 30,
+    }
+    gw = FakeGateway({"channel_difference": diff})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "channel", "5", {"pts": None})
+        await HistoryCollector().catch_up(_ctx(st, gw))
+        assert gw.channel_difference_pts == [0]
+        assert get_state(st, "channel", "5") == {"pts": 60}
+
+
+@pytest.mark.asyncio
 async def test_catchup_defaults_pts_to_zero_when_unseeded(tmp_path):
     diff = {
         "_": "updates.channelDifference", "final": True, "pts": 5,
