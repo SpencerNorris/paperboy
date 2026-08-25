@@ -89,6 +89,16 @@ class ChannelCollector:
             full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": chan["id"]}
         )
         full_chat = full["full_chat"]
+        # getFullChannel(input_channel) must answer for the channel we asked
+        # about: input_channel (the access_hash history uses) is resolve-side,
+        # while channel_id / pts below key off full_chat.id. If those ever
+        # disagreed, one run would address one channel and store under another
+        # — fail loudly rather than split identity across the collect.
+        if full_chat["id"] != chan["id"]:
+            raise ValueError(
+                f"getFullChannel for {chan['id']} answered with full_chat for "
+                f"{full_chat['id']} — refusing to split channel identity"
+            )
         # Prefer the richer `chat` object returned alongside getFullChannel
         # (may carry admin_rights/creator not present on the resolve() one).
         full_chats = full.get("chats", [])

@@ -154,6 +154,32 @@ async def test_channel_collector_trusts_peer_over_the_chats_vector(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_channel_collector_rejects_resolve_full_identity_mismatch(tmp_path):
+    # ctx.input_channel (access_hash) comes from the resolve-side pick;
+    # ctx.channel_id / pts come from full_chat.id. If the two ever disagreed,
+    # history would key state to one channel while addressing another — fail
+    # loudly rather than split identity across the run.
+    fx = _fixtures()
+    fx["full_channel"] = {
+        "_": "messages.chatFull",
+        "full_chat": {
+            "_": "channelFull", "id": 6, "participants_count": 1, "about": "x",
+            "pts": 1, "linked_chat_id": 0,
+        },
+        "chats": [{"_": "channel", "id": 6, "access_hash": 77, "title": "other"}],
+        "users": [],
+    }
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        ctx = CollectContext(
+            gw, st, load_settings("default", {}), parse_target("@durov"),
+            None, None, "stranger", logging.getLogger("t"),
+        )
+        with pytest.raises(ValueError):
+            await ChannelCollector().collect(ctx)
+
+
+@pytest.mark.asyncio
 async def test_channel_collector_rejects_a_resolution_without_peer(tmp_path):
     # `contacts.ResolvedPeer` always carries `peer` in the wild; a response
     # without it gives us no authoritative identity, so guessing is refused.
