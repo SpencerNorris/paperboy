@@ -31,6 +31,21 @@ def test_expired_invite_hash_classifies_as_skip():
         assert classify(exc(None)) == Disposition.SKIP
 
 
+def test_refused_join_classifies_as_skip():
+    # A --join can be refused by a real gated group: an approval-gated group
+    # returns INVITE_REQUEST_SENT, and a saturated account CHANNELS_TOO_MUCH.
+    # These must SKIP that one join (a clean, distinguishable skip), not crash
+    # the whole run with a raw Telethon error (issue #20 review).
+    from telethon.errors import (
+        ChannelsTooMuchError,
+        InviteRequestSentError,
+        UserChannelsTooMuchError,
+    )
+
+    for exc in (InviteRequestSentError, ChannelsTooMuchError, UserChannelsTooMuchError):
+        assert classify(exc(None)) == Disposition.SKIP
+
+
 def test_unrecognized_exception_is_reraised():
     class Weird(Exception):
         pass

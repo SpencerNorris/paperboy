@@ -38,13 +38,16 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
     from telethon.errors import (
         BroadcastForbiddenError,
         ChannelPrivateError,
+        ChannelsTooMuchError,
         ChatAdminRequiredError,
         ChatNotModifiedError,
         InviteHashEmptyError,
         InviteHashExpiredError,
         InviteHashInvalidError,
+        InviteRequestSentError,
         MsgIdInvalidError,
         PremiumAccountRequiredError,
+        UserChannelsTooMuchError,
     )
 
     return (
@@ -64,6 +67,13 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         InviteHashExpiredError,
         InviteHashInvalidError,
         InviteHashEmptyError,
+        # A `--join` (issue #20) can be refused by a real gated group: an
+        # approval-gated group answers INVITE_REQUEST_SENT, and a saturated
+        # account CHANNELS_TOO_MUCH. That is a clean per-join skip — the
+        # discussion phase reports "joining failed" — not a run-ending crash.
+        InviteRequestSentError,
+        ChannelsTooMuchError,
+        UserChannelsTooMuchError,
     )
 
 
