@@ -240,10 +240,12 @@ class HistoryCollector:
         `updateEditChannelMessage` appends a revision (via `upsert_message`'s
         own content-hash check), `updateDeleteChannelMessages` tombstones
         with `evidence="update"` (spec §7's highest-confidence deletion
-        evidence). A `channelDifferenceTooLong` re-seeds `pts` from the
-        payload's `dialog` and returns with `stopped="resynced"` — a full
-        gap probe for this channel is the caller's job (a future `watch`
-        loop iteration or a plain re-run of `history`).
+        evidence). A `channelDifferenceTooLong` projects the recovery
+        messages it carries, re-seeds `pts` from the payload's `dialog`
+        (only when the dialog actually carries an int — issue #22), and
+        returns with `stopped="resynced"` — a full gap probe for this
+        channel is the caller's job (a future `watch` loop iteration or a
+        plain re-run of `history`).
         """
         if ctx.input_channel is None or ctx.channel_id is None:
             raise PhaseStop(
@@ -254,7 +256,10 @@ class HistoryCollector:
         counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
 
         state = get_state(ctx.store, "channel", str(channel_id)) or {}
-        pts = state.get("pts", 0)
+        # `or 0` and not a plain default: a pre-fix run could have persisted
+        # {"pts": None} (issue #22), and forwarding None to the gateway dies
+        # inside Telethon as a struct.error — outside the disposition system.
+        pts = state.get("pts") or 0
 
         diff = await ctx.gateway.get_channel_difference(
             ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
@@ -264,8 +269,24 @@ class HistoryCollector:
         )
 
         if diff.get("_", "").lower() == "channeldifferencetoolong":
-            resynced_pts = diff.get("dialog", {}).get("pts", pts)
-            set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
+            # The resync response carries the newest messages as a recovery
+            # payload — project them; they already reached raw_records above.
+            for m in diff.get("messages", []):
+                self._observe_message(ctx, channel_id, m, counts)
+            # `Dialog.pts` is flags.0?int and Telethon emits it present-with-
+            # None when unset, so a `.get("pts", fallback)` never falls back
+            # (issue #22). Never persist a non-int cursor: the next reader
+            # would hand None to Telethon and crash outside the disposition
+            # system. Keeping the old cursor just repeats the resync signal.
+            resynced_pts = (diff.get("dialog") or {}).get("pts")
+            if isinstance(resynced_pts, int):
+                set_state(ctx.store, "channel", str(channel_id), {"pts": resynced_pts})
+            else:
+                ctx.log.warning(
+                    "history: channelDifferenceTooLong for %s carried no dialog pts; "
+                    "keeping the stored cursor (%s) — full re-sweep required",
+                    channel_id, pts,
+                )
             return CollectResult(name=self.name, counts=counts, stopped="resynced")
 
         for m in diff.get("new_messages", []):

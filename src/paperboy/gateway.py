@@ -117,6 +117,11 @@ class FakeGateway:
         # catch a sweep silently aimed at the wrong channel or built with a
         # stale access hash.
         self.history_targets: list[dict] = []
+        # Every `pts` value `get_channel_difference` was called with. A cursor
+        # corrupted in the store (issue #22: `None` persisted by a TooLong
+        # resync) only becomes observable at the call boundary — the real
+        # gateway would crash on it inside Telethon, past every handler.
+        self.channel_difference_pts: list[int | None] = []
 
     async def resolve(self, target_value: str) -> dict:
         self.calls.append("resolve")
@@ -153,7 +158,8 @@ class FakeGateway:
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         self.calls.append("get_channel_difference")
-        del input_channel, pts, limit
+        self.channel_difference_pts.append(pts)
+        del input_channel, limit
         return self._fx["channel_difference"]
 
     async def get_authorizations(self) -> dict:
