@@ -9,10 +9,31 @@ import hashlib
 from paperboy.ids import channel_uri, primary_username
 from paperboy.store.db import Store, dumps
 
-_FLAG_KEYS = (
-    "verified", "scam", "fake", "restricted", "signatures", "has_link", "has_geo",
-    "slowmode_enabled", "participants_hidden", "can_view_participants",
-)
+# `min` is a whole-object serialization marker (this payload was a reduced
+# object), not a channel property — it is recorded on `peers.is_min` and
+# excluded from a channel's flags. Only the whole-object marker is excluded;
+# per-field reliability qualifiers like `stories_hidden_min` are kept, because
+# they carry real metadata about a specific flag rather than misdescribing the
+# channel.
+_FLAG_EXCLUDE = frozenset({"min"})
+
+
+def _channel_flags(full: dict, chan: dict) -> dict[str, bool]:
+    """Every boolean flag on the ChannelFull and Channel.
+
+    Telegram's `flags.N?true` fields serialise as real booleans, so capturing
+    every bool-valued key projects the full flag set — rather than a fixed
+    allow-list, which silently dropped 20 of 28 flags and hid the very
+    `join_to_send`/`join_request` the join decision rests on (issue #20). `chan`
+    is applied last so the authoritative Channel wins any overlap with the
+    ChannelFull.
+    """
+    flags: dict[str, bool] = {}
+    for obj in (full, chan):
+        for k, v in obj.items():
+            if isinstance(v, bool) and k not in _FLAG_EXCLUDE:
+                flags[k] = v
+    return flags
 
 
 def _channel_kind(chan: dict) -> str | None:
@@ -51,7 +72,7 @@ def upsert_channel(
     participants_count = full.get("participants_count")
     restriction = chan.get("restriction_reason")
     restriction_json = dumps(restriction) if restriction else None
-    flags = {k: (chan.get(k, full.get(k))) for k in _FLAG_KEYS if k in chan or k in full}
+    flags = _channel_flags(full, chan)
     flags_json = dumps(flags) if flags else None
 
     store.conn.execute(

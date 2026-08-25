@@ -153,3 +153,199 @@ async def test_web_collector_skips_target_with_no_public_username(tmp_path):
         collector = WebCollector(client=_mock_client(handler), sleep=lambda s: None)
         with pytest.raises(SkipAndRecord):
             await collector.collect(_ctx(st, target_str="-100123456789"))
+
+
+# --- an ambiguous HTTP failure must never read as "nothing there" ----------
+#
+# Found on the live target: the 2026-08-21 collect reported `wayback_rows: 0`
+# and the brief concluded the channel's 258 purged posts were unrecoverable.
+# `raw_records` shows what actually happened — `status_code: 429`, a 162-byte
+# nginx error page. `_collect_wayback` never checked the status, so
+# `response.json()` raised, `payload` became `[]`, and a throttled request was
+# reported as a confident empty index. archive.org throttles VPN exit IPs
+# routinely, so this is the common case, not an exotic one.
+
+
+def _status_handler(tme_status: int, cdx_status: int, tme_html: str = "", cdx_json: str = "[]"):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host in ("t.me", "www.t.me"):
+            if tme_status != 200:
+                return httpx.Response(tme_status, text="<html><h1>429</h1></html>")
+            if request.url.params.get("before") is not None:
+                return httpx.Response(200, text="<html><body>no more</body></html>")
+            return httpx.Response(200, text=tme_html)
+        if request.url.host == "web.archive.org":
+            if cdx_status != 200:
+                return httpx.Response(cdx_status, text="<html><h1>429</h1></html>")
+            return httpx.Response(200, text=cdx_json)
+        return httpx.Response(404)
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_throttled_wayback_is_not_reported_as_zero_snapshots(tmp_path):
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 429, tme_html))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        # The distinction that matters: "we could not find out" is not "zero".
+        assert res.counts.get("wayback_rows") != 0 or res.counts.get("wayback_failed")
+        assert res.counts.get("wayback_failed") == 429
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_empty_cdx_index_still_reports_zero(tmp_path):
+    """The other side of it: a real 200 with an empty index means zero, and
+    must not be dressed up as a failure."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 200, tme_html, "[]"))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
+async def test_a_200_with_an_unparseable_body_is_a_failure_not_zero(tmp_path):
+    """The gap 392e70f left (issue #24): the status check passes, but a 200
+    whose body is not valid JSON — exactly what an oversized CDX response
+    arriving truncated looks like, the original durov failure mode — still
+    fell through `except ValueError: payload = []` to a confident
+    `wayback_rows: 0`. Same "couldn't tell" dressed as "nothing there"."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    truncated = '[["urlkey","timestamp","original","digest"],["com,t)/s/du'
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=truncated))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert "wayback_rows" not in res.counts
+        assert res.counts.get("wayback_failed") == 200
+        # the unparseable body is still recoverable from raw_records (stored
+        # JSON-escaped, so decode the row and compare the actual text field)
+        import json as _json
+
+        raw = st.conn.execute(
+            "SELECT payload_json FROM raw_records WHERE kind='wayback_cdx'"
+        ).fetchone()
+        assert raw is not None
+        assert _json.loads(raw["payload_json"])["text"] == truncated
+
+
+@pytest.mark.asyncio
+async def test_a_valid_json_non_index_body_is_a_failure_not_zero(tmp_path):
+    """The sibling of the truncation case: a 200 whose body IS valid JSON but
+    is not a CDX array — a proxy/gateway error doc like {"error": "..."} — is
+    not an empty index either. It must not fall through to a false zero (the
+    same bug class issue #24 names)."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json='{"error": "blocked"}'))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert "wayback_rows" not in res.counts
+        assert res.counts.get("wayback_failed") == 200
+
+
+@pytest.mark.asyncio
+async def test_a_wayback_failure_warning_reports_the_real_status(tmp_path, caplog):
+    """A 404 also reaches the body-parse branches (404 is not an ambiguous
+    status), so the failure warning must name the actual status, not a
+    hard-coded 200."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 404, tme_html, cdx_json="<html>not found</html>"))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        with caplog.at_level(logging.WARNING):
+            res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts.get("wayback_failed") == 404
+        warnings = [r.getMessage() for r in caplog.records if "wayback" in r.getMessage()]
+        assert warnings
+        assert all("404" in m and "HTTP 200" not in m for m in warnings)
+
+
+@pytest.mark.asyncio
+async def test_a_json_list_that_is_not_index_shaped_is_a_failure(tmp_path):
+    """One guard deeper than the not-a-list case: a body that IS a JSON list
+    but whose elements are not rows — a list-wrapped error envelope like
+    [{"error": ...}] (a normal API error shape) or a list of strings — is not
+    a CDX index and must not read as an empty index. The CDX index is a list
+    of equal-length lists; anything else here is a failed attempt (issue #24)."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    for body in ('[{"error": "blocked"}]', '["blocked", "denied"]', "[1, 2, 3]"):
+        client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=body))
+        with Store.open(tmp_path / f"p{hash(body)}.sqlite") as st:
+            res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+            assert "wayback_rows" not in res.counts, body
+            assert res.counts.get("wayback_failed") == 200, body
+
+
+@pytest.mark.asyncio
+async def test_a_header_only_cdx_index_is_a_genuine_zero(tmp_path):
+    """The other side: an all-lists array with no data rows (just the header,
+    or rows the parser skips) IS index-shaped — a valid query that found
+    nothing — and stays zero, not a failure."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    header_only = '[["urlkey", "timestamp", "original", "digest"]]'
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=header_only))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
+async def test_a_bom_only_cdx_body_is_a_genuine_zero(tmp_path):
+    """A body that is only a BOM (U+FEFF is not str.strip() whitespace) is an
+    empty index, not a failure — never a false failure on a genuine zero."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json="﻿"))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
+async def test_an_empty_cdx_body_is_a_genuine_zero_not_a_failure(tmp_path):
+    """The inverse trap of the fix above: the CDX endpoint signals an empty
+    index with an EMPTY body (not "[]"), which also fails to parse as JSON.
+    That is a true zero and must NOT be dressed up as a failure — otherwise
+    the fix for issue #24 just inverts the original bug."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=""))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
+async def test_a_wayback_failure_does_not_destroy_the_tme_results(tmp_path):
+    """The two vectors are independent. One being throttled must not discard
+    what the other already collected."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 503, tme_html))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["tme_posts"] == 2
+        assert res.counts.get("wayback_failed") == 503
+
+
+@pytest.mark.asyncio
+async def test_throttled_tme_is_not_reported_as_an_empty_channel(tmp_path):
+    """Same bug, same file, other vector: `parse_tme_page` on a 429 error body
+    yields no posts, the loop breaks, and the phase reports `tme_posts: 0` —
+    indistinguishable from a channel with no public page."""
+    client = _mock_client(_status_handler(429, 200))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts.get("tme_failed") == 429
+
+
+@pytest.mark.asyncio
+async def test_a_404_from_tme_is_a_real_absence_not_a_failure(tmp_path):
+    """A 404 genuinely means no public page — that IS zero, and must not be
+    reported as an unknown."""
+    client = _mock_client(_status_handler(404, 200))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["tme_posts"] == 0
+        assert "tme_failed" not in res.counts

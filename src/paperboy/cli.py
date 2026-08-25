@@ -132,9 +132,13 @@ def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
     phases: str = typer.Option(
-        None, "--phases", help="Comma-separated: channel,history,graph,web,media"
+        None, "--phases", help="Comma-separated: channel,history,discussion,graph,web,media"
     ),
-    join: bool = typer.Option(False, "--join", help="Not implemented in core v1 (Phase 2)."),
+    join: bool = typer.Option(
+        False, "--join",
+        help="Join a linked discussion group that gates reading behind membership "
+             "(join_to_send). An active, non-passive WRITE — off by default.",
+    ),
     media: bool = typer.Option(
         False, "--media", help="Also download message media (opt-in; off by default)."
     ),
@@ -147,13 +151,13 @@ def collect(
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
+    overrides: dict[str, object] = {}
     if join:
         console.print(
-            "[yellow]--join is accepted but not implemented in core v1 — "
-            "paperboy never joins.[/]"
+            "[yellow]--join enabled: paperboy will JOIN a join_to_send discussion "
+            "group to read it — an active, non-passive act, recorded in run_events.[/]"
         )
-
-    overrides: dict[str, object] = {}
+        overrides["allow_join"] = True
     if profile_budget is not None:
         overrides["profile_budget"] = profile_budget
     if max_rpc is not None:
@@ -166,7 +170,8 @@ def collect(
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
-        p for p in ("history", "graph", "media", "web") if phase_list and p in phase_list
+        p for p in ("history", "discussion", "graph", "media", "web")
+        if phase_list and p in phase_list
     ]
     if phase_list is not None and _dependent_phases and "channel" not in phase_list:
         # `channel` populates `CollectContext.input_channel`/`channel_id` (the

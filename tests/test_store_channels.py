@@ -1,5 +1,39 @@
+import json
+
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
+
+
+def test_channel_flags_capture_every_boolean_not_a_fixed_allow_list(tmp_path):
+    # The projection dropped 20 of the 28 boolean flags Telegram returns,
+    # including the ones the --join decision rests on (issue #20). Every boolean
+    # flag on the Channel and ChannelFull must survive into flags_json; the
+    # `min` serialization marker is the one deliberate exclusion (it is a
+    # peer-resolution artifact recorded on peers.is_min, not a channel property).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        chan = {
+            "_": "channel", "id": 5, "access_hash": 99, "title": "T",
+            "broadcast": True, "join_to_send": True, "join_request": False,
+            "noforwards": True, "left": False, "creator": True, "min": False,
+        }
+        full = {
+            "_": "channelFull", "id": 5, "participants_count": 10, "pts": 1,
+            "linked_chat_id": 0, "can_view_participants": True, "antispam": True,
+            "hidden_prehistory": False,
+        }
+        r = st.add_raw("channelFull", full, "stranger", None)
+        upsert_channel(st, full, chan, r, "2026-01-01T00:00:00+00:00")
+        flags = json.loads(
+            st.conn.execute("select flags_json from channels where id=5").fetchone()["flags_json"]
+        )
+        for k in ("join_to_send", "join_request", "noforwards", "left", "creator", "broadcast"):
+            assert k in flags, f"{k} dropped from flags_json"
+        for k in ("can_view_participants", "antispam", "hidden_prehistory"):
+            assert k in flags, f"ChannelFull flag {k} dropped from flags_json"
+        assert flags["join_to_send"] is True and flags["join_request"] is False
+        assert "min" not in flags  # the deliberate exclusion
+        # non-boolean fields are not flags
+        assert "participants_count" not in flags and "title" not in flags
 
 
 def test_upsert_channel_and_snapshot(tmp_path):

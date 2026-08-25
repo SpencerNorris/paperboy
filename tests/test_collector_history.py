@@ -7,7 +7,7 @@ from paperboy.collectors.base import CollectContext
 from paperboy.collectors.history import HistoryCollector
 from paperboy.config import load_settings
 from paperboy.store.db import Store
-from paperboy.store.sync import get_state
+from paperboy.store.sync import get_state, set_state
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
 
@@ -149,3 +149,250 @@ async def test_catch_up_raises_phase_stop_when_channel_context_unset(tmp_path):
     })
     with Store.open(tmp_path / "p.sqlite") as st, pytest.raises(PhaseStop):
         await HistoryCollector().catch_up(_unset_ctx(st, gw))
+
+
+# --- generalization: explicit target + probe_gaps switch -------------------
+#
+# `discussion` reuses this same page loop against a linked group instead of
+# duplicating cursor/resumability/FLOOD_WAIT handling (plan Task 1). These
+# reuse this file's own `_m`/`_ctx` helpers rather than a `_msg` of their
+# own — `_m` already parameterizes the message id and accepts overrides via
+# `**extra`, and the channel the loop writes rows under is controlled
+# entirely by `collect()`'s `channel_id` kwarg (or `ctx.channel_id` by
+# default), never by anything inside the message payload itself, so no
+# helper change is needed to target a different channel.
+
+
+@pytest.mark.asyncio
+async def test_collect_defaults_to_the_context_channel(tmp_path):
+    """No kwargs => today's behaviour, bit for bit."""
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        rows = st.conn.execute("select channel_id from messages").fetchall()
+        assert {r["channel_id"] for r in rows} == {5}
+        assert res.counts["messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_an_explicit_channel(tmp_path):
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        rows = st.conn.execute("select channel_id from messages").fetchall()
+        assert {r["channel_id"] for r in rows} == {77}
+
+
+@pytest.mark.asyncio
+async def test_probe_gaps_false_writes_no_tombstones(tmp_path):
+    # ids 1 and 3 present, 2 missing: probing ON would tombstone 2.
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        assert res.counts["tombstones"] == 0
+        assert st.conn.execute("select count(*) c from message_tombstones").fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_gaps_false_writes_no_verified_range(tmp_path):
+    """Amendment 2 / spec §5: `add_range` is called only when `probe_gaps`
+    is true. `store/sync.py` defines a range as verified-complete — "every
+    id in the span was either stored or probed" — which is false with
+    probing off, and writing one anyway makes `missing_ids()` report zero
+    gaps for that span forever. Previously unpinned: `grep -rn sync_ranges
+    tests/` found only `test_store_sync.py`'s direct unit tests and
+    `test_backfill_records_verified_range` (the probe_gaps=True case), so
+    nothing in the suite would catch `add_range` being moved back outside
+    the `if probe_gaps:` branch — which is exactly what the plan's own
+    verbatim Task 1 Step 4 code still shows."""
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        assert st.conn.execute(
+            "select count(*) c from sync_ranges where channel_id=5"
+        ).fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_gaps_true_still_tombstones(tmp_path):
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["tombstones"] == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_target_resumes_on_its_own_cursor(tmp_path):
+    gw = FakeGateway({"history": [_m(2), _m(1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "history", "5", {"offset_id": 999})
+        await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        assert get_state(st, "history", "5") == {"offset_id": 999}
+        assert get_state(st, "history", "77") == {"offset_id": 1}
+
+
+# --- page_budget (added for the `discussion` collector's Opus test-gate
+# review, coverage gap 3: "the default is unpinned, and nothing asserts
+# `history`'s own `page_budget` stays unbounded when a caller (`discussion`)
+# threads its own budget through the shared parameter") ---------------------
+
+
+@pytest.mark.asyncio
+async def test_page_budget_defaults_to_unbounded(tmp_path):
+    """Task 1 Step 6 adds a `page_budget: int | None = None` kwarg to
+    `collect()`; `discussion` threads its own `discussion_page_budget`
+    (default 500, see `tests/test_collector_discussion.py::
+    test_discussion_page_budget_defaults_to_500`) through it explicitly.
+    `history`'s OWN default must stay unbounded — a plain `collect()` call
+    with no `page_budget` argument at all must page a channel past 100
+    (`_HISTORY_PAGE_SIZE`) messages, indeed past whatever small number
+    `discussion` happens to default to, without ever raising `PhaseStop`.
+    3 full 100-message pages (300 total, no gaps) exercises this without
+    depending on the exact default value."""
+    gw = FakeGateway({"history": [_m(i) for i in range(300, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(_ctx(st, gw))
+        assert res.counts["messages"] == 300
+
+
+@pytest.mark.asyncio
+async def test_explicit_target_with_probe_gaps_true_probes_gaps_on_that_target(tmp_path):
+    """The explicit-target axis (`test_collect_targets_an_explicit_channel`)
+    and the `probe_gaps` axis (`test_probe_gaps_true_still_tombstones`) are
+    each exercised only against `ctx.channel_id`/`ctx.input_channel`
+    individually. An implementation whose `_probe_gaps` call still reads
+    `ctx.channel_id`/`ctx.input_channel` instead of the threaded `channel_id`/
+    `input_channel` parameters would gap-probe (and tombstone) the WRONG
+    channel entirely and still pass both of those tests on their own —
+    neither can observe which channel actually got probed. This combines
+    both axes and asserts the tombstone landed under the EXPLICIT target's
+    URI, not `ctx.channel_id`'s."""
+    gw = FakeGateway({
+        "history": [_m(3), _m(1)],
+        "get_messages": {2: {"_": "MessageEmpty", "id": 2}},
+    })
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await HistoryCollector().collect(
+            _ctx(st, gw), channel_id=77, input_channel={"channel_id": 77, "access_hash": 3},
+        )
+        assert res.counts["tombstones"] == 1
+        row = st.conn.execute("select message_uri from message_tombstones").fetchone()
+        assert row["message_uri"] == "tg:msg:77/2"
+
+
+# --- incremental catch-up: budget interruption must not lose messages -------
+#
+# Regression, found by the Opus test gate. Incremental mode discarded the saved
+# cursor AND advanced the persisted `max_id_seen` before the span had been
+# walked, so on the next run `prior_high` was already the new maximum and the
+# loop broke on its first page. Every id between the budget stop and the old
+# high-water mark was then unreachable by any future run — silent, permanent
+# loss, while the PhaseStop message promised "re-run to continue".
+
+
+@pytest.mark.asyncio
+async def test_incremental_run_stopped_by_budget_resumes_where_it_stopped(tmp_path):
+    gw = FakeGateway({"history": [_m(i) for i in range(300, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["backfill_complete"] is True
+        assert sweep["max_id_seen"] == 300
+
+        # 500 new messages arrive; catch up two pages at a time.
+        gw2 = FakeGateway({"history": [_m(i) for i in range(800, 0, -1)], "get_messages": {}})
+        with pytest.raises(PhaseStop):
+            await HistoryCollector().collect(_ctx(st, gw2), probe_gaps=False, page_budget=2)
+
+        # The committed high-water mark must NOT have jumped to 800: the span
+        # 301..600 has not been walked yet, and promoting it strands them.
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["max_id_seen"] == 300
+        history_state = get_state(st, "history", "5")
+        assert history_state is not None
+        assert history_state["offset_id"] == 601
+
+
+@pytest.mark.asyncio
+async def test_incremental_catch_up_across_budget_stops_loses_no_messages(tmp_path):
+    gw = FakeGateway({"history": [_m(i) for i in range(300, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+
+        gw2 = FakeGateway({"history": [_m(i) for i in range(800, 0, -1)], "get_messages": {}})
+        for _ in range(20):
+            try:
+                await HistoryCollector().collect(_ctx(st, gw2), probe_gaps=False, page_budget=2)
+            except PhaseStop:
+                continue
+            break
+
+        stored = {r["msg_id"] for r in st.conn.execute("select msg_id from messages")}
+        missing = sorted(set(range(1, 801)) - stored)
+        assert not missing, f"{len(missing)} ids never fetched, e.g. {missing[:10]}"
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["max_id_seen"] == 800
+
+
+@pytest.mark.asyncio
+async def test_incremental_catch_up_stops_at_the_high_water_mark(tmp_path):
+    """The stop condition must FIRE, not merely avoid losing anything.
+
+    Without `if incremental and cursor <= stop_at: break` every catch-up
+    re-sweeps the whole channel and still passes every other assertion here —
+    no id is lost, the counts are right, the state is right. Only the RPC
+    count betrays it: on the live ~35k-message group that is ~351
+    `messages.getHistory` calls per run instead of 1, forever, plus a
+    `raw_records` and `message_metrics` row per message re-observed.
+    """
+    gw = FakeGateway({"history": [_m(i) for i in range(250, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["backfill_complete"] is True
+
+        # Two new messages arrive. Catching up must cost ONE page, not a
+        # re-sweep: the first page reaches id 152 <= max_id_seen 250, so the
+        # loop breaks before even the terminating empty-page call.
+        gw2 = FakeGateway({"history": [_m(i) for i in range(252, 0, -1)], "get_messages": {}})
+        await HistoryCollector().collect(_ctx(st, gw2), probe_gaps=False)
+        assert gw2.calls.count("iter_history") == 1
+        assert {r["msg_id"] for r in st.conn.execute("select msg_id from messages")} == set(
+            range(1, 253)
+        )
+
+
+# --- a budget-stopped phase must report what it collected ------------------
+
+
+@pytest.mark.asyncio
+async def test_page_budget_phase_stop_carries_the_counts_collected_so_far(tmp_path):
+    """A budget stop is the ROUTINE outcome on a large target, not an error.
+
+    The phase stored a full page before stopping; if `PhaseStop` cannot carry
+    that, the operator sees an empty result for a run that did real work and
+    `run_events` records nothing to reason from.
+    """
+    gw = FakeGateway({"history": [_m(i) for i in range(250, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        with pytest.raises(PhaseStop) as excinfo:
+            await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False, page_budget=1)
+        assert excinfo.value.counts["messages"] == 100
+        assert st.conn.execute("select count(*) c from messages").fetchone()["c"] == 100

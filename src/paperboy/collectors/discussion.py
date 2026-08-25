@@ -1,0 +1,266 @@
+"""The `discussion` collector: the linked group's comments, and the people in them.
+
+For a broadcast channel a non-admin account can enumerate nothing about
+subscribers — not the member list, not even the admin list
+(`docs/research/sources/mtproto-participants-users.md` §1.3, sourced to TDLib).
+The linked discussion group is therefore *the* person vector, and reading it
+never requires joining unless the group sets `join_to_send`.
+
+The subtle part is mapping a comment back to the post it hangs off.
+`reply_to_top_id` is **not** the channel post id: it is the id of the group's
+auto-forwarded mirror of that post. The mirror carries the real post id in
+`fwd_from.channel_post`, so the chain is
+
+    comment.reply_to_top_id -> mirror.id -> mirror.fwd_from.channel_post -> post
+
+and a forwarded message only counts as a mirror if its origin is *our* channel —
+members forward third-party posts into groups all the time, and treating one of
+those as a mirror silently attributes comments to the wrong post. A comment that
+does not resolve is stored and counted, never guessed at.
+"""
+
+from __future__ import annotations
+
+import json
+
+from paperboy.budget import PhaseStop, SkipAndRecord
+from paperboy.collectors.base import CollectContext, CollectResult
+from paperboy.collectors.history import HistoryCollector
+from paperboy.ids import channel_uri, msg_uri, peer_ref_uri, utc_now_iso
+from paperboy.store.edges import add_edge_once
+from paperboy.store.events import record_run_event
+from paperboy.store.repliers import backfill_recent_repliers
+from paperboy.targets import Target
+
+_COMMENTED_ON = "commented_on"
+_REPLIED_TO = "replied_to"
+
+
+class DiscussionCollector:
+    name = "discussion"
+
+    def applies_to(self, target: Target) -> bool:
+        return target.is_channel_like
+
+    async def collect(self, ctx: CollectContext) -> CollectResult:
+        if ctx.channel_id is None:
+            raise PhaseStop(
+                "discussion skipped: channel context not established "
+                "(channel phase did not complete)"
+            )
+        counts = {
+            "messages": 0, "revisions": 0, "tombstones": 0, "edges": 0,
+            "backfilled_peers": 0, "unmapped": 0,
+        }
+
+        # Zero-RPC harvest first. It reads only the store, so it still yields
+        # peers when the group turns out to be absent or unreadable — which is
+        # why it must not sit behind preflight.
+        counts["backfilled_peers"] = backfill_recent_repliers(
+            ctx.store, ctx.channel_id, ctx.tier
+        )
+
+        target = self._linked_group(ctx)
+        if isinstance(target, str):
+            return CollectResult(name=self.name, counts=counts, stopped=target)
+        group_id, input_channel, needs_join = target
+
+        if needs_join:
+            skip = await self._join_or_skip(ctx, group_id, input_channel)
+            if skip is not None:
+                return CollectResult(name=self.name, counts=counts, stopped=skip)
+
+        # Gap-probing is off: on a churn-heavy group of tens of thousands of
+        # messages it is a second pass the size of the sweep, and it yields
+        # only the weak `evidence='gap'` tier.
+        try:
+            sweep_counts = (await HistoryCollector().collect(
+                ctx, channel_id=group_id, input_channel=input_channel,
+                probe_gaps=False, page_budget=ctx.settings.discussion_page_budget,
+            )).counts
+        except PhaseStop as stop:
+            # A budget stop is routine on a large group, not a failure. The
+            # messages that landed are stored, so project their edges and
+            # report the work before re-raising — otherwise every run on a
+            # big target reports nothing and strands the rows it collected.
+            self._merge(counts, stop.counts)
+            self._write_thread_edges(ctx, group_id, counts)
+            raise PhaseStop(*stop.args, counts=counts) from stop
+
+        self._merge(counts, sweep_counts)
+        self._write_thread_edges(ctx, group_id, counts)
+        return CollectResult(name=self.name, counts=counts)
+
+    @staticmethod
+    def _merge(counts: dict[str, int], sweep: dict[str, int]) -> None:
+        for key in ("messages", "revisions", "tombstones", "edges"):
+            counts[key] += sweep.get(key, 0)
+
+    async def _join_or_skip(
+        self, ctx: CollectContext, group_id: int, input_channel: dict
+    ) -> str | None:
+        """Join a `join_to_send` group under `--join`, or return a skip reason.
+
+        Joining is the one WRITE paperboy makes and the single documented
+        exception to read-only (spec §2, issue #20): it happens ONLY under an
+        explicit `--join`, is routed through the budget/guardrail module (so
+        `PEER_FLOOD` is a `HardStop` that ends the run and is deliberately NOT
+        caught here), and is recorded in `run_events` as an active, non-passive
+        act. A refused join (e.g. an approval-gated group -> `INVITE_REQUEST_SENT`)
+        is a clean skip, distinguishable from "join_to_send set, --join not given".
+        """
+        if not ctx.settings.allow_join:
+            return (
+                f"discussion group {group_id}: join_to_send is set; "
+                "re-run with --join to join and read it"
+            )
+        try:
+            await ctx.gateway.join_channel(input_channel)
+        except SkipAndRecord as exc:
+            ctx.log.warning(
+                "discussion: --join join of group %s was refused: %s", group_id, exc
+            )
+            return f"discussion group {group_id}: --join was given but joining failed"
+        record_run_event(
+            ctx.store, ctx.channel_id, self.name, "join",
+            {"group_id": group_id, "method": "channels.joinChannel", "active": True},
+        )
+        ctx.log.warning(
+            "discussion: JOINED group %s via --join — an active, non-passive act", group_id
+        )
+        return None
+
+    def _linked_group(self, ctx: CollectContext) -> tuple[int, dict, bool] | str:
+        """`(group_id, input_channel, needs_join)`, or a `stopped` reason string.
+
+        `needs_join` is True when the group sets `join_to_send` — reading it then
+        requires membership, and `collect` will join under `--join` or skip.
+        Every failure here is a clean skip, never an exception: a channel with no
+        discussion group, or one whose access hash is unknown, is normal.
+
+        The reasons are deliberately lexically disjoint — no reason contains
+        another's distinguishing word — because tests assert on them, and an
+        overlapping pair lets a test pass on the wrong branch.
+        """
+        row = ctx.store.conn.execute(
+            "SELECT linked_chat_id FROM channels WHERE id=?", (ctx.channel_id,)
+        ).fetchone()
+        group_id = row["linked_chat_id"] if row else None
+        if not group_id:
+            # `0` is as meaningful as NULL here and must not be treated as a
+            # channel id — falsy, not `is None`.
+            return "no linked discussion group"
+
+        peer = ctx.store.conn.execute(
+            "SELECT access_hash, flags_json FROM peers WHERE uri=?",
+            (channel_uri(group_id),),
+        ).fetchone()
+        if peer is None or not peer["access_hash"]:
+            # A stored `0` is not a usable hash — it yields CHANNEL_INVALID
+            # against live Telegram, a phase error rather than a clean skip.
+            return f"discussion group {group_id}: no access hash known"
+
+        flags = json.loads(peer["flags_json"]) if peer["flags_json"] else {}
+        # Reading is open to anyone *unless* `join_to_send` is set. Honouring it
+        # is what keeps collection passive; `--join` (issue #20) is the explicit
+        # escape hatch, applied by `_join_or_skip`.
+        needs_join = bool(flags.get("join_to_send"))
+        input_channel = {"channel_id": group_id, "access_hash": peer["access_hash"]}
+        return group_id, input_channel, needs_join
+
+    def _write_thread_edges(
+        self, ctx: CollectContext, group_id: int, counts: dict[str, int]
+    ) -> None:
+        """Emit `commented_on` (person → channel post) and `replied_to`
+        (comment → parent) from the rows the sweep just stored.
+
+        Runs over stored rows rather than the live page stream so that a comment
+        paged in before its mirror — or in an entirely earlier run — still maps.
+        """
+        # `collect()` has already rejected a None channel_id; restating it
+        # here is what carries that guarantee across the method boundary.
+        assert ctx.channel_id is not None
+        channel_id = ctx.channel_id
+        mirrors = self._mirror_map(ctx, group_id)
+        rows = ctx.store.conn.execute(
+            "SELECT uri, msg_id, from_uri, reply_to_msg_id, reply_to_top_id, source_raw_id "
+            "FROM messages WHERE channel_id=? "
+            "AND (reply_to_msg_id IS NOT NULL OR reply_to_top_id IS NOT NULL)",
+            (group_id,),
+        ).fetchall()
+
+        for row in rows:
+            observed_at = utc_now_iso()
+            if row["reply_to_msg_id"]:
+                # Every reply gets this, including a direct reply to a thread
+                # root: `replied_to` is comment → parent, with no restriction to
+                # nested replies.
+                self._add_edge_once(
+                    ctx, row["uri"], _REPLIED_TO, msg_uri(group_id, row["reply_to_msg_id"]),
+                    observed_at, row["source_raw_id"], {"source": "discussion"}, counts,
+                )
+
+            top_id = row["reply_to_top_id"]
+            if top_id is None:
+                # Ordinary in-group chatter replying to another message. It was
+                # never a comment-thread post, so it is not a mapping candidate
+                # and must not inflate `unmapped` — on a real group these
+                # dominate, and counting them would bury the signal.
+                continue
+
+            post_id = mirrors.get(top_id)
+            if post_id is None or not row["from_uri"]:
+                # No mirror for this thread root, or no attributable author.
+                # `from_uri` is also NULL for a comment the collecting account
+                # authored (deliberately unattributed, #12), so `unmapped`
+                # includes those — correctly: no commented_on edge is emitted
+                # for them either. Counted once, never attributed to a guess.
+                counts["unmapped"] += 1
+                continue
+
+            self._add_edge_once(
+                ctx, row["from_uri"], _COMMENTED_ON, msg_uri(channel_id, post_id),
+                observed_at, row["source_raw_id"], {"comment_uri": row["uri"]}, counts,
+            )
+
+    def _mirror_map(self, ctx: CollectContext, group_id: int) -> dict[int, int]:
+        """`group_msg_id -> channel_post_id` for the group's auto-forwarded
+        copies of our channel's posts.
+
+        Rebuilt from stored rows on every run, so it survives resumption. The
+        origin check is what makes it a *mirror* rather than any old forward.
+        """
+        rows = ctx.store.conn.execute(
+            "SELECT msg_id, fwd_json FROM messages "
+            "WHERE channel_id=? AND fwd_json IS NOT NULL",
+            (group_id,),
+        ).fetchall()
+        ours = channel_uri(ctx.channel_id) if ctx.channel_id is not None else None
+        mirrors: dict[int, int] = {}
+        for row in rows:
+            fwd = json.loads(row["fwd_json"])
+            post = fwd.get("channel_post")
+            if post is not None and peer_ref_uri(fwd.get("from_id")) == ours:
+                mirrors[row["msg_id"]] = post
+        return mirrors
+
+    def _add_edge_once(
+        self,
+        ctx: CollectContext,
+        subject: str,
+        predicate: str,
+        object_: str,
+        observed_at: str,
+        source_raw_id: int | None,
+        evidence: dict | None,
+        counts: dict[str, int],
+    ) -> None:
+        """Emit a structural edge idempotently — these predicates ("X commented
+        on Y") are set-like facts, and this method re-scans every stored group
+        row on every run. Delegates to the shared `add_edge_once` chokepoint
+        (issues #14, #19); `add_edge` itself stays append-only for
+        `channel`/`history` (ADR-0002).
+        """
+        if add_edge_once(ctx.store, subject, predicate, object_, observed_at, ctx.tier,
+                         source_raw_id, evidence):
+            counts["edges"] += 1

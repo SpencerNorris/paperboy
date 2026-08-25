@@ -34,6 +34,19 @@ _WAYBACK_CDX_LIMIT = 10000  # cap the CDX response (durov has ~775k captures = 1
 _DEFAULT_MIN_INTERVAL_SECONDS = 1.0
 
 
+def _is_ambiguous_failure(status_code: int) -> bool:
+    """True when a response tells us nothing about whether content exists.
+
+    `200` is an answer. `404` is also an answer — the page genuinely is not
+    there, so zero results is the truth. Everything else (429 throttling, 5xx,
+    a proxy error page) means *we could not find out*, and reporting it as zero
+    is how a rate-limited request becomes a confident "no snapshots exist".
+    That is exactly what happened on 2026-08-21: archive.org returned 429, the
+    unchecked body failed to parse, and the run recorded `wayback_rows: 0`.
+    """
+    return status_code not in (200, 404)
+
+
 def _text_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -118,8 +131,10 @@ class WebCollector:
         client = self._get_client(ctx)
         channel_id = _resolve_channel_id(ctx, username)
 
+        # The two vectors are independent; neither failing may discard what
+        # the other already collected.
         counts = self._collect_tme(ctx, client, username, channel_id)
-        counts["wayback_rows"] = self._collect_wayback(ctx, client, username)
+        counts.update(self._collect_wayback(ctx, client, username))
 
         return CollectResult(name=self.name, counts=counts)
 
@@ -149,6 +164,18 @@ class WebCollector:
                 ctx.tier,
                 {"channel_username": username},
             )
+
+            if _is_ambiguous_failure(response.status_code):
+                # Same trap as the CDX path: `parse_tme_page` on an error body
+                # yields no posts, the loop breaks, and the phase reports zero —
+                # indistinguishable from a channel with no public page. Keep
+                # whatever earlier pages returned and flag the failure.
+                ctx.log.warning(
+                    "web: t.me/s/%s returned HTTP %s — reporting failure, not zero",
+                    username, response.status_code,
+                )
+                counts["tme_failed"] = response.status_code
+                break
 
             posts = parse_tme_page(response.text)
             if not posts:
@@ -209,7 +236,9 @@ class WebCollector:
         if tombstoned:
             counts["deleted_recovered"] += 1
 
-    def _collect_wayback(self, ctx: CollectContext, client: WebClient, username: str) -> int:
+    def _collect_wayback(
+        self, ctx: CollectContext, client: WebClient, username: str
+    ) -> dict[str, int]:
         # Bound the query: an unbounded `url=t.me/s/<name>*` CDX search on a
         # heavily-archived channel returns hundreds of thousands of rows (a
         # 100+ MB response that arrives truncated and fails to parse). Cap it,
@@ -228,11 +257,64 @@ class WebCollector:
             {"channel_username": username},
         )
 
+        if _is_ambiguous_failure(response.status_code):
+            # Report the failure instead of an empty index. The raw response is
+            # already in `raw_records` above, so the status is recoverable, but
+            # the operator needs to see it in the run summary — otherwise a
+            # throttled archive query reads as a settled negative finding.
+            ctx.log.warning(
+                "web: wayback CDX returned HTTP %s for %s — reporting failure, not zero",
+                response.status_code, username,
+            )
+            return {"wayback_failed": response.status_code}
+
+        # The CDX endpoint signals a genuinely empty index with an EMPTY body
+        # (not "[]"), so an empty/whitespace 200 is a true zero, not a failure.
+        # `lstrip` the BOM first: U+FEFF is not str.strip() whitespace, so a
+        # BOM-only body would otherwise be misread as an unparseable failure.
+        if response.text.lstrip("﻿").strip() == "":
+            return {"wayback_rows": 0}
+
+        # A NON-empty body that is not a CDX index is a failed collection
+        # attempt, not an empty index (issue #24) — reporting it as zero is the
+        # same false negative the status check above prevents. Two shapes reach
+        # here: a body that won't parse as JSON at all (an oversized response
+        # arriving truncated), and one that parses but is not the expected
+        # array (a proxy/gateway error doc like {"error": ...}). Both are
+        # failures; the raw body is already in `raw_records`, so each stays
+        # diagnosable. The status is interpolated because 404 also lands here
+        # (404 is not an *ambiguous* status, so it is not short-circuited above).
         try:
             payload = response.json()
         except ValueError:
-            payload = []
-        rows = parse_cdx_rows(payload) if isinstance(payload, list) else []
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP %s with an unparseable body "
+                "(%d bytes) — reporting failure, not zero",
+                username, response.status_code, len(response.text),
+            )
+            return {"wayback_failed": response.status_code}
+        if not isinstance(payload, list):
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP %s with a non-index JSON body "
+                "(%s) — reporting failure, not zero",
+                username, response.status_code, type(payload).__name__,
+            )
+            return {"wayback_failed": response.status_code}
+        # A CDX index is a list of equal-length rows (each itself a list). A
+        # non-empty list whose elements are NOT all lists — a list-wrapped error
+        # envelope like [{"error": ...}], or a list of strings — is not an index,
+        # and reading it as an empty result is the same false zero one guard up
+        # (issue #24). An empty list stays a genuine zero; an all-lists body is
+        # index-shaped and handed to parse_cdx_rows, which itself tolerates a
+        # header-only list (zero rows) and best-effort-skips malformed rows.
+        if payload and not all(isinstance(row, list) for row in payload):
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP %s with a JSON list that is not "
+                "a CDX index — reporting failure, not zero",
+                username, response.status_code,
+            )
+            return {"wayback_failed": response.status_code}
+        rows = parse_cdx_rows(payload)
 
         n = 0
         for row in rows:
@@ -252,4 +334,4 @@ class WebCollector:
                 },
             )
             n += 1
-        return n
+        return {"wayback_rows": n}

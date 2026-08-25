@@ -33,7 +33,7 @@ from paperboy.ids import (
     utc_now_iso,
     utf16_slice,
 )
-from paperboy.store.edges import add_edge
+from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
 from paperboy.targets import Target
 
@@ -41,6 +41,7 @@ from paperboy.targets import Target
 _RECOMMENDED = "recommended_with"
 _MENTIONS = "mentions"
 _INVITED_VIA = "invited_via"
+_MEMBER_OF = "member_of"
 
 _RESOLVED_INVITE_KINDS = {"chatinvitealready", "chatinvitepeek"}
 
@@ -101,12 +102,14 @@ class GraphCollector:
             peer_uri = upsert_peer(
                 ctx.store, chat, raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
             )
+            if peer_uri is None:  # self, kept out of the store (#12)
+                continue
             counts["peers"] += 1
-            add_edge(
+            if add_edge_once(
                 ctx.store, subject, _RECOMMENDED, peer_uri, observed_at, ctx.tier, raw_id,
                 {"total_count": true_count},
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
     def _write_mention_edges(
         self,
@@ -116,11 +119,11 @@ class GraphCollector:
     ) -> None:
         observed_at = utc_now_iso()
         for subject, object_, evidence, source_raw_id in mention_edges:
-            add_edge(
+            if add_edge_once(
                 ctx.store, subject, _MENTIONS, object_, observed_at, ctx.tier, source_raw_id,
                 evidence,
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
     async def _collect_invite_previews(
         self, ctx: CollectContext, invite_hashes: dict[str, list[str]], counts: dict
@@ -147,6 +150,11 @@ class GraphCollector:
                 object_uri = upsert_peer(
                     ctx.store, chat, raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
                 )
+                if object_uri is None:
+                    # The resolved invite chat is the collecting account — not
+                    # possible for a real channel/chat (self is a user), but
+                    # keep the run out of its own graph regardless (#12).
+                    continue
                 counts["peers"] += 1
                 evidence = {"resolved": True, "chat_id": chat.get("id")}
             else:
@@ -161,12 +169,36 @@ class GraphCollector:
                     "has_photo": preview.get("photo") is not None,
                 }
 
+            # `chatInvite.participants` is a *sample* of the members — the only
+            # roster data Telegram hands an account that has not joined (see
+            # docs/research/sources/mtproto-participants-users.md). It rotates
+            # between calls, so projecting it on every run accumulates real
+            # membership over time while collection stays passive. An unjoined
+            # invite exposes no numeric chat id, so the ChatInvite raw record —
+            # whose context carries the hash — is the only provenance there is.
+            for participant in preview.get("participants") or []:
+                peer_uri = upsert_peer(
+                    ctx.store, participant, raw_id, observed_at,
+                    seen_in_chat=None, seen_in_msg=None,
+                )
+                if peer_uri is None:  # self, kept out of the store (#12)
+                    continue
+                counts["peers"] += 1
+                if add_edge_once(
+                    ctx.store, peer_uri, _MEMBER_OF, object_uri, observed_at, ctx.tier, raw_id,
+                    # `sampled` marks these as a handful out of
+                    # `participants_count`, so no reader mistakes the rows
+                    # present for the whole membership.
+                    {"sampled": True, "participants_count": preview.get("participants_count")},
+                ):
+                    counts["edges"] += 1
+
             for m_uri in msg_uris:
-                add_edge(
+                if add_edge_once(
                     ctx.store, m_uri, _INVITED_VIA, object_uri, observed_at, ctx.tier, raw_id,
                     evidence,
-                )
-                counts["edges"] += 1
+                ):
+                    counts["edges"] += 1
 
     async def _collect_sponsored(self, ctx: CollectContext, counts: dict) -> None:
         assert ctx.input_channel is not None and ctx.channel_id is not None
@@ -200,7 +232,7 @@ class GraphCollector:
                 continue
             link_kind, value = parsed
             object_uri = invite_uri(value) if link_kind == "invite" else username_uri(value)
-            add_edge(
+            if add_edge_once(
                 ctx.store, subject, _MENTIONS, object_uri, observed_at, ctx.tier, raw_id,
                 {
                     "source": "sponsored",
@@ -208,8 +240,8 @@ class GraphCollector:
                     "sponsor_info": sponsored.get("sponsor_info"),
                     "title": sponsored.get("title"),
                 },
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
 
 def _scan_message_entities(

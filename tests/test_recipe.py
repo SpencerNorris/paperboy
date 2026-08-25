@@ -76,7 +76,7 @@ async def test_collect_channel_media_flag_opts_in(tmp_path):
             phases=None, log=logging.getLogger("t"), media=True, profile="mediarecipe",
         )
         # graph is in the default set now (opt-in media appends after it)
-        assert [r.name for r in results] == ["channel", "history", "graph", "media"]
+        assert [r.name for r in results] == ["channel", "history", "discussion", "graph", "media"]
         media_result = next(r for r in results if r.name == "media")
         assert media_result.counts["downloaded"] == 1
         assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1
@@ -113,11 +113,25 @@ def test_default_collectors_web_is_opt_in():
     # not in the default set. Running it end to end needs a mocked WebClient
     # (see tests/test_collector_web.py), not a real network call.
     assert [c.name for c in _default_collectors(include_media=False, include_web=False)] == [
-        "channel", "history", "graph",
+        "channel", "history", "discussion", "graph",
     ]
     assert [c.name for c in _default_collectors(include_media=False, include_web=True)] == [
-        "channel", "history", "graph", "web",
+        "channel", "history", "discussion", "graph", "web",
     ]
+
+
+def test_discussion_runs_by_default_immediately_after_history():
+    """Design spec §10: `channel -> history -> discussion -> participants ->
+    profiles -> media -> graph -> web`. Nothing previously pinned
+    `discussion`'s position in `_default_collectors` — a registration
+    anywhere else in the list (e.g. after `graph`, or before `history`)
+    would still pass every other test, including
+    `tests/test_integration_discussion.py`, which bypasses
+    `_default_collectors` entirely via an explicit `collectors=` override.
+    Expected to fail with `ValueError` (`"discussion"` not yet in the list)
+    until plan Task 4 registers `DiscussionCollector`."""
+    names = [c.name for c in _default_collectors(include_media=False, include_web=False)]
+    assert names.index("discussion") == names.index("history") + 1
 
 
 class _StubCollector:
@@ -150,6 +164,46 @@ async def test_hard_stop_aborts_remaining_phases(tmp_path):
         assert results[-1].stopped == "hard_stop"
         events = st.conn.execute("select kind from run_events order by id").fetchall()
         assert [e["kind"] for e in events] == ["complete", "hard_stop"]
+
+
+def _diff_page(pts, *, final, mid):
+    return {
+        "_": "updates.channelDifference", "final": final, "pts": pts,
+        "new_messages": [
+            {"_": "message", "id": mid, "message": f"c{mid}", "date": 1767322445,
+             "peer_id": {"channel_id": 5}}
+        ],
+        "other_updates": [], "chats": [], "users": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_history_phase_stop_reports_backfill_plus_catchup_counts(tmp_path):
+    # A catch-up budget stop must not erase the backfill that already completed:
+    # _run_one folds the backfill counts into catch_up's PhaseStop, so the
+    # history phase reports every message it stored (2a40754), not just the
+    # catch-up's partial page.
+    fx = _fixtures()
+    fx["channel_difference"] = [
+        _diff_page(50, final=False, mid=10),
+        _diff_page(60, final=True, mid=11),
+    ]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {"catchup_page_budget": 1}),
+            parse_target("@durov"), phases=["channel", "history"],
+            log=logging.getLogger("t"),
+        )
+        history = next(r for r in results if r.name == "history")
+        assert history.stopped == "phase_stop"
+        # 2 backfilled (fixture history) + 1 catch-up page applied before the stop
+        assert history.counts["messages"] == 3
+        assert st.conn.execute("select count(*) as n from messages").fetchone()["n"] == 3
+        event = st.conn.execute(
+            "select detail_json from run_events where phase='history' and kind='phase_stop'"
+        ).fetchone()
+        assert event is not None and '"messages": 3' in event["detail_json"]
 
 
 @pytest.mark.asyncio
