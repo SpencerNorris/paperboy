@@ -364,7 +364,9 @@ async def test_incremental_catch_up_stops_at_the_high_water_mark(tmp_path):
     gw = FakeGateway({"history": [_m(i) for i in range(250, 0, -1)], "get_messages": {}})
     with Store.open(tmp_path / "p.sqlite") as st:
         await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False)
-        assert get_state(st, "history_sweep", "5")["backfill_complete"] is True
+        sweep = get_state(st, "history_sweep", "5")
+        assert sweep is not None
+        assert sweep["backfill_complete"] is True
 
         # Two new messages arrive. Catching up must cost ONE page, not a
         # re-sweep: the first page reaches id 152 <= max_id_seen 250, so the

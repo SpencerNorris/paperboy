@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     flood_sleep_threshold: int = 60
     max_rpc_per_run: int = 20000
     profile_budget: int = 2000
+    discussion_page_budget: int = 500
     allow_join: bool = False
     allow_phone_lookup: bool = False
 
