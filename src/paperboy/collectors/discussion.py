@@ -27,7 +27,7 @@ from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.history import HistoryCollector
 from paperboy.ids import channel_uri, msg_uri, peer_ref_uri, utc_now_iso
-from paperboy.store.edges import add_edge
+from paperboy.store.edges import add_edge_once
 from paperboy.store.repliers import backfill_recent_repliers
 from paperboy.targets import Target
 
@@ -215,22 +215,12 @@ class DiscussionCollector:
         evidence: dict | None,
         counts: dict[str, int],
     ) -> None:
-        """`add_edge`, skipped when the identical triple is already stored.
-
-        These two predicates are structural facts — "X commented on Y" — not
-        observations that vary over time like `message_metrics`. This method
-        re-scans every stored group row on every run, so an unguarded insert
-        would append a fresh row with a new `observed_at` and the previous run's
-        `source_raw_id` for evidence this run never gathered. The guard lives
-        here rather than in `add_edge` because `channel`, `history` and `graph`
-        all still depend on that function's append-only semantics.
+        """Emit a structural edge idempotently — these predicates ("X commented
+        on Y") are set-like facts, and this method re-scans every stored group
+        row on every run. Delegates to the shared `add_edge_once` chokepoint
+        (issues #14, #19); `add_edge` itself stays append-only for
+        `channel`/`history` (ADR-0002).
         """
-        exists = ctx.store.conn.execute(
-            "SELECT 1 FROM edges WHERE subject_uri=? AND predicate=? AND object_uri=? LIMIT 1",
-            (subject, predicate, object_),
-        ).fetchone()
-        if exists is not None:
-            return
-        if add_edge(ctx.store, subject, predicate, object_, observed_at, ctx.tier,
-                    source_raw_id, evidence):
+        if add_edge_once(ctx.store, subject, predicate, object_, observed_at, ctx.tier,
+                         source_raw_id, evidence):
             counts["edges"] += 1

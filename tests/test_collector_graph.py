@@ -82,6 +82,26 @@ async def test_recommendations_produce_edges_peers_and_true_count(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_graph_edges_are_idempotent_across_reruns(tmp_path):
+    # Re-running graph must not re-insert the same structural edges — the raw
+    # `edges` rows would otherwise stop meaning "how connected is this entity"
+    # (issue #14). A second run re-observes the same relationships and writes
+    # none of them again, and reports 0 new edges.
+    fx = _base_fixtures()
+    fx["channel_recommendations"] = _load("recommendations.json")
+    with Store.open(tmp_path / "p.sqlite") as st:
+        gw = FakeGateway(fx)
+        await GraphCollector().collect(_ctx(st, gw))
+        first = st.conn.execute("select count(*) as n from edges").fetchone()["n"]
+        assert first >= 2
+
+        res2 = await GraphCollector().collect(_ctx(st, FakeGateway(fx)))
+        second = st.conn.execute("select count(*) as n from edges").fetchone()["n"]
+        assert second == first, "a re-run must not duplicate edges"
+        assert res2.counts["edges"] == 0, "the re-run reports no new edges"
+
+
+@pytest.mark.asyncio
 async def test_recommendations_chat_not_modified_is_skipped_without_crashing(tmp_path):
     fx = _base_fixtures()
     fx["channel_recommendations"] = SkipAndRecord("CHAT_NOT_MODIFIED")
