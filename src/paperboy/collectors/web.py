@@ -270,25 +270,37 @@ class WebCollector:
 
         # The CDX endpoint signals a genuinely empty index with an EMPTY body
         # (not "[]"), so an empty/whitespace 200 is a true zero, not a failure.
-        if response.text.strip() == "":
+        # `lstrip` the BOM first: U+FEFF is not str.strip() whitespace, so a
+        # BOM-only body would otherwise be misread as an unparseable failure.
+        if response.text.lstrip("﻿").strip() == "":
             return {"wayback_rows": 0}
 
-        # But a NON-empty 200 body that won't parse as JSON is a failed
-        # collection attempt, not an empty index (issue #24): an oversized CDX
-        # response arriving truncated lands here, and swallowing it to `[]`
-        # reports the same false zero the status check above was added to
-        # prevent. The raw body is already in `raw_records`, so it stays
-        # diagnosable.
+        # A NON-empty body that is not a CDX index is a failed collection
+        # attempt, not an empty index (issue #24) — reporting it as zero is the
+        # same false negative the status check above prevents. Two shapes reach
+        # here: a body that won't parse as JSON at all (an oversized response
+        # arriving truncated), and one that parses but is not the expected
+        # array (a proxy/gateway error doc like {"error": ...}). Both are
+        # failures; the raw body is already in `raw_records`, so each stays
+        # diagnosable. The status is interpolated because 404 also lands here
+        # (404 is not an *ambiguous* status, so it is not short-circuited above).
         try:
             payload = response.json()
         except ValueError:
             ctx.log.warning(
-                "web: wayback CDX for %s returned HTTP 200 with an unparseable body "
+                "web: wayback CDX for %s returned HTTP %s with an unparseable body "
                 "(%d bytes) — reporting failure, not zero",
-                username, len(response.text),
+                username, response.status_code, len(response.text),
             )
             return {"wayback_failed": response.status_code}
-        rows = parse_cdx_rows(payload) if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP %s with a non-index JSON body "
+                "(%s) — reporting failure, not zero",
+                username, response.status_code, type(payload).__name__,
+            )
+            return {"wayback_failed": response.status_code}
+        rows = parse_cdx_rows(payload)
 
         n = 0
         for row in rows:
