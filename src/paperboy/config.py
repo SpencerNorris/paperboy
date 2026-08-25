@@ -54,7 +54,9 @@ class Settings(BaseSettings):
     # updates) so a huge backlog stops politely and resumes next run, rather than
     # holding the connection open indefinitely. The pts-advance guard, not this,
     # is what prevents an infinite loop; this is the politeness/size bound.
-    catchup_page_budget: int = 1000
+    # `ge=1`: the budget is checked only after a page is fetched and applied, so
+    # a value <1 would still pull one page — it never means "no catch-up".
+    catchup_page_budget: int = Field(default=1000, ge=1)
     allow_join: bool = False
     allow_phone_lookup: bool = False
 

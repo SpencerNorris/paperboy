@@ -248,10 +248,11 @@ class HistoryCollector:
         A `channelDifferenceTooLong` projects the recovery messages it carries,
         re-seeds `pts` from the payload's `dialog` (only when the dialog
         actually carries an int — issue #22), and returns `stopped="resynced"`
-        — a full gap probe is then the caller's job. The loop stops early on a
-        non-final page that fails to advance `pts` (a misbehaving server, not a
-        backlog) and raises `PhaseStop` — carrying the counts applied so far —
-        when `catchup_page_budget` pages have been pulled in one run.
+        — a full gap probe is then the caller's job. The loop stops early with
+        `stopped="stalled"` on a non-final page that fails to advance `pts` (a
+        misbehaving server, not a backlog) — marked so it is not read as a clean
+        finish — and raises `PhaseStop`, carrying the counts applied so far, when
+        `catchup_page_budget` pages have been pulled in one run.
         """
         if ctx.input_channel is None or ctx.channel_id is None:
             raise PhaseStop(
@@ -275,9 +276,17 @@ class HistoryCollector:
         # lands, so an interruption resumes from the last stored cursor.
         pages = 0
         while True:
-            diff = await ctx.gateway.get_channel_difference(
-                ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
-            )
+            try:
+                diff = await ctx.gateway.get_channel_difference(
+                    ctx.input_channel, pts, _CHANNEL_DIFFERENCE_LIMIT
+                )
+            except PhaseStop as exc:
+                # A flood raised by Budget.call on a later page carries no counts
+                # of its own; attach the pages already applied and persisted so
+                # they are still reported (2a40754), then let it propagate.
+                if not exc.counts:
+                    raise PhaseStop(str(exc), counts=counts) from exc
+                raise
             ctx.store.add_raw(
                 diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id}
             )
@@ -326,13 +335,16 @@ class HistoryCollector:
             # A non-final page that does not advance pts would loop forever — a
             # misbehaving server, not a real backlog. Stop rather than spin; the
             # pts-advance guard, not the budget below, is the loop's real bound.
+            # Mark it `stalled` (like `resynced`): the backlog was NOT drained,
+            # so this must not read as a clean finish — the very defect issue #25
+            # exists to eliminate — for the run summary or a future watch loop.
             if new_pts <= pts:
                 ctx.log.warning(
                     "history: getChannelDifference for %s returned a non-final page "
                     "without advancing pts (%s -> %s); stopping catch-up",
                     channel_id, pts, new_pts,
                 )
-                return CollectResult(name=self.name, counts=counts)
+                return CollectResult(name=self.name, counts=counts, stopped="stalled")
 
             set_state(ctx.store, "channel", str(channel_id), {"pts": new_pts})
             pts = new_pts

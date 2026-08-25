@@ -84,7 +84,17 @@ async def _run_one(collector: Collector, ctx: CollectContext) -> CollectResult:
     """
     result = await collector.collect(ctx)
     if isinstance(collector, HistoryCollector):
-        catchup_result = await collector.catch_up(ctx)
+        try:
+            catchup_result = await collector.catch_up(ctx)
+        except PhaseStop as exc:
+            # catch_up now loops (issue #25), so it can PhaseStop mid-work — its
+            # page budget, or a flood on a later page. The backfill above already
+            # completed; its counts must still reach the phase report, or a
+            # history phase that stored hundreds of messages reads as near-empty
+            # (2a40754, and PhaseStop's own contract). Fold them into the stop.
+            raise PhaseStop(
+                str(exc), counts=_merge_counts(result.counts, exc.counts)
+            ) from exc
         result = CollectResult(
             name=result.name,
             counts=_merge_counts(result.counts, catchup_result.counts),

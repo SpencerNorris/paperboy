@@ -222,14 +222,32 @@ async def test_catchup_empty_difference_ends_immediately(tmp_path):
 @pytest.mark.asyncio
 async def test_catchup_stops_if_pts_does_not_advance(tmp_path):
     # A server that returns final=False but never advances pts must not spin
-    # forever — stop with a warning instead.
+    # forever — stop, and mark the stop so it is NOT read as a clean finish
+    # (the exact defect class issue #25 exists to eliminate).
     stuck = _page(50, final=False, messages=[_msg(10, "stuck")])
     gw = FakeGateway({"channel_difference": stuck})  # bare dict → same page every call
     with Store.open(tmp_path / "p.sqlite") as st:
         set_state(st, "channel", "5", {"pts": 50})  # equal to the page's pts → no progress
         res = await HistoryCollector().catch_up(_ctx(st, gw))
         assert gw.calls.count("get_channel_difference") == 1
-        assert res.stopped is None
+        assert res.stopped == "stalled"
+
+
+@pytest.mark.asyncio
+async def test_catchup_flood_midloop_preserves_the_pages_already_applied(tmp_path):
+    # A flood (PhaseStop from Budget.call) on a later page must not erase the
+    # counts of the pages catch_up already applied and persisted (2a40754).
+    pages = [
+        _page(50, final=False, messages=[_msg(10, "applied before the flood")]),
+        PhaseStop("flood on page 2"),
+    ]
+    gw = FakeGateway({"channel_difference": pages})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "channel", "5", {"pts": 40})
+        with pytest.raises(PhaseStop) as ei:
+            await HistoryCollector().catch_up(_ctx(st, gw))
+        assert ei.value.counts["messages"] == 1  # the page applied before the flood
+        assert get_state(st, "channel", "5") == {"pts": 50}  # its pts persisted too
 
 
 @pytest.mark.asyncio

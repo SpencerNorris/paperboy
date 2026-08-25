@@ -166,6 +166,46 @@ async def test_hard_stop_aborts_remaining_phases(tmp_path):
         assert [e["kind"] for e in events] == ["complete", "hard_stop"]
 
 
+def _diff_page(pts, *, final, mid):
+    return {
+        "_": "updates.channelDifference", "final": final, "pts": pts,
+        "new_messages": [
+            {"_": "message", "id": mid, "message": f"c{mid}", "date": 1767322445,
+             "peer_id": {"channel_id": 5}}
+        ],
+        "other_updates": [], "chats": [], "users": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_history_phase_stop_reports_backfill_plus_catchup_counts(tmp_path):
+    # A catch-up budget stop must not erase the backfill that already completed:
+    # _run_one folds the backfill counts into catch_up's PhaseStop, so the
+    # history phase reports every message it stored (2a40754), not just the
+    # catch-up's partial page.
+    fx = _fixtures()
+    fx["channel_difference"] = [
+        _diff_page(50, final=False, mid=10),
+        _diff_page(60, final=True, mid=11),
+    ]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {"catchup_page_budget": 1}),
+            parse_target("@durov"), phases=["channel", "history"],
+            log=logging.getLogger("t"),
+        )
+        history = next(r for r in results if r.name == "history")
+        assert history.stopped == "phase_stop"
+        # 2 backfilled (fixture history) + 1 catch-up page applied before the stop
+        assert history.counts["messages"] == 3
+        assert st.conn.execute("select count(*) as n from messages").fetchone()["n"] == 3
+        event = st.conn.execute(
+            "select detail_json from run_events where phase='history' and kind='phase_stop'"
+        ).fetchone()
+        assert event is not None and '"messages": 3' in event["detail_json"]
+
+
 @pytest.mark.asyncio
 async def test_phase_stop_continues_to_next_phase(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
