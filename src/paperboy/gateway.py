@@ -165,10 +165,13 @@ class FakeGateway:
         # A list models a multi-page catch-up (getChannelDifference is called
         # until the server sets `final`); the pages are consumed in order and
         # the last repeats if the collector over-reads. A bare dict is the
-        # single-page case and is returned on every call, as before.
-        if isinstance(fx, list):
-            return fx[min(idx, len(fx) - 1)]
-        return fx
+        # single-page case and is returned on every call, as before. A page that
+        # is a BaseException is raised, modelling a flood (PhaseStop) mid-loop —
+        # the same exception-fixture convention as download_media/check_chat_invite.
+        page = fx[min(idx, len(fx) - 1)] if isinstance(fx, list) else fx
+        if isinstance(page, BaseException):
+            raise page
+        return page
 
     async def get_authorizations(self) -> dict:
         self.calls.append("get_authorizations")
