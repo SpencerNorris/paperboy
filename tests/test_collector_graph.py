@@ -82,6 +82,26 @@ async def test_recommendations_produce_edges_peers_and_true_count(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_graph_edges_are_idempotent_across_reruns(tmp_path):
+    # Re-running graph must not re-insert the same structural edges — the raw
+    # `edges` rows would otherwise stop meaning "how connected is this entity"
+    # (issue #14). A second run re-observes the same relationships and writes
+    # none of them again, and reports 0 new edges.
+    fx = _base_fixtures()
+    fx["channel_recommendations"] = _load("recommendations.json")
+    with Store.open(tmp_path / "p.sqlite") as st:
+        gw = FakeGateway(fx)
+        await GraphCollector().collect(_ctx(st, gw))
+        first = st.conn.execute("select count(*) as n from edges").fetchone()["n"]
+        assert first >= 2
+
+        res2 = await GraphCollector().collect(_ctx(st, FakeGateway(fx)))
+        second = st.conn.execute("select count(*) as n from edges").fetchone()["n"]
+        assert second == first, "a re-run must not duplicate edges"
+        assert res2.counts["edges"] == 0, "the re-run reports no new edges"
+
+
+@pytest.mark.asyncio
 async def test_recommendations_chat_not_modified_is_skipped_without_crashing(tmp_path):
     fx = _base_fixtures()
     fx["channel_recommendations"] = SkipAndRecord("CHAT_NOT_MODIFIED")
@@ -264,3 +284,152 @@ async def test_sponsored_messages_admin_only_error_is_skipped_without_crashing(t
         res = await GraphCollector().collect(_ctx(st, FakeGateway(fx)))
         assert res.counts["skipped"] >= 1
         assert res.counts["edges"] == 0
+
+
+# --- invite-preview participant sample -------------------------------------
+#
+# `messages.checkChatInvite` returns a *sample* of members alongside the title
+# and count — the only roster data Telegram will hand an account that has not
+# joined (see docs/research/sources/mtproto-participants-users.md: "Member
+# sample from an invite link, without joining ... access: anyone with the
+# t.me/+hash"). The sample rotates between calls, so projecting it on every run
+# accumulates real membership over time without ever joining.
+
+
+def _invite_fx(hash_: str = "AbCdEf123", fixture: str = "chat_invite_with_participants.json"):
+    fx = _base_fixtures()
+    fx["chat_invite"] = {hash_: _load(fixture)}
+    return fx
+
+
+def _seed_invite_message(st: Store, hash_: str = "AbCdEf123") -> None:
+    _seed_message(
+        st, 5, 14, "join us",
+        [{
+            "_": "MessageEntityTextUrl", "offset": 0, "length": 7,
+            "url": f"https://t.me/+{hash_}",
+        }],
+    )
+
+
+@pytest.mark.asyncio
+async def test_invite_preview_participants_are_projected_into_peers(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+
+        rows = {
+            r["uri"]: r
+            for r in st.conn.execute(
+                "select uri, kind, id, first_name, last_name, username, flags_json from peers"
+            )
+        }
+        assert "tg:user:6674021615" in rows
+        assert "tg:user:7931433362" in rows
+        assert "tg:user:5631259670" in rows
+
+        eck = rows["tg:user:6674021615"]
+        assert eck["kind"] == "user"
+        assert eck["first_name"] == "EckArt"
+
+        rockwell = rows["tg:user:7931433362"]
+        assert rockwell["last_name"] == "Rockwell"
+        assert json.loads(rockwell["flags_json"])["premium"] is True
+
+
+@pytest.mark.asyncio
+async def test_invite_participant_bots_are_projected_too(tmp_path):
+    """Bots identify the tooling a group runs — keep them, flagged as bots."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+
+        bot = st.conn.execute(
+            "select username, flags_json from peers where uri='tg:user:5631259670'"
+        ).fetchone()
+        assert bot is not None
+        assert bot["username"] == "uasaverbot"
+        assert json.loads(bot["flags_json"])["bot"] is True
+
+
+@pytest.mark.asyncio
+async def test_invite_participants_carry_the_invite_raw_record_as_provenance(tmp_path):
+    """An unjoined invite has no numeric chat id, so the ChatInvite raw row —
+    whose `context_json` holds the hash — is the only provenance available."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+
+        peer = st.conn.execute(
+            "select source_raw_id, seen_in_chat, seen_in_msg from peers "
+            "where uri='tg:user:6674021615'"
+        ).fetchone()
+        raw = st.conn.execute(
+            "select kind, context_json from raw_records where id=?", (peer["source_raw_id"],)
+        ).fetchone()
+        assert raw["kind"] == "ChatInvite"
+        assert json.loads(raw["context_json"])["hash"] == "AbCdEf123"
+        # No chat id exists for an unjoined invite — must not be faked.
+        assert peer["seen_in_chat"] is None
+        assert peer["seen_in_msg"] is None
+
+
+@pytest.mark.asyncio
+async def test_invite_participants_are_counted_in_the_result(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        res = await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+        assert res.counts["peers"] == 3
+
+
+@pytest.mark.asyncio
+async def test_invite_preview_without_participants_projects_no_peers(tmp_path):
+    """Regression guard: the sample is optional and often absent."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        fx = _invite_fx(fixture="chat_invite_preview.json")
+        res = await GraphCollector().collect(_ctx(st, FakeGateway(fx)))
+        assert res.counts["peers"] == 0
+        assert st.conn.execute("select count(*) c from peers").fetchone()["c"] == 0
+
+
+@pytest.mark.asyncio
+async def test_invite_participants_produce_member_of_edges(tmp_path):
+    """A roster sample is only useful if the membership itself is queryable.
+
+    `member_of` is in the spec §2 edge vocabulary; without it the association
+    between a sampled person and the group they were sampled from survives
+    only as a `source_raw_id` back-reference, which the graph export cannot
+    traverse.
+    """
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+
+        edges = {
+            (r["subject_uri"], r["object_uri"])
+            for r in st.conn.execute(
+                "select subject_uri, object_uri from edges where predicate='member_of'"
+            )
+        }
+        assert edges == {
+            ("tg:user:6674021615", "tg:invite:AbCdEf123"),
+            ("tg:user:7931433362", "tg:invite:AbCdEf123"),
+            ("tg:user:5631259670", "tg:invite:AbCdEf123"),
+        }
+
+
+@pytest.mark.asyncio
+async def test_invite_member_of_edges_record_that_it_was_a_sample(tmp_path):
+    """The sample is a handful of a much larger group — a reader must not
+    mistake three rows for a three-person group."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_invite_message(st)
+        await GraphCollector().collect(_ctx(st, FakeGateway(_invite_fx())))
+
+        edge = st.conn.execute(
+            "select evidence_json from edges where predicate='member_of' limit 1"
+        ).fetchone()
+        evidence = json.loads(edge["evidence_json"])
+        assert evidence["sampled"] is True
+        assert evidence["participants_count"] == 307

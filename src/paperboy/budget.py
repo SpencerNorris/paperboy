@@ -34,7 +34,18 @@ class HardStop(Exception):
 
 
 class PhaseStop(Exception):
-    """The current phase must stop; other phases may still run (long FLOOD_WAIT)."""
+    """The current phase must stop; other phases may still run (long FLOOD_WAIT).
+
+    `counts` carries whatever the phase completed before stopping. A page-budget
+    stop is the routine outcome on a large target rather than an error, so a
+    phase that stored hundreds of messages before hitting it must still report
+    them — otherwise the operator reads an empty result for a run that did real
+    work, and `run_events` preserves nothing to resume reasoning from.
+    """
+
+    def __init__(self, *args: object, counts: dict[str, int] | None = None) -> None:
+        super().__init__(*args)
+        self.counts: dict[str, int] = dict(counts or {})
 
 
 class SkipAndRecord(Exception):

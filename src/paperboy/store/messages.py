@@ -13,6 +13,7 @@ import hashlib
 
 from paperboy.ids import msg_uri, peer_ref_uri, to_iso
 from paperboy.store.db import Store, dumps
+from paperboy.store.sync import is_self
 
 _TOMBSTONE_SETS_DELETED_AT = {"update", "empty"}
 
@@ -68,6 +69,10 @@ def upsert_message(
     date = _iso_or_none(msg.get("date"))
     edit_date = _iso_or_none(msg.get("edit_date"))
     from_uri = peer_ref_uri(msg.get("from_id"))
+    if is_self(store, from_uri):
+        # The collecting account is never attributed as an author (issue #12);
+        # the message row stays, its from_uri is nulled.
+        from_uri = None
     post_author = msg.get("post_author")
     grouped_id = msg.get("grouped_id")
     via_bot_id = msg.get("via_bot_id")

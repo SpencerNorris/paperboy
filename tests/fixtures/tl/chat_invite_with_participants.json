@@ -1,0 +1,45 @@
+{
+  "_": "ChatInvite",
+  "title": "Cool Group",
+  "about": "Rules:\n1. Be nice",
+  "photo": {"_": "PhotoEmpty", "id": 0},
+  "participants_count": 307,
+  "broadcast": false,
+  "megagroup": true,
+  "color": 3,
+  "participants": [
+    {
+      "_": "User",
+      "id": 6674021615,
+      "access_hash": 111,
+      "first_name": "EckArt",
+      "last_name": null,
+      "username": null,
+      "bot": false,
+      "premium": false,
+      "deleted": false
+    },
+    {
+      "_": "User",
+      "id": 7931433362,
+      "access_hash": 222,
+      "first_name": "Mok.ss",
+      "last_name": "Rockwell",
+      "username": null,
+      "bot": false,
+      "premium": true,
+      "deleted": false
+    },
+    {
+      "_": "User",
+      "id": 5631259670,
+      "access_hash": 333,
+      "first_name": "USaver",
+      "last_name": null,
+      "username": "uasaverbot",
+      "bot": true,
+      "premium": false,
+      "deleted": false
+    }
+  ]
+}

@@ -26,12 +26,13 @@ from typing import TYPE_CHECKING
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
+from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.web import WebCollector
-from paperboy.ids import utc_now_iso
-from paperboy.store.db import dumps
+from paperboy.progress import Progress
+from paperboy.store.events import record_run_event
 
 if TYPE_CHECKING:
     from paperboy.collectors.base import Collector
@@ -47,7 +48,10 @@ def _default_collectors(*, include_media: bool, include_web: bool) -> list[Colle
     # a different trust boundary than the authenticated MTProto session) are
     # OPT-IN (--media / --web, or named in --phases), so a plain `collect`
     # stays Telegram-only: metadata + history + graph.
-    collectors: list[Collector] = [ChannelCollector(), HistoryCollector(), GraphCollector()]
+    collectors: list[Collector] = [
+        ChannelCollector(), HistoryCollector(), DiscussionCollector(),
+        GraphCollector(),
+    ]
     if include_web:
         collectors.append(WebCollector())
     if include_media:
@@ -55,14 +59,7 @@ def _default_collectors(*, include_media: bool, include_web: bool) -> list[Colle
     return collectors
 
 
-def _record_run_event(
-    store: Store, channel_id: int | None, phase: str, kind: str, detail: dict | None
-) -> None:
-    store.conn.execute(
-        "INSERT INTO run_events(observed_at, channel_id, phase, kind, detail_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (utc_now_iso(), channel_id, phase, kind, dumps(detail) if detail is not None else None),
-    )
+_record_run_event = record_run_event
 
 
 def _merge_counts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
@@ -79,7 +76,17 @@ async def _run_one(collector: Collector, ctx: CollectContext) -> CollectResult:
     """
     result = await collector.collect(ctx)
     if isinstance(collector, HistoryCollector):
-        catchup_result = await collector.catch_up(ctx)
+        try:
+            catchup_result = await collector.catch_up(ctx)
+        except PhaseStop as exc:
+            # catch_up now loops (issue #25), so it can PhaseStop mid-work — its
+            # page budget, or a flood on a later page. The backfill above already
+            # completed; its counts must still reach the phase report, or a
+            # history phase that stored hundreds of messages reads as near-empty
+            # (2a40754, and PhaseStop's own contract). Fold them into the stop.
+            raise PhaseStop(
+                str(exc), counts=_merge_counts(result.counts, exc.counts)
+            ) from exc
         result = CollectResult(
             name=result.name,
             counts=_merge_counts(result.counts, catchup_result.counts),
@@ -121,38 +128,58 @@ async def collect_channel(
     selected = set(phases) if phases is not None else {c.name for c in active}
 
     results: list[CollectResult] = []
-    for collector in active:
-        if collector.name not in selected or not collector.applies_to(target):
-            continue
-        try:
-            result = await _run_one(collector, ctx)
-        except SkipAndRecord as exc:
-            # Disposition.SKIP (e.g. ChannelPrivateError, ChatAdminRequiredError,
-            # MsgIdInvalidError, BroadcastForbiddenError, PremiumAccountRequiredError):
-            # skip this one collector, the run continues (spec §8) — this must
-            # never abort the whole run, unlike PhaseStop/HardStop below.
-            log.warning("phase %s skipped: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "skip", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
-            continue
-        except PhaseStop as exc:
-            log.warning("phase %s stopped: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "phase_stop", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="phase_stop"))
-            continue
-        except HardStop as exc:
-            log.error("hard stop during %s: %s", collector.name, exc)
-            detail = {"error": str(exc)}
-            _record_run_event(store, ctx.channel_id, collector.name, "hard_stop", detail)
-            results.append(CollectResult(name=collector.name, counts={}, stopped="hard_stop"))
-            break
-        else:
-            _record_run_event(
-                store, ctx.channel_id, collector.name, "complete",
-                {"counts": result.counts, "stopped": result.stopped},
-            )
-            results.append(result)
+    progress = Progress(store, log)
+    progress.begin()
+    try:
+        for collector in active:
+            if collector.name not in selected or not collector.applies_to(target):
+                continue
+            progress.start_phase(collector.name)
+            try:
+                result = await _run_one(collector, ctx)
+            except SkipAndRecord as exc:
+                # Disposition.SKIP (e.g. ChannelPrivateError, ChatAdminRequiredError,
+                # MsgIdInvalidError, BroadcastForbiddenError, PremiumAccountRequiredError):
+                # skip this one collector, the run continues (spec §8) — this must
+                # never abort the whole run, unlike PhaseStop/HardStop below.
+                progress.end_phase(collector.name, None, stopped="skip")
+                log.warning("phase %s skipped: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "skip", {"error": str(exc)}
+                )
+                results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
+                continue
+            except PhaseStop as exc:
+                # A stopped phase may still have done real work — a page-budget
+                # stop is the normal outcome on a large target — so report what
+                # it collected rather than a bare `{}`.
+                stopped_counts = getattr(exc, "counts", {}) or {}
+                progress.end_phase(collector.name, stopped_counts or None, stopped="phase_stop")
+                log.warning("phase %s stopped: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "phase_stop",
+                    {"error": str(exc), "counts": stopped_counts},
+                )
+                results.append(
+                    CollectResult(name=collector.name, counts=stopped_counts, stopped="phase_stop")
+                )
+                continue
+            except HardStop as exc:
+                progress.end_phase(collector.name, None, stopped="hard_stop")
+                log.error("hard stop during %s: %s", collector.name, exc)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "hard_stop", {"error": str(exc)}
+                )
+                results.append(CollectResult(name=collector.name, counts={}, stopped="hard_stop"))
+                break
+            else:
+                progress.end_phase(collector.name, result.counts)
+                _record_run_event(
+                    store, ctx.channel_id, collector.name, "complete",
+                    {"counts": result.counts, "stopped": result.stopped},
+                )
+                results.append(result)
+    finally:
+        await progress.close()
 
     return results

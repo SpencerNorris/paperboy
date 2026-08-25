@@ -38,10 +38,18 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
     from telethon.errors import (
         BroadcastForbiddenError,
         ChannelPrivateError,
+        ChannelsTooMuchError,
         ChatAdminRequiredError,
         ChatNotModifiedError,
+        InviteHashEmptyError,
+        InviteHashExpiredError,
+        InviteHashInvalidError,
+        InviteRequestSentError,
         MsgIdInvalidError,
         PremiumAccountRequiredError,
+        UserBannedInChannelError,
+        UserChannelsTooMuchError,
+        UsersTooMuchError,
     )
 
     return (
@@ -55,6 +63,24 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         # return" case (no recommendations, ads disabled, invite already
         # known unchanged) — skip that one RPC, the phase continues.
         ChatNotModifiedError,
+        # A t.me/+<hash> invite link in a message can be dead by the time we
+        # preview it (checkChatInvite) — expired / invalid / empty. That is one
+        # dead link, not a run-ending failure: skip that preview, continue.
+        InviteHashExpiredError,
+        InviteHashInvalidError,
+        InviteHashEmptyError,
+        # A `--join` (issue #20) can be refused by a real gated group in several
+        # ways, all meaning "this one group cannot be joined": an approval-gated
+        # group answers INVITE_REQUEST_SENT; the account is in too many channels
+        # (CHANNELS_TOO_MUCH / its user-scoped sibling); the group is at its
+        # member cap (USERS_TOO_MUCH); the account is banned from it
+        # (USER_BANNED_IN_CHANNEL). Each is a clean per-join skip — the
+        # discussion phase reports "joining failed" — not a run-ending crash.
+        InviteRequestSentError,
+        ChannelsTooMuchError,
+        UserChannelsTooMuchError,
+        UsersTooMuchError,
+        UserBannedInChannelError,
     )
 
 

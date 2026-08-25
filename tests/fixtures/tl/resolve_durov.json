@@ -1,5 +1,9 @@
 {
   "_": "contacts.resolvedPeer",
+  "peer": {
+    "_": "PeerChannel",
+    "channel_id": 5
+  },
   "chats": [
     {
       "_": "channel",

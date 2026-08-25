@@ -79,6 +79,14 @@ class Gateway(Protocol):
         `ChatInviteAlready`/`ChatInvitePeek` dict (a real `Chat`, if already known)."""
         ...
 
+    async def join_channel(self, input_channel: dict) -> dict:
+        """`channels.joinChannel` — the one WRITE paperboy makes, and only under
+        an explicit `--join` (issue #20). Returns the `Updates` dict on success.
+        May raise `SkipAndRecord` (a documented refusal like `INVITE_REQUEST_SENT`
+        for an approval-gated group, `CHANNELS_TOO_MUCH`, `CHANNEL_PRIVATE`) or
+        `HardStop` on `PEER_FLOOD`. NEVER call this outside the `--join` path."""
+        ...
+
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
         """`messages.getSponsoredMessages` — a `SponsoredMessages` or
         `SponsoredMessagesEmpty` dict. May raise `SkipAndRecord` (e.g.
@@ -108,21 +116,40 @@ class FakeGateway:
         # duplicate never reaches the gateway at all, not just that its
         # result was discarded.
         self.download_media_calls: list[int] = []
+        # Every protocol method invoked, in call order. Lets a test assert that
+        # a code path made NO RPC at all, or exactly one — an assertion that is
+        # otherwise unfalsifiable, because a fake that records nothing looks
+        # identical whether it was called or not.
+        self.calls: list[str] = []
+        # Every `input_channel` `iter_history` was pointed at. The only way to
+        # catch a sweep silently aimed at the wrong channel or built with a
+        # stale access hash.
+        self.history_targets: list[dict] = []
+        # Every `pts` value `get_channel_difference` was called with. A cursor
+        # corrupted in the store (issue #22: `None` persisted by a TooLong
+        # resync) only becomes observable at the call boundary — the real
+        # gateway would crash on it inside Telethon, past every handler.
+        self.channel_difference_pts: list[int | None] = []
 
     async def resolve(self, target_value: str) -> dict:
+        self.calls.append("resolve")
         del target_value
         return self._fx["resolve"]
 
     async def get_full_channel(self, input_channel: dict) -> dict:
+        self.calls.append("get_full_channel")
         del input_channel
         return self._fx["full_channel"]
 
     async def get_self(self) -> dict:
+        self.calls.append("get_self")
         return self._fx["self"]
 
     async def iter_history(
         self, input_channel: dict, *, offset_id: int, limit: int
     ) -> AsyncIterator[dict]:
+        self.calls.append("iter_history")
+        self.history_targets.append(dict(input_channel))
         del input_channel
         history = self._fx.get("history", [])
         # Mirrors real getHistory semantics: offset_id=0 means "from the
@@ -132,24 +159,42 @@ class FakeGateway:
             yield m
 
     async def get_messages(self, input_channel: dict, ids: list[int]) -> list[dict]:
+        self.calls.append("get_messages")
         del input_channel
         table: dict[int, dict] = self._fx.get("get_messages", {})
         return [table.get(i, {"_": "MessageEmpty", "id": i}) for i in ids]
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
-        del input_channel, pts, limit
-        return self._fx["channel_difference"]
+        self.calls.append("get_channel_difference")
+        idx = len(self.channel_difference_pts)
+        self.channel_difference_pts.append(pts)
+        del input_channel, limit
+        fx = self._fx["channel_difference"]
+        # A list models a multi-page catch-up (getChannelDifference is called
+        # until the server sets `final`); the pages are consumed in order and
+        # the last repeats if the collector over-reads. A bare dict is the
+        # single-page case and is returned on every call, as before. A page that
+        # is a BaseException is raised, modelling a flood (PhaseStop) mid-loop —
+        # the same exception-fixture convention as download_media/check_chat_invite.
+        page = fx[min(idx, len(fx) - 1)] if isinstance(fx, list) else fx
+        if isinstance(page, BaseException):
+            raise page
+        return page
 
     async def get_authorizations(self) -> dict:
+        self.calls.append("get_authorizations")
         return self._fx["authorizations"]
 
     async def get_password_state(self) -> dict:
+        self.calls.append("get_password_state")
         return self._fx["password_state"]
 
     async def get_privacy(self, key: str) -> dict:
+        self.calls.append("get_privacy")
         return self._fx["privacy"][key]
 
     async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+        self.calls.append("download_media")
         del input_channel
         self.download_media_calls.append(message["id"])
         value = self._fx.get("media", {}).get(message["id"])
@@ -158,12 +203,14 @@ class FakeGateway:
         return value
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
+        self.calls.append("get_channel_recommendations")
         del input_channel
         return self._fx_or_raise(
             "channel_recommendations", {"_": "messages.chats", "chats": []}
         )
 
     async def check_chat_invite(self, hash_: str) -> dict:
+        self.calls.append("check_chat_invite")
         table: dict[str, dict] = self._fx.get("chat_invite", {})
         value = table.get(hash_)
         if value is None:
@@ -172,7 +219,16 @@ class FakeGateway:
             raise value
         return value
 
+    async def join_channel(self, input_channel: dict) -> dict:
+        self.calls.append("join_channel")
+        del input_channel
+        value = self._fx.get("join", {"_": "updates", "updates": []})
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        self.calls.append("get_sponsored_messages")
         del input_channel
         return self._fx_or_raise(
             "sponsored_messages", {"_": "messages.sponsoredMessagesEmpty"}
@@ -491,6 +547,23 @@ class TelethonGateway:
             await self.budget.call(
                 "messages.getSponsoredMessages",
                 lambda: self.client(GetSponsoredMessagesRequest(peer=peer)),
+            ),
+        )
+        return result.to_dict()
+
+    async def join_channel(self, input_channel: dict) -> dict:
+        # The single WRITE path (issue #20). Routed through Budget.call like
+        # every other RPC, so PEER_FLOOD becomes a HardStop and the pacing/cap
+        # apply; the caller only reaches here under an explicit --join.
+        from telethon.tl.functions.channels import JoinChannelRequest
+        from telethon.tl.tlobject import TLObject
+
+        channel = _input_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "channels.joinChannel",
+                lambda: self.client(JoinChannelRequest(channel=channel)),
             ),
         )
         return result.to_dict()
