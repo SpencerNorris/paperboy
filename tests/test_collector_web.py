@@ -207,6 +207,45 @@ async def test_a_genuinely_empty_cdx_index_still_reports_zero(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_200_with_an_unparseable_body_is_a_failure_not_zero(tmp_path):
+    """The gap 392e70f left (issue #24): the status check passes, but a 200
+    whose body is not valid JSON — exactly what an oversized CDX response
+    arriving truncated looks like, the original durov failure mode — still
+    fell through `except ValueError: payload = []` to a confident
+    `wayback_rows: 0`. Same "couldn't tell" dressed as "nothing there"."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    truncated = '[["urlkey","timestamp","original","digest"],["com,t)/s/du'
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=truncated))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert "wayback_rows" not in res.counts
+        assert res.counts.get("wayback_failed") == 200
+        # the unparseable body is still recoverable from raw_records (stored
+        # JSON-escaped, so decode the row and compare the actual text field)
+        import json as _json
+
+        raw = st.conn.execute(
+            "SELECT payload_json FROM raw_records WHERE kind='wayback_cdx'"
+        ).fetchone()
+        assert raw is not None
+        assert _json.loads(raw["payload_json"])["text"] == truncated
+
+
+@pytest.mark.asyncio
+async def test_an_empty_cdx_body_is_a_genuine_zero_not_a_failure(tmp_path):
+    """The inverse trap of the fix above: the CDX endpoint signals an empty
+    index with an EMPTY body (not "[]"), which also fails to parse as JSON.
+    That is a true zero and must NOT be dressed up as a failure — otherwise
+    the fix for issue #24 just inverts the original bug."""
+    tme_html = (FX / "tme_durov_page1.html").read_text()
+    client = _mock_client(_status_handler(200, 200, tme_html, cdx_json=""))
+    with Store.open(tmp_path / "p.sqlite") as st:
+        res = await WebCollector(client=client, sleep=lambda s: None).collect(_ctx(st))
+        assert res.counts["wayback_rows"] == 0
+        assert "wayback_failed" not in res.counts
+
+
+@pytest.mark.asyncio
 async def test_a_wayback_failure_does_not_destroy_the_tme_results(tmp_path):
     """The two vectors are independent. One being throttled must not discard
     what the other already collected."""
