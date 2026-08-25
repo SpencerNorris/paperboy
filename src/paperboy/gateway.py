@@ -158,9 +158,17 @@ class FakeGateway:
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         self.calls.append("get_channel_difference")
+        idx = len(self.channel_difference_pts)
         self.channel_difference_pts.append(pts)
         del input_channel, limit
-        return self._fx["channel_difference"]
+        fx = self._fx["channel_difference"]
+        # A list models a multi-page catch-up (getChannelDifference is called
+        # until the server sets `final`); the pages are consumed in order and
+        # the last repeats if the collector over-reads. A bare dict is the
+        # single-page case and is returned on every call, as before.
+        if isinstance(fx, list):
+            return fx[min(idx, len(fx) - 1)]
+        return fx
 
     async def get_authorizations(self) -> dict:
         self.calls.append("get_authorizations")
