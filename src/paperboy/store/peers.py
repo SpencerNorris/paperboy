@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from paperboy.ids import channel_uri, chat_uri, primary_username, user_uri
 from paperboy.store.db import Store, dumps
+from paperboy.store.sync import is_self
 
 _FLAG_KEYS = (
     "verified", "scam", "fake", "restricted", "bot", "premium", "deleted",
@@ -46,8 +47,15 @@ def upsert_peer(
     *,
     seen_in_chat: int | None,
     seen_in_msg: int | None,
-) -> str:
+) -> str | None:
+    """Project a peer, returning its URI — or `None` if it is the collecting
+    account, which is never a subject of interest and is kept out of the store
+    entirely (issue #12; the id lives only in `sync_state('account','self')`).
+    Callers that use the return value as an edge endpoint must skip a `None`.
+    """
     kind, uri, id_ = _classify(obj)
+    if is_self(store, uri):
+        return None
     is_min = bool(obj.get("min"))
 
     existing = store.conn.execute("SELECT is_min FROM peers WHERE uri=?", (uri,)).fetchone()

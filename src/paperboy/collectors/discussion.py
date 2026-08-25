@@ -231,6 +231,6 @@ class DiscussionCollector:
         ).fetchone()
         if exists is not None:
             return
-        add_edge(ctx.store, subject, predicate, object_, observed_at, ctx.tier,
-                 source_raw_id, evidence)
-        counts["edges"] += 1
+        if add_edge(ctx.store, subject, predicate, object_, observed_at, ctx.tier,
+                    source_raw_id, evidence):
+            counts["edges"] += 1

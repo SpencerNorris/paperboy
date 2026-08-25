@@ -102,12 +102,14 @@ class GraphCollector:
             peer_uri = upsert_peer(
                 ctx.store, chat, raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
             )
+            if peer_uri is None:  # self, kept out of the store (#12)
+                continue
             counts["peers"] += 1
-            add_edge(
+            if add_edge(
                 ctx.store, subject, _RECOMMENDED, peer_uri, observed_at, ctx.tier, raw_id,
                 {"total_count": true_count},
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
     def _write_mention_edges(
         self,
@@ -117,11 +119,11 @@ class GraphCollector:
     ) -> None:
         observed_at = utc_now_iso()
         for subject, object_, evidence, source_raw_id in mention_edges:
-            add_edge(
+            if add_edge(
                 ctx.store, subject, _MENTIONS, object_, observed_at, ctx.tier, source_raw_id,
                 evidence,
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
     async def _collect_invite_previews(
         self, ctx: CollectContext, invite_hashes: dict[str, list[str]], counts: dict
@@ -148,6 +150,11 @@ class GraphCollector:
                 object_uri = upsert_peer(
                     ctx.store, chat, raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
                 )
+                if object_uri is None:
+                    # The resolved invite chat is the collecting account — not
+                    # possible for a real channel/chat (self is a user), but
+                    # keep the run out of its own graph regardless (#12).
+                    continue
                 counts["peers"] += 1
                 evidence = {"resolved": True, "chat_id": chat.get("id")}
             else:
@@ -174,22 +181,24 @@ class GraphCollector:
                     ctx.store, participant, raw_id, observed_at,
                     seen_in_chat=None, seen_in_msg=None,
                 )
+                if peer_uri is None:  # self, kept out of the store (#12)
+                    continue
                 counts["peers"] += 1
-                add_edge(
+                if add_edge(
                     ctx.store, peer_uri, _MEMBER_OF, object_uri, observed_at, ctx.tier, raw_id,
                     # `sampled` marks these as a handful out of
                     # `participants_count`, so no reader mistakes the rows
                     # present for the whole membership.
                     {"sampled": True, "participants_count": preview.get("participants_count")},
-                )
-                counts["edges"] += 1
+                ):
+                    counts["edges"] += 1
 
             for m_uri in msg_uris:
-                add_edge(
+                if add_edge(
                     ctx.store, m_uri, _INVITED_VIA, object_uri, observed_at, ctx.tier, raw_id,
                     evidence,
-                )
-                counts["edges"] += 1
+                ):
+                    counts["edges"] += 1
 
     async def _collect_sponsored(self, ctx: CollectContext, counts: dict) -> None:
         assert ctx.input_channel is not None and ctx.channel_id is not None
@@ -223,7 +232,7 @@ class GraphCollector:
                 continue
             link_kind, value = parsed
             object_uri = invite_uri(value) if link_kind == "invite" else username_uri(value)
-            add_edge(
+            if add_edge(
                 ctx.store, subject, _MENTIONS, object_uri, observed_at, ctx.tier, raw_id,
                 {
                     "source": "sponsored",
@@ -231,8 +240,8 @@ class GraphCollector:
                     "sponsor_info": sponsored.get("sponsor_info"),
                     "title": sponsored.get("title"),
                 },
-            )
-            counts["edges"] += 1
+            ):
+                counts["edges"] += 1
 
 
 def _scan_message_entities(

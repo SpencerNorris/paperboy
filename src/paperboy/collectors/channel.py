@@ -5,7 +5,7 @@ project it, and prime `ctx` for `history` (and later Phase 2 collectors).
 from __future__ import annotations
 
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import channel_uri, utc_now_iso
+from paperboy.ids import channel_uri, user_uri, utc_now_iso
 from paperboy.store.channels import upsert_channel
 from paperboy.store.edges import add_edge
 from paperboy.store.peers import upsert_peer
@@ -77,6 +77,17 @@ class ChannelCollector:
         observed_at = utc_now_iso()
         peer_uris: set[str] = set()
 
+        # Learn (and record) the collecting account FIRST, so `is_self` is
+        # primed before any peer/message/edge is projected below — self must be
+        # kept out of the store even when it rides along in a response's users
+        # vector, not only the explicit get_me() (issue #12). The raw record is
+        # kept (redacted) so provenance can still say which account observed;
+        # the id lives in sync_state only, never as a peer row.
+        self_user = _redact_self(await ctx.gateway.get_self())
+        ctx.store.add_raw(self_user.get("_", "User"), self_user, "self", None)
+        self_uri = user_uri(self_user["id"])
+        set_state(ctx.store, "account", "self", {"uri": self_uri, "id": self_user.get("id")})
+
         resolved = await ctx.gateway.resolve(ctx.target.value)
         resolve_raw_id = ctx.store.add_raw(
             resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw}
@@ -125,19 +136,13 @@ class ChannelCollector:
                     ctx.store, obj, source_raw_id, observed_at,
                     seen_in_chat=None, seen_in_msg=None,
                 )
-                peer_uris.add(uri)
+                if uri is not None:  # None => self, kept out of the store (#12)
+                    peer_uris.add(uri)
 
         if chan_for_channel.get("creator"):
             ctx.tier = "self"
         elif chan_for_channel.get("admin_rights"):
             ctx.tier = "admin"
-
-        self_user = _redact_self(await ctx.gateway.get_self())
-        self_raw_id = ctx.store.add_raw(self_user.get("_", "User"), self_user, "self", None)
-        self_uri = upsert_peer(
-            ctx.store, self_user, self_raw_id, observed_at, seen_in_chat=None, seen_in_msg=None
-        )
-        set_state(ctx.store, "account", "self", {"uri": self_uri, "id": self_user.get("id")})
 
         ctx.input_channel = input_channel
         ctx.channel_id = channel_id

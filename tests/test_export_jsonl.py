@@ -43,7 +43,11 @@ def test_export_writes_three_files_with_revisions(tmp_path):
         assert (out / "edges.jsonl").read_text() == ""
 
 
-def test_export_scrubs_self_authored_messages(tmp_path):
+def test_export_scrubs_a_legacy_self_authored_message(tmp_path):
+    # Post-#12, `upsert_message` nulls a self `from_uri` at ingest, so the store
+    # never holds a self-attributed message. The export keeps its from_uri scrub
+    # as backward-compat DEFENSE for a database collected before that fix — this
+    # simulates such a legacy row by writing the self attribution directly.
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed(st, self_uri="tg:user:1")
         m = {
@@ -58,12 +62,33 @@ def test_export_scrubs_self_authored_messages(tmp_path):
         }
         r2 = st.add_raw("message", self_msg, "self", None)
         upsert_message(st, 5, self_msg, r2, "2026-01-01T00:00:00+00:00", "self")
+        # a pre-#12 store would have carried the self attribution:
+        st.conn.execute(
+            "UPDATE messages SET from_uri='tg:user:1' WHERE channel_id=5 AND msg_id=2"
+        )
 
         out = tmp_path / "out"
         counts = export_jsonl(st, "tg:channel:5", out)
         assert counts["messages"] == 1
         lines = (out / "messages.jsonl").read_text().splitlines()
         assert json.loads(lines[0])["text"] == "not mine"
+
+
+def test_upsert_message_nulls_a_self_from_uri_at_ingest(tmp_path):
+    # The #12 store-level chokepoint: a self-authored message is stored but not
+    # attributed to the collecting account.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, self_uri="tg:user:1")
+        self_msg = {
+            "_": "message", "id": 2, "message": "mine", "date": 1767322445,
+            "peer_id": {"channel_id": 5}, "from_id": {"_": "peerUser", "user_id": 1},
+        }
+        r = st.add_raw("message", self_msg, "self", None)
+        upsert_message(st, 5, self_msg, r, "2026-01-01T00:00:00+00:00", "self")
+        row = st.conn.execute(
+            "SELECT from_uri FROM messages WHERE channel_id=5 AND msg_id=2"
+        ).fetchone()
+        assert row is not None and row["from_uri"] is None
 
 
 def test_export_scopes_edges_to_channel(tmp_path):
