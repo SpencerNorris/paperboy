@@ -377,3 +377,22 @@ async def test_incremental_catch_up_stops_at_the_high_water_mark(tmp_path):
         assert {r["msg_id"] for r in st.conn.execute("select msg_id from messages")} == set(
             range(1, 253)
         )
+
+
+# --- a budget-stopped phase must report what it collected ------------------
+
+
+@pytest.mark.asyncio
+async def test_page_budget_phase_stop_carries_the_counts_collected_so_far(tmp_path):
+    """A budget stop is the ROUTINE outcome on a large target, not an error.
+
+    The phase stored a full page before stopping; if `PhaseStop` cannot carry
+    that, the operator sees an empty result for a run that did real work and
+    `run_events` records nothing to reason from.
+    """
+    gw = FakeGateway({"history": [_m(i) for i in range(250, 0, -1)], "get_messages": {}})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        with pytest.raises(PhaseStop) as excinfo:
+            await HistoryCollector().collect(_ctx(st, gw), probe_gaps=False, page_budget=1)
+        assert excinfo.value.counts["messages"] == 100
+        assert st.conn.execute("select count(*) c from messages").fetchone()["c"] == 100

@@ -148,12 +148,19 @@ async def collect_channel(
                 results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
                 continue
             except PhaseStop as exc:
-                progress.end_phase(collector.name, None, stopped="phase_stop")
+                # A stopped phase may still have done real work — a page-budget
+                # stop is the normal outcome on a large target — so report what
+                # it collected rather than a bare `{}`.
+                stopped_counts = getattr(exc, "counts", {}) or {}
+                progress.end_phase(collector.name, stopped_counts or None, stopped="phase_stop")
                 log.warning("phase %s stopped: %s", collector.name, exc)
                 _record_run_event(
-                    store, ctx.channel_id, collector.name, "phase_stop", {"error": str(exc)}
+                    store, ctx.channel_id, collector.name, "phase_stop",
+                    {"error": str(exc), "counts": stopped_counts},
                 )
-                results.append(CollectResult(name=collector.name, counts={}, stopped="phase_stop"))
+                results.append(
+                    CollectResult(name=collector.name, counts=stopped_counts, stopped="phase_stop")
+                )
                 continue
             except HardStop as exc:
                 progress.end_phase(collector.name, None, stopped="hard_stop")

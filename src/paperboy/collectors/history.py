@@ -143,7 +143,8 @@ class HistoryCollector:
             if page_budget is not None and pages >= page_budget:
                 raise PhaseStop(
                     f"page budget ({page_budget}) reached at offset_id={cursor}; "
-                    "re-run to continue from the saved cursor"
+                    "re-run to continue from the saved cursor",
+                    counts=counts,
                 )
 
         settled = max(committed_high, pending_high)
