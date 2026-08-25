@@ -268,10 +268,26 @@ class WebCollector:
             )
             return {"wayback_failed": response.status_code}
 
+        # The CDX endpoint signals a genuinely empty index with an EMPTY body
+        # (not "[]"), so an empty/whitespace 200 is a true zero, not a failure.
+        if response.text.strip() == "":
+            return {"wayback_rows": 0}
+
+        # But a NON-empty 200 body that won't parse as JSON is a failed
+        # collection attempt, not an empty index (issue #24): an oversized CDX
+        # response arriving truncated lands here, and swallowing it to `[]`
+        # reports the same false zero the status check above was added to
+        # prevent. The raw body is already in `raw_records`, so it stays
+        # diagnosable.
         try:
             payload = response.json()
         except ValueError:
-            payload = []
+            ctx.log.warning(
+                "web: wayback CDX for %s returned HTTP 200 with an unparseable body "
+                "(%d bytes) — reporting failure, not zero",
+                username, len(response.text),
+            )
+            return {"wayback_failed": response.status_code}
         rows = parse_cdx_rows(payload) if isinstance(payload, list) else []
 
         n = 0
