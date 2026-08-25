@@ -79,6 +79,14 @@ class Gateway(Protocol):
         `ChatInviteAlready`/`ChatInvitePeek` dict (a real `Chat`, if already known)."""
         ...
 
+    async def join_channel(self, input_channel: dict) -> dict:
+        """`channels.joinChannel` — the one WRITE paperboy makes, and only under
+        an explicit `--join` (issue #20). Returns the `Updates` dict on success.
+        May raise `SkipAndRecord` (a documented refusal like `INVITE_REQUEST_SENT`
+        for an approval-gated group, `CHANNELS_TOO_MUCH`, `CHANNEL_PRIVATE`) or
+        `HardStop` on `PEER_FLOOD`. NEVER call this outside the `--join` path."""
+        ...
+
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
         """`messages.getSponsoredMessages` — a `SponsoredMessages` or
         `SponsoredMessagesEmpty` dict. May raise `SkipAndRecord` (e.g.
@@ -207,6 +215,14 @@ class FakeGateway:
         value = table.get(hash_)
         if value is None:
             return {"_": "chatInvite", "title": "", "participants_count": 0}
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    async def join_channel(self, input_channel: dict) -> dict:
+        self.calls.append("join_channel")
+        del input_channel
+        value = self._fx.get("join", {"_": "updates", "updates": []})
         if isinstance(value, BaseException):
             raise value
         return value
@@ -531,6 +547,23 @@ class TelethonGateway:
             await self.budget.call(
                 "messages.getSponsoredMessages",
                 lambda: self.client(GetSponsoredMessagesRequest(peer=peer)),
+            ),
+        )
+        return result.to_dict()
+
+    async def join_channel(self, input_channel: dict) -> dict:
+        # The single WRITE path (issue #20). Routed through Budget.call like
+        # every other RPC, so PEER_FLOOD becomes a HardStop and the pacing/cap
+        # apply; the caller only reaches here under an explicit --join.
+        from telethon.tl.functions.channels import JoinChannelRequest
+        from telethon.tl.tlobject import TLObject
+
+        channel = _input_channel(input_channel)
+        result = cast(
+            TLObject,
+            await self.budget.call(
+                "channels.joinChannel",
+                lambda: self.client(JoinChannelRequest(channel=channel)),
             ),
         )
         return result.to_dict()

@@ -31,9 +31,8 @@ from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.web import WebCollector
-from paperboy.ids import utc_now_iso
 from paperboy.progress import Progress
-from paperboy.store.db import dumps
+from paperboy.store.events import record_run_event
 
 if TYPE_CHECKING:
     from paperboy.collectors.base import Collector
@@ -60,14 +59,7 @@ def _default_collectors(*, include_media: bool, include_web: bool) -> list[Colle
     return collectors
 
 
-def _record_run_event(
-    store: Store, channel_id: int | None, phase: str, kind: str, detail: dict | None
-) -> None:
-    store.conn.execute(
-        "INSERT INTO run_events(observed_at, channel_id, phase, kind, detail_json) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (utc_now_iso(), channel_id, phase, kind, dumps(detail) if detail is not None else None),
-    )
+_record_run_event = record_run_event
 
 
 def _merge_counts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:

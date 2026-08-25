@@ -9,9 +9,12 @@ import hashlib
 from paperboy.ids import channel_uri, primary_username
 from paperboy.store.db import Store, dumps
 
-# `min` is a serialization marker (this payload was a reduced object), not a
-# channel property — it is recorded on `peers.is_min` and excluded from a
-# channel's flags.
+# `min` is a whole-object serialization marker (this payload was a reduced
+# object), not a channel property — it is recorded on `peers.is_min` and
+# excluded from a channel's flags. Only the whole-object marker is excluded;
+# per-field reliability qualifiers like `stories_hidden_min` are kept, because
+# they carry real metadata about a specific flag rather than misdescribing the
+# channel.
 _FLAG_EXCLUDE = frozenset({"min"})
 
 

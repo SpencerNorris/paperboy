@@ -77,10 +77,14 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
             # as `min` rather than writing a hollow authoritative row. The
             # provenance points at the post the reference was found on, which
             # is what `inputPeerFromMessage` later needs.
-            upsert_peer(
+            peer_uri = upsert_peer(
                 store, stub, row["id"], observed_at,
                 seen_in_chat=channel_id, seen_in_msg=post_id,
             )
+            if peer_uri is None:
+                # The collecting account replying to its own target — kept out
+                # of the store (#12), and out of the backfilled_peers count.
+                continue
             add_edge_once(
                 store, uri, _COMMENTED_ON, post_uri, observed_at, tier, row["id"],
                 # Two producers emit `commented_on` — this backfill and the

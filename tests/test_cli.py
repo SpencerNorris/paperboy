@@ -113,6 +113,67 @@ def test_collect_media_alone_rejected_with_clear_message(tmp_path, monkeypatch):
     assert "AssertionError" not in result.stdout
 
 
+def _join_fixtures():
+    fx = _fixtures()
+    fx["full_channel"]["full_chat"]["linked_chat_id"] = 777
+    fx["full_channel"]["chats"].append(
+        {"_": "channel", "id": 777, "access_hash": 4242, "title": "X Chat",
+         "megagroup": True, "join_to_send": True}
+    )
+    fx["get_messages"] = {}
+    fx["join"] = {"_": "updates", "updates": []}
+    return fx
+
+
+def test_collect_join_flag_joins_a_gated_group_and_records_it(tmp_path, monkeypatch):
+    # End-to-end wiring: --join -> allow_join setting -> the discussion collector
+    # joins the join_to_send group and records the active act in run_events.
+    import sqlite3
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del secrets, profile, store
+        assert settings.allow_join is True, "--join must set allow_join"
+        return FakeGateway(_join_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_join", "--phases", "channel,discussion",
+         "--join", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "active" in result.stdout.lower()  # the console warns it is an active act
+    db = sqlite3.connect(tmp_path / "clitest_join" / "paperboy.sqlite")
+    joins = db.execute("SELECT detail_json FROM run_events WHERE kind='join'").fetchall()
+    db.close()
+    assert len(joins) == 1 and "777" in joins[0][0]
+
+
+def test_collect_without_join_flag_leaves_a_gated_group_unjoined(tmp_path, monkeypatch):
+    import sqlite3
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del secrets, profile, store
+        assert settings.allow_join is False
+        return FakeGateway(_join_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_nojoin", "--phases", "channel,discussion",
+         "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    db = sqlite3.connect(tmp_path / "clitest_nojoin" / "paperboy.sqlite")
+    joins = db.execute("SELECT 1 FROM run_events WHERE kind='join'").fetchall()
+    db.close()
+    assert joins == []  # never an implicit join
+
+
 def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeypatch):
     fx = _fixtures()
     fx["history"] = [
