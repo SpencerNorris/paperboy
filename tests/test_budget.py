@@ -39,10 +39,17 @@ def test_refused_join_classifies_as_skip():
     from telethon.errors import (
         ChannelsTooMuchError,
         InviteRequestSentError,
+        UserBannedInChannelError,
         UserChannelsTooMuchError,
+        UsersTooMuchError,
     )
 
-    for exc in (InviteRequestSentError, ChannelsTooMuchError, UserChannelsTooMuchError):
+    # Every "this specific group cannot be joined" outcome: request pending,
+    # account in too many channels, group at member cap, account banned.
+    for exc in (
+        InviteRequestSentError, ChannelsTooMuchError, UserChannelsTooMuchError,
+        UsersTooMuchError, UserBannedInChannelError,
+    ):
         assert classify(exc(None)) == Disposition.SKIP
 
 
