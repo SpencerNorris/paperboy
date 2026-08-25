@@ -17,7 +17,7 @@ import json
 
 from paperboy.ids import msg_uri, peer_ref_uri, utc_now_iso
 from paperboy.store.db import Store
-from paperboy.store.edges import add_edge
+from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
 
 _COMMENTED_ON = "commented_on"
@@ -81,26 +81,15 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
                 store, stub, row["id"], observed_at,
                 seen_in_chat=channel_id, seen_in_msg=post_id,
             )
-            if not _edge_exists(store, uri, _COMMENTED_ON, post_uri):
-                add_edge(
-                    store, uri, _COMMENTED_ON, post_uri, observed_at, tier, row["id"],
-                    # Two producers emit `commented_on` — this backfill and the
-                    # sweep's `_write_thread_edges`. The source marker is the
-                    # only way a consumer can tell them apart.
-                    {"source": "recent_repliers"},
-                )
+            add_edge_once(
+                store, uri, _COMMENTED_ON, post_uri, observed_at, tier, row["id"],
+                # Two producers emit `commented_on` — this backfill and the
+                # sweep's `_write_thread_edges`. The source marker is the
+                # only way a consumer can tell them apart.
+                {"source": "recent_repliers"},
+            )
             seen.add(uri)
     return len(seen)
-
-
-def _edge_exists(store: Store, subject: str, predicate: str, object_: str) -> bool:
-    return (
-        store.conn.execute(
-            "SELECT 1 FROM edges WHERE subject_uri=? AND predicate=? AND object_uri=? LIMIT 1",
-            (subject, predicate, object_),
-        ).fetchone()
-        is not None
-    )
 
 
 def _peer_stub(peer: dict) -> dict | None:

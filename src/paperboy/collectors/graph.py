@@ -33,7 +33,7 @@ from paperboy.ids import (
     utc_now_iso,
     utf16_slice,
 )
-from paperboy.store.edges import add_edge
+from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
 from paperboy.targets import Target
 
@@ -105,7 +105,7 @@ class GraphCollector:
             if peer_uri is None:  # self, kept out of the store (#12)
                 continue
             counts["peers"] += 1
-            if add_edge(
+            if add_edge_once(
                 ctx.store, subject, _RECOMMENDED, peer_uri, observed_at, ctx.tier, raw_id,
                 {"total_count": true_count},
             ):
@@ -119,7 +119,7 @@ class GraphCollector:
     ) -> None:
         observed_at = utc_now_iso()
         for subject, object_, evidence, source_raw_id in mention_edges:
-            if add_edge(
+            if add_edge_once(
                 ctx.store, subject, _MENTIONS, object_, observed_at, ctx.tier, source_raw_id,
                 evidence,
             ):
@@ -184,7 +184,7 @@ class GraphCollector:
                 if peer_uri is None:  # self, kept out of the store (#12)
                     continue
                 counts["peers"] += 1
-                if add_edge(
+                if add_edge_once(
                     ctx.store, peer_uri, _MEMBER_OF, object_uri, observed_at, ctx.tier, raw_id,
                     # `sampled` marks these as a handful out of
                     # `participants_count`, so no reader mistakes the rows
@@ -194,7 +194,7 @@ class GraphCollector:
                     counts["edges"] += 1
 
             for m_uri in msg_uris:
-                if add_edge(
+                if add_edge_once(
                     ctx.store, m_uri, _INVITED_VIA, object_uri, observed_at, ctx.tier, raw_id,
                     evidence,
                 ):
@@ -232,7 +232,7 @@ class GraphCollector:
                 continue
             link_kind, value = parsed
             object_uri = invite_uri(value) if link_kind == "invite" else username_uri(value)
-            if add_edge(
+            if add_edge_once(
                 ctx.store, subject, _MENTIONS, object_uri, observed_at, ctx.tier, raw_id,
                 {
                     "source": "sponsored",
