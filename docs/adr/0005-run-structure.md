@@ -76,9 +76,35 @@ Option A, with structural-marker inference for legacy rows.
    `sync_state` across replayed runs exactly as the live store did across
    real runs. All `_backfill_older_*` shadow-projection code is deleted.
 6. Independently (defense-in-depth and a live-collect correctness fix):
-   `upsert_peer`/`upsert_channel` become order-independent —
-   `first_seen = MIN`, `last_seen = MAX`, current-state fields updated only
-   by an observation at least as new as the stored `last_seen`.
+   `upsert_peer`/`upsert_channel` become order-independent.
+   *(Amended 2026-08-26, review round 2 finding A: the original one-line
+   rule here — "current-state fields updated only by an observation at
+   least as new as the stored `last_seen`" — was recency-only and silently
+   dropped `peers.py`'s pre-existing **richness** invariant ("a `min`
+   observation never clobbers the richer stored profile", stated only in
+   that module's docstring). Recency and richness are independent
+   orderings, and the peer projection is subject to BOTH; the composed
+   lattice, by stored×incoming cell, is:)*
+   - **full ← full:** recency — identity/profile columns (`kind`, `id`,
+     `access_hash`, `is_min`, `username`, `first_name`, `last_name`,
+     `title`, `flags_json`, `source_raw_id`) and provenance columns
+     (`seen_in_chat`, `seen_in_msg`) move iff
+     `excluded.last_seen >= stored.last_seen`.
+   - **full ← min:** richness — identity/profile columns NEVER move,
+     regardless of stamp order; provenance columns (plus their
+     `source_raw_id`, which records where the `min` reference was seen —
+     what `inputPeerFromMessage` later needs) move on recency alone.
+   - **min ← full:** richness — identity/profile columns ALWAYS move, even
+     when the full observation carries an OLDER stamp (the best profile
+     data known wins); provenance on recency.
+   - **min ← min:** recency for everything.
+   - **every cell:** `first_seen = MIN`, `last_seen = MAX` — the seen
+     window always widens and can never invert.
+   `upsert_channel` keeps the plain recency rule: `channels` has no `min`
+   concept (`_FLAG_EXCLUDE` strips the marker), so recency alone is
+   complete there. All four peer cells must be tested in BOTH stamp
+   orderings — a two-invariant merge has four cells and eight ordered
+   cases, and testing fewer is how round 2's regression shipped.
 
 ## Consequences
 

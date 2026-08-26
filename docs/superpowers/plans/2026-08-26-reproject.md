@@ -2520,3 +2520,161 @@ git commit -m "docs(reproject): ADR-0005 run-structure revision — multi-run re
   path), sticky media detection (would fabricate custody observations for
   runs that never ran media — #36 stays open, narrowed), and any mutation of
   the source DB for legacy segmentation (replay-time inference only).
+
+---
+
+# Revision R2 (2026-08-26): review round-2 findings — invariant composition + doc structure
+
+> Authorized after round 2's review exhaustion (#33, second escalation
+> comment). Base: `2269372` on `feat/reproject`. The reviewers confirmed the
+> run-id redesign itself is sound (two-run gate live, real archive
+> reproduces digit-for-digit, no shortcuts in the diff); what failed is
+> (A) ADR-0005 §6's original upsert rule, which was recency-only and
+> dropped `peers.py`'s richness invariant — §6 is now amended with the
+> composed lattice, read it first — and (B) `docs/features/reproject.md`'s
+> shape, which makes doc rot the default. Round 3 is NARROW: four tasks,
+> no new features.
+>
+> **Environment rule for every command in this revision:** the macOS system
+> volume ran out of space mid-review (spurious `sqlite3 disk I/O error`s).
+> Run ALL pytest invocations as
+> `TMPDIR=/Volumes/Storage/tmp uv run pytest -q --basetemp=/Volumes/Storage/tmp/pytest`
+> (`/Volumes/Storage/tmp` exists). Never write test tmp under `/`.
+
+## Task R7: The composed upsert invariant (ADR-0005 §6 as amended)
+
+**Files:**
+- Modify: `src/paperboy/store/peers.py` (the `ON CONFLICT` clause + module
+  docstring), `tests/test_store_peers.py`
+
+- [ ] **Step 1: Write the eight-case table test, confirm the failing cells
+  RED first.** One parametrized test covering every (stored, incoming) ×
+  (older, newer) case from the amended ADR §6 lattice — stored full/min ×
+  incoming full/min × incoming stamp older/newer. For each case assert all
+  of: identity columns (`username`, `access_hash`, `is_min`), provenance
+  columns (`seen_in_chat`, `seen_in_msg`), `source_raw_id`, and the
+  `first_seen`/`last_seen` window. The two cells the review proved broken
+  (min-stored ← full-incoming-with-OLDER-stamp discarding the profile;
+  full-stored ← min-incoming interplay under the recency guard) must fail
+  against `2269372` before any fix — run and record the failure. Keep the
+  existing `test_min_does_not_clobber_full` and round-2's
+  `test_min_observation_older_than_first_seen_still_widens_the_window`;
+  the new table test supersedes neither (they pin the historical shapes).
+
+- [ ] **Step 2: Implement.** In the main `ON CONFLICT(uri) DO UPDATE`, the
+  identity/profile CASE guards become
+  `WHEN excluded.last_seen >= peers.last_seen OR (peers.is_min AND NOT excluded.is_min) THEN …`
+  (richness overrides recency for min→full); provenance columns keep the
+  plain recency guard; `first_seen`/`last_seen` stay MIN/MAX. The
+  incoming-min-on-richer-row early branch keeps its round-2 recency guard
+  and its provenance-only scope (that IS cell full←min). Rewrite the module
+  docstring to state the four-cell lattice and cite ADR-0005 §6 (amended) —
+  the docstring being the only home of the richness invariant is exactly
+  how round 2's regression happened.
+
+- [ ] **Step 3: The ordering property gate** (append to
+  `tests/test_store_peers.py`): apply one fixed set of three observations
+  of the same peer — full@t1, min@t2, full@t3 (distinct usernames/hashes) —
+  in ALL `itertools.permutations` orders; assert the final peers row is
+  byte-identical across all six orders and matches the lattice's expected
+  outcome. This is the gate class the escalation demanded: it can fail for
+  ordering defects without a reviewer inventing a probe. Confirm it fails
+  on `2269372` (pre-fix) for at least one permutation before the fix lands;
+  green after.
+
+- [ ] **Step 4: Integration fixture through the real collector path**
+  (append to `tests/test_reproject.py`): a two-run round-trip variant where
+  run 1 observes a peer FULL (in the resolve/full_channel users vector) and
+  run 2 observes the same peer only as a `min` author stub (message
+  `from_id`), then reproject — `assert_round_trip` must hold, and the
+  reprojected peers row must keep the full profile with the widened window.
+  No `SkipAndRecord` short-circuit anywhere on the path (the round-2 gate's
+  blind spot: its only two-target run bailed at `@atom8388` before reaching
+  peer projection).
+
+- [ ] **Step 5: Full suite (with the TMPDIR rule) + lint/type; commit**
+
+```bash
+TMPDIR=/Volumes/Storage/tmp uv run pytest -q --basetemp=/Volumes/Storage/tmp/pytest && uv run ruff check && uv run pyright
+git add src/paperboy/store/peers.py tests/test_store_peers.py tests/test_reproject.py
+git commit -m "fix(store): compose richness with recency in upsert_peer — ADR-0005 §6 amendment (#33 round-2 finding A)"
+```
+
+## Task R8: Restructure `docs/features/reproject.md`
+
+**Files:**
+- Modify: `docs/features/reproject.md`
+
+- [ ] **Step 1: Single source of truth.** Behavior statements live in
+  exactly one place — the module/function docstrings (the
+  `_reset_incremental_backfill_state` docstring is already the best account
+  in the repo). Rewrite "How it works" to a short orientation that POINTS
+  at the docstrings (`reproject.py`, `replay.py`, `clock.py`,
+  `store/peers.py`) instead of paraphrasing them. Fix the two passages
+  round 2's fix falsified (the pre-narrowing description of the
+  `history`/`history_sweep` reset — currently at ~:71-78 and ~:499-504;
+  locate by content, not line number).
+
+- [ ] **Step 2: Freeze the narratives.** Every smoke transcript and "bug
+  found and fixed" narrative gets a dated header:
+  `> Historical record (2026-08-26, commit <sha>). Kept as evidence; for
+  current behavior see the module docstrings.` — and its prose changed to
+  unambiguous past tense where it currently asserts present behavior. Do
+  not delete the transcripts (they are DoD evidence); do stop them from
+  claiming currency.
+
+- [ ] **Step 3: Cross-refs.** ADR-0005's status line and CLAUDE.md's
+  pointer stay valid; verify both still point at sections that exist after
+  the restructure. Full suite + lint (docs don't need pytest, run anyway to
+  be sure nothing imports the doc paths); commit
+
+```bash
+TMPDIR=/Volumes/Storage/tmp uv run pytest -q --basetemp=/Volumes/Storage/tmp/pytest && uv run ruff check && uv run pyright
+git add docs/features/reproject.md docs/adr/0005-run-structure.md CLAUDE.md
+git commit -m "docs(reproject): single-source-of-truth restructure — docstrings canonical, narratives frozen (#33 round-2 finding B)"
+```
+
+## Task R9: CLI wart + worktree hygiene (no-shed)
+
+- [ ] **Step 1:** `paperboy reproject --profile <nonexistent>` currently
+  mkdirs `data/<nonexistent>/` (via `configure_logging`) before
+  `build_reproject` rejects the profile — smoke case 8 left a
+  `data/ghost-profile/` behind. Reorder the `reproject` CLI command so the
+  source-DB existence check runs before `configure_logging` creates the
+  profile dir (or log to stderr-only until validated — pick the smaller
+  change), with a test: invoking reproject on a nonexistent profile exits 1
+  AND creates no directory. Red first.
+- [ ] **Step 2:** ensure no stray `data/ghost-profile/` or other
+  test-created dirs exist in the working tree; never commit anything under
+  `data/`.
+- [ ] **Step 3:** full suite + lint/type; commit
+  `fix(cli): reproject must not create a profile dir for a profile it then rejects`
+
+## Task R10: Complete the deferred verification + final validation
+
+- [ ] **Step 1: The 5-mutation battery round 2's reviewer could not
+  finish** (disk-space casualty): for each of the five round-2 regression
+  tests the reviewer listed as unproven-live (see the #33 round-2
+  escalation — the segmentation, run_id-guard, and backfill-state tests
+  from `2269372`), apply the obvious reverting mutation to the code under
+  test, confirm the test FAILS, revert the mutation. Record
+  mutation→failing-test pairs in the DoD report. Any test that survives its
+  mutation is dead signal — fix the test, not the mutation.
+- [ ] **Step 2: Real-archive smoke re-run** (delete only the stale
+  `data/default/paperboy.reprojected.sqlite` first): all round-2 numbers
+  must reproduce digit-for-digit, plus the R7 fix must not change any
+  archive count (the archive's replay is stamp-ordered, so richness cells
+  fire only if a min stub follows a full observation across runs — report
+  whichever way it lands, with the count diff if any).
+- [ ] **Step 3:** full suite + lint/type; update the DoD report; commit.
+
+## Revision R2 self-review
+
+- R7 turns both of round 2's finding-A orderings into permanent gates (the
+  8-case table + the 6-permutation property test) — the class, not the
+  instance. R8 removes the structural cause of finding B rather than
+  patching two stale lines. R9/R10 clear every loose end the escalation
+  named (ghost dir, unproven mutations, TMPDIR).
+- Deliberately NOT done: re-litigating the run-id design (verified sound),
+  touching `upsert_channel`'s rule (no min concept — ADR §6 records why),
+  deleting smoke narratives (frozen, not erased).
