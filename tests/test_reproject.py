@@ -30,7 +30,7 @@ runner = CliRunner()
 async def test_detect_phases_reflects_recorded_raw_kinds(tmp_path):
     db = await run_full_collect(tmp_path)
     src = ReplaySource.open(db, tmp_path / "default" / "media")
-    phases = detect_phases(src)
+    phases = detect_phases(src, src.runs()[0])
     assert phases[:2] == ["channel", "history"]
     assert "graph" in phases and "web" in phases and "media" in phases
 
@@ -47,7 +47,7 @@ async def test_detect_phases_minimal_source(tmp_path):
             log=logging.getLogger("t"),
         )
     src = ReplaySource.open(db, tmp_path / "default" / "media")
-    assert detect_phases(src) == ["channel", "history"]
+    assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
 
 
 def test_cli_reproject_writes_fresh_db_and_prints_diff(tmp_path, monkeypatch):
@@ -76,10 +76,25 @@ def test_cli_reproject_refuses_existing_out(tmp_path, monkeypatch):
 
 
 def test_cli_reproject_empty_source_exits_1(tmp_path, monkeypatch):
+    # Zero raw_records at all -> zero runs -> the "empty log" message
+    # (ADR-0005): distinct from "has runs but none resolved anything",
+    # covered separately below.
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
     (tmp_path / "default").mkdir(parents=True)
     with Store.open(tmp_path / "default" / "paperboy.sqlite"):
         pass  # schema only, no raws
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 1
+    assert "raw log is empty" in result.output
+
+
+def test_cli_reproject_source_with_no_resolve_records_exits_1(tmp_path, monkeypatch):
+    # Raw records exist (so at least one run), but none of them is a
+    # ResolvedPeer — nothing for reproject to replay a target from.
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    (tmp_path / "default").mkdir(parents=True)
+    with Store.open(tmp_path / "default" / "paperboy.sqlite") as st:
+        st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 1
     assert "no resolve records" in result.output
@@ -137,12 +152,19 @@ def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkey
     # with a bare ValueError even on a live run; reproject's multi-target
     # loop must not let that discard every other target's already-committed
     # projections the way a single crashed `collect` run naturally would.
+    # Two proper historical runs (ADR-0005): self is written FIRST in each,
+    # matching the real collector's capture order (`channel.py` writes self
+    # before anything else) — the segmentation the source archive naturally
+    # has when built from two separate `collect` invocations.
     db = tmp_path / "default" / "paperboy.sqlite"
     with Store.open(db) as st:
         resolve = json.loads(Path("tests/fixtures/tl/resolve_durov.json").read_text())
         full_channel = json.loads(Path("tests/fixtures/tl/full_channel.json").read_text())
+        st.begin_run()
+        st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw(resolve.get("_"), resolve, "stranger", {"target": "@durov"})
         st.add_raw(full_channel.get("_"), full_channel, "stranger", {"channel_id": 5})
+        st.begin_run()
         st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw(
             "contacts.resolvedPeer",
@@ -310,7 +332,7 @@ def test_source_without_graph_reprojects_without_graph(tmp_path, monkeypatch):
         _collect_with_fixtures(tmp_path, full_collect_fixtures(), ["channel", "history"])
     )
     src = ReplaySource.open(db1, tmp_path / "default" / "media")
-    assert detect_phases(src) == ["channel", "history"]
+    assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
     src.close()
 
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
@@ -403,10 +425,6 @@ def _second_run_fixtures(fx: dict) -> dict:
     return fx
 
 
-@pytest.mark.xfail(
-    reason="#33 / ADR-0005: multi-run replay lands in tasks R2-R5",
-    strict=True,
-)
 def test_two_run_round_trip_identity(tmp_path, monkeypatch):
     """ADR-0005 gate: a source built from TWO collect passes — the ordinary
     real-archive shape — must round-trip identically, time series included."""

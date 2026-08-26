@@ -27,8 +27,10 @@ def _seed(tmp_path):
 
 
 def _client(tmp_path):
+    src = ReplaySource.open(_seed(tmp_path), tmp_path / "media")
     clock = ReplayClock()
-    return RawReplayWebClient(ReplaySource.open(_seed(tmp_path), tmp_path / "media"), clock), clock
+    run = src.runs()[0]
+    return RawReplayWebClient(src, clock, run), clock
 
 
 def test_serves_stored_response_and_stamps_clock(tmp_path):

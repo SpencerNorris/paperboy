@@ -71,8 +71,13 @@ def _seed(tmp_path):
 
 def _gateway(tmp_path):
     db, media_root = _seed(tmp_path)
+    src = ReplaySource.open(db, media_root)
     clock = ReplayClock()
-    return RawReplayGateway(ReplaySource.open(db, media_root), clock), clock
+    # The seeded fixtures are single-run (no begin_run/run_id involved), so
+    # this is the source's one (legacy-labeled) run — behavior is unchanged
+    # from before per-run scoping.
+    run = src.runs()[0]
+    return RawReplayGateway(src, clock, run), clock
 
 
 @pytest.mark.asyncio
@@ -176,9 +181,10 @@ async def test_doctor_methods_are_not_replayable(tmp_path):
 def test_source_helpers(tmp_path):
     db, media_root = _seed(tmp_path)
     src = ReplaySource.open(db, media_root)
-    assert src.resolve_targets() == ["@durov"]
-    assert src.linked_group_ids() == {555}
-    assert src.has_kind("mediadownload") and not src.has_kind("tme_page")
+    run = src.runs()[0]
+    assert src.resolve_targets(run) == ["@durov"]
+    assert src.linked_group_ids(run) == {555}
+    assert src.has_kind(run, "mediadownload") and not src.has_kind(run, "tme_page")
 
 
 def test_source_is_read_only(tmp_path):
@@ -186,3 +192,49 @@ def test_source_is_read_only(tmp_path):
     src = ReplaySource.open(db, media_root)
     with pytest.raises(sqlite3.OperationalError):
         src.conn.execute("DELETE FROM raw_records")
+
+
+# ---------------------------------------------------------------------------
+# Revision R (ADR-0005): per-run replay — ReplaySource.runs()
+# ---------------------------------------------------------------------------
+
+
+def test_runs_groups_by_run_id_in_capture_order(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("aaa")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        st.begin_run("bbb")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+    src = ReplaySource.open(db, tmp_path / "media")
+    runs = src.runs()
+    assert [(r.run_id, r.lo, r.hi) for r in runs] == [("aaa", 1, 2), ("bbb", 3, 3)]
+
+
+def test_runs_segments_legacy_rows_at_self_markers(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 2), ("legacy-0002", 3, 4),
+    ]
+
+
+def test_runs_mixed_legacy_then_stamped(tmp_path):
+    # Legacy segment(s) precede stamped runs — the migration boundary shape.
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        st.begin_run("ccc")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 2), ("ccc", 3, 4),
+    ]

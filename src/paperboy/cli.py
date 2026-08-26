@@ -22,6 +22,7 @@ from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
 from paperboy.recipes import collect_channel
+from paperboy.replay import ReprojectSourceError
 from paperboy.reproject import ReprojectError
 from paperboy.reproject import reproject as reproject_run
 from paperboy.targets import parse_target
@@ -339,7 +340,7 @@ def reproject(
             summary = asyncio.run(
                 reproject_run(source, out_store, settings, profile, phase_list, log)
             )
-    except ReprojectError as exc:
+    except (ReprojectError, ReprojectSourceError) as exc:
         console.print(f"[red]{exc}[/]")
         out_path.unlink(missing_ok=True)  # don't leave a half-made target behind
         raise typer.Exit(code=1) from None
