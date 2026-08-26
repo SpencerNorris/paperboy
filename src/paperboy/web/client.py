@@ -16,6 +16,7 @@ request. A disallowed host — initial or redirected-to — raises
 
 from __future__ import annotations
 
+from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -30,6 +31,13 @@ _MAX_REDIRECTS = 5
 
 class DisallowedHostError(Exception):
     """Raised for a URL (initial or a redirect target) whose host isn't allow-listed."""
+
+
+class WebGetter(Protocol):
+    """The shape `WebCollector` needs from an HTTP client — satisfied by the
+    real `WebClient` and by `replay.RawReplayWebClient` (spec §4)."""
+
+    def get(self, url: str) -> httpx.Response: ...
 
 
 def _host_of(url: str) -> str:
