@@ -58,6 +58,12 @@ def upsert_channel(
     Writes current state to `channels` and always appends a `channel_snapshots`
     row — snapshots are an observation time series, not deduplicated, so
     counters like `participants_count` can be plotted over time.
+
+    Newest-observation-wins, not last-write-wins (ADR-0005 §6): observations
+    can arrive out of order (a live re-run, or replay processing historical
+    runs one at a time), so current-state columns only move when this
+    observation is at least as new as the stored `last_seen`, while
+    `first_seen`/`last_seen` always widen to the true min/max window.
     """
     id_ = chan["id"]
     uri = channel_uri(id_)
@@ -83,16 +89,31 @@ def upsert_channel(
             first_seen, last_seen
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
-            username=excluded.username,
-            title=excluded.title,
-            about=excluded.about,
-            kind=excluded.kind,
-            linked_chat_id=excluded.linked_chat_id,
-            participants_count=excluded.participants_count,
-            flags_json=excluded.flags_json,
-            restriction_json=excluded.restriction_json,
-            source_raw_id=excluded.source_raw_id,
-            last_seen=excluded.last_seen
+            -- newest-observation-wins (ADR-0005 §6): current-state columns
+            -- only move forward when this observation is at least as new as
+            -- what is stored; the seen window always widens (MIN/MAX below).
+            username = CASE WHEN excluded.last_seen >= channels.last_seen
+                            THEN excluded.username ELSE channels.username END,
+            title = CASE WHEN excluded.last_seen >= channels.last_seen
+                         THEN excluded.title ELSE channels.title END,
+            about = CASE WHEN excluded.last_seen >= channels.last_seen
+                         THEN excluded.about ELSE channels.about END,
+            kind = CASE WHEN excluded.last_seen >= channels.last_seen
+                        THEN excluded.kind ELSE channels.kind END,
+            linked_chat_id = CASE WHEN excluded.last_seen >= channels.last_seen
+                                  THEN excluded.linked_chat_id ELSE channels.linked_chat_id END,
+            participants_count = CASE WHEN excluded.last_seen >= channels.last_seen
+                                      THEN excluded.participants_count
+                                      ELSE channels.participants_count END,
+            flags_json = CASE WHEN excluded.last_seen >= channels.last_seen
+                              THEN excluded.flags_json ELSE channels.flags_json END,
+            restriction_json = CASE WHEN excluded.last_seen >= channels.last_seen
+                                    THEN excluded.restriction_json
+                                    ELSE channels.restriction_json END,
+            source_raw_id = CASE WHEN excluded.last_seen >= channels.last_seen
+                                 THEN excluded.source_raw_id ELSE channels.source_raw_id END,
+            first_seen = MIN(channels.first_seen, excluded.first_seen),
+            last_seen = MAX(channels.last_seen, excluded.last_seen)
         """,
         (
             id_, uri, username, title, about, kind, created_at, linked_chat_id,
