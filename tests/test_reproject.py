@@ -434,3 +434,55 @@ def test_two_run_round_trip_identity(tmp_path, monkeypatch):
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 0, result.output
     assert_round_trip(db1, tmp_path / "default" / "paperboy.reprojected.sqlite")
+
+
+def _seed_backward_backfill_source(db: Path, *, run1_ids: range, run2_ids: range) -> None:
+    """A hand-built raw log matching the real archive's shape (found running
+    the R6 smoke, ADR-0005): two collect passes against the SAME channel,
+    where the second extends a backward backfill FURTHER INTO THE PAST —
+    `run2_ids` entirely below `run1_ids`. This is the ordinary multi-session
+    shape a deep backward backfill takes; it never involves a stamped
+    `run_id`/legacy-marker ambiguity, so it isolates the OTHER bug this
+    revision found: `HistoryCollector`'s live-collection incremental-vs-full
+    state (`sync_state` scopes `history`/`history_sweep`) surviving across
+    REPLAYED runs. `iter_history`, scoped per run (ADR-0005), naturally
+    empties out at each run's OWN rowid boundary — `history.py` reads that
+    as "reached the real end of the channel's history" and marks the sweep
+    complete, which is only true for a LIVE gateway (Telegram's real history
+    can't retroactively grow older messages between sessions, so this
+    couldn't happen live) — leaking that flag into the next run wrongly
+    switches it to incremental-only (ids above the first run's high-water
+    mark), silently dropping every one of its own, all-older messages.
+    """
+    resolve = json.loads(Path("tests/fixtures/tl/resolve_durov.json").read_text())
+    full_channel = json.loads(Path("tests/fixtures/tl/full_channel.json").read_text())
+    with Store.open(db) as st:
+        for run_name, ids in (("run-1", run1_ids), ("run-2", run2_ids)):
+            st.begin_run(run_name)
+            st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
+            st.add_raw(resolve.get("_"), resolve, "stranger", {"target": "@durov"})
+            st.add_raw(full_channel.get("_"), full_channel, "stranger", {"channel_id": 5})
+            for i in ids:
+                st.add_raw(
+                    "message", {"_": "message", "id": i, "message": f"m{i}", "date": 1767322400},
+                    "stranger", {"channel_id": 5},
+                )
+
+
+def test_reproject_does_not_truncate_a_backward_multi_run_backfill(tmp_path, monkeypatch):
+    # Run 1: 150 messages (ids 851..1000, > one page of 100) so it naturally
+    # empties out at ITS OWN rowid boundary after 2 pages. Run 2: 150 OLDER
+    # messages (ids 701..850), also > one page — the bug's failure mode
+    # needs run 2 to span more than one page, or an early "caught up" break
+    # after page 1 would still have captured everything.
+    db = tmp_path / "default" / "paperboy.sqlite"
+    _seed_backward_backfill_source(db, run1_ids=range(851, 1001), run2_ids=range(701, 851))
+    source_ids = set(range(701, 1001))
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
+    reprojected_ids = {r[0] for r in out.execute("SELECT msg_id FROM messages")}
+    out.close()
+    assert reprojected_ids == source_ids
