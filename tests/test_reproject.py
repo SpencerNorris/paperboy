@@ -507,6 +507,75 @@ def test_two_run_round_trip_identity(tmp_path, monkeypatch):
     assert_round_trip(db1, tmp_path / "default" / "paperboy.reprojected.sqlite")
 
 
+def _run1_with_full_peer(fx: dict) -> dict:
+    return {**fx, "full_channel": {
+        **fx["full_channel"],
+        "users": [{"_": "user", "id": 42, "access_hash": 777,
+                   "username": "peer42", "first_name": "Peer"}],
+    }}
+
+
+def _run2_with_min_stub_message(fx: dict) -> dict:
+    # The new message also carries FRESH media (a distinct document, unseen
+    # in run 1) — deliberately, matching `_second_run_fixtures` above: with
+    # no raw-detectable media activity of its own, run 2's media phase would
+    # leave no raw trace at all and reproject's phase detection would skip
+    # it outright, silently sidestepping (not exercising) what this test is
+    # for. It would also spuriously collide with the OTHER, already-tracked
+    # residual this same gap in phase detection causes (ADR-0005 "Residual
+    # #36": a message's media re-scanned across runs without ANY fresh raw
+    # activity in that run produces a `duplicate` custody_log row live has
+    # no way to replay) — a false failure unrelated to this test's actual
+    # subject, peer richness composition.
+    return {**fx, "history": [
+        {
+            "_": "message", "id": 5, "message": "peer42 posts again",
+            "date": 1769322500, "from_id": {"_": "PeerUser", "user_id": 42},
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 88, "access_hash": 1,
+                    "mime_type": "text/plain",
+                    "attributes": [
+                        {"_": "DocumentAttributeFilename", "file_name": "c.txt"}
+                    ],
+                },
+            },
+        },
+        *fx["history"],
+    ], "media": {**fx["media"], 5: b"run 2 fresh bytes"}}
+
+
+def test_two_run_round_trip_preserves_full_peer_over_a_later_min_stub(tmp_path, monkeypatch):
+    """ADR-0005 §6 (amended) R7 Step 4, #33 round 3: a peer observed FULL in
+    run 1 (the `ChatFull` users vector) and only as a `min` author stub in
+    run 2 must reproject with the full profile intact and the seen window
+    widened. This is the real-collector-path companion to
+    `test_upsert_peer_composed_lattice`'s `full_stored-min_incoming` cells —
+    round 2's own two-run gate never actually reached peer projection with a
+    real richness conflict (its second target, `@atom8388`, bailed at
+    resolve with a `SkipAndRecord` before any peer upsert)."""
+    asyncio.run(run_full_collect(tmp_path, mutate_fixtures=_run1_with_full_peer))
+    db1 = asyncio.run(run_full_collect(tmp_path, mutate_fixtures=_run2_with_min_stub_message))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db1, tmp_path / "default" / "paperboy.reprojected.sqlite")
+
+    out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
+    out.row_factory = sqlite3.Row
+    row = out.execute(
+        "SELECT username, first_name, is_min, first_seen, last_seen "
+        "FROM peers WHERE uri='tg:user:42'"
+    ).fetchone()
+    out.close()
+    assert row is not None, "peer 42 (full in run 1) was not projected at all"
+    assert row["username"] == "peer42"
+    assert row["first_name"] == "Peer"
+    assert row["is_min"] == 0  # the richer profile survives the later min stub
+    assert row["last_seen"] > row["first_seen"]  # window widened by run 2's stub
+
+
 def _seed_backward_backfill_source(db: Path, *, run1_ids: range, run2_ids: range) -> None:
     """A hand-built raw log matching the real archive's shape (found running
     the R6 smoke, ADR-0005): two collect passes against the SAME channel,
