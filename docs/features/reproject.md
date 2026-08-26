@@ -88,12 +88,17 @@ recency (a newer observation beats an older one) — because replay does not
 guarantee `observed_at`-order delivery even within one run. The lattice
 itself, cell by cell, is documented in ADR-0005 §6 (amended 2026-08-26) and
 pinned by `tests/test_store_peers.py::test_upsert_peer_composed_lattice`;
-this doc does not restate it. Known residual: the composed merge is not
-associative when a `min` observation's timestamp exceeds two `full`
-observations it is sandwiched between in arrival order — narrowed and
-tracked as [#38](https://github.com/SpencerNorris/paperboy/issues/38), not
-fixed in round 3 (needs a richness-scoped timestamp benchmark distinct from
-`last_seen`, a real design change, not this round's narrow scope).
+this doc does not restate it. Known residuals — the merge is **not** fully
+order-independent in two filed families, both triggered by a `min`
+observation stamped newer than the newest `full` observation of the peer:
+[#38](https://github.com/SpencerNorris/paperboy/issues/38) (a min
+sandwiched between two fulls — *identity* columns diverge by arrival
+order) and [#39](https://github.com/SpencerNorris/paperboy/issues/39)
+(≥1 full — the `source_raw_id` raw-evidence lineage pointer diverges while
+identity converges). Neither is fixed in round 3: closing them needs a
+richness-scoped timestamp benchmark distinct from `last_seen` plus a
+decision on `source_raw_id`'s dual identity-source/provenance-source role —
+real design changes, not that round's narrow scope.
 
 ## CLI
 
@@ -228,11 +233,14 @@ real-archive re-run"):
   round-trip equality contract (D5); it matters only if a reprojected DB is
   swapped in and then live-collected against. Tracked as
   [#37](https://github.com/SpencerNorris/paperboy/issues/37).
-- **The composed peer merge is not associative in one corner** — a `min`
-  observation stamped newer than two `full` observations it lands between
-  can shield the older-stamped-but-newer `full` from applying. See "Peer
-  projection composition" above; tracked as
-  [#38](https://github.com/SpencerNorris/paperboy/issues/38).
+- **The composed peer merge is not fully order-independent in two filed
+  families**, both triggered by a `min` observation stamped newer than the
+  newest `full` observation of the same peer: identity columns diverge in
+  the two-full sandwich
+  ([#38](https://github.com/SpencerNorris/paperboy/issues/38)), and the
+  `source_raw_id` raw-evidence lineage pointer diverges with ≥1 full
+  ([#39](https://github.com/SpencerNorris/paperboy/issues/39)). See "Peer
+  projection composition" above.
 - Deferred (spec §9, deliberately out of scope): an in-place `--force` mode,
   a `--verify`-only mode, incremental reproject of a single phase into an
   existing DB.
