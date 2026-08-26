@@ -700,3 +700,36 @@ were already exact before this fix and remain exact after it — this bug
 never touched those tables' correctness, only which run `media`/`custody_
 log`/`raw_records` rows got attributed to (or dropped from) via the wrong
 segment boundary.
+
+## Round-3 verification (2026-08-26, commits `d5acfd7`..HEAD)
+
+> **Historical record** (2026-08-26). DoD evidence for review round 3 of
+> #33: the ADR-0005 §6 lattice fix, the doc restructure, and the deferred
+> verification round 2's reviewer could not finish (its disk-space
+> casualty).
+
+- **Real-archive smoke re-run** (source md5 `ea97fc2b8ab297c77c2a816e3d3363cf`,
+  byte-unchanged): every count reproduced **digit-for-digit** against the
+  round-2 transcript above — `channel_snapshots` 6→6, `web_snapshots`
+  362→362, `message_metrics` 4020→4020, `messages`/`message_revisions`
+  5496→5496, `message_tombstones` 258→258, `peers` 158→160, `edges`
+  2503→2522, `media` 451→449, `custody_log` 607→599 (the last four exactly
+  as documented above). The `upsert_peer` lattice fix changed **no**
+  archive count — this archive's replay delivers each peer's observations
+  in ascending-stamp order, so the richness-overrides-recency cells never
+  fire differently from plain recency here; the fix matters for the
+  orderings the 8-case table and permutation tests pin.
+- **The 5-mutation battery** (each mutation applied, tested, reverted;
+  suite green before and after):
+
+  | Mutation (reverting) | Killed |
+  |---|---|
+  | `runs()` repeated-role sub-cluster split disabled | `test_runs_splits_consecutive_all_opening_passes`, `test_runs_splits_consecutive_resolve_full_self_passes`, `test_reproject_preserves_every_pass_of_consecutive_channel_only_runs` (3 failed) |
+  | `runs()` foreign-intrusion fold disabled (every cluster commits) | 2 failed in `test_replay_gateway.py` |
+  | zero-target warning demoted below WARNING | `test_reproject_warns_on_a_zero_target_run` |
+  | `_reset_incremental_backfill_state` reverted to blanket `history_sweep` delete | `test_reproject_does_not_truncate_a_backward_multi_run_backfill` |
+  | `upsert_peer` early-branch `first_seen` widening disabled | 5 failed in `test_store_peers.py` |
+
+  Every round-2 regression test is live signal; no mutation survived.
+- Full gates: 408 passed, ruff clean, pyright clean
+  (`TMPDIR=/Volumes/Storage/tmp`, per the round-2 disk-space confounder).
