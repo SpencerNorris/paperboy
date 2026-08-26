@@ -95,21 +95,23 @@ class ReplaySource:
 
     def runs(self) -> list[ReplayRun]:
         """Capture-ordered collect passes (ADR-0005). Stamped rows group by
-        `run_id`; legacy NULL rows are segmented at each `tier='self'` User
-        record — every collect pass's first raw write under the CURRENT
-        collector (`collectors/channel.py` writes self before anything, and
-        the CLI refuses dependent phases without `channel`).
-
-        A real archive can predate that invariant (found running the R6
-        real-archive smoke, ADR-0005): its earliest pass(es) wrote
-        resolve/full BEFORE self. Only the SECOND and later self markers cut
-        a new segment — the first one encountered confirms/continues
-        whatever segment is already open, so any pre-invariant leading rows
-        stay attached to the run they actually belong to instead of forming
-        an orphan segment with no self record (which would then have no
-        target to resolve on replay, silently dropping that run's data).
-        Runs must be contiguous rowid ranges (one sequential process per
-        pass); interleaving means a corrupt source and fails loudly."""
+        `run_id`. Legacy NULL rows are segmented at each collect pass's
+        OPENING CLUSTER — `resolve()`'s `ResolvedPeer`, `getFullChannel()`'s
+        `ChatFull`, and the self `User` record, whatever order the collector
+        version that captured them wrote them in (current code: self first;
+        an archive can predate that invariant and write resolve/full before
+        self — found running the R6 real-archive smoke, where it recurred at
+        EVERY pass boundary throughout the archive's history, not just its
+        first). A new legacy segment starts at the first opening-cluster row
+        seen after at least one substantive (non-opening) row — so however
+        many of the three opening records are present, and in whatever
+        order, they all land in the SAME segment as each other, and that
+        segment is the one they actually belong to rather than being split
+        off as an orphan with no self record or no resolve to replay a
+        target from (both of which would silently drop that run's data on
+        replay). Runs must be contiguous rowid ranges (one sequential
+        process per pass); interleaving means a corrupt source and fails
+        loudly."""
         run_id_expr = "run_id" if self._has_run_id else "NULL AS run_id"
         rows = self.conn.execute(
             f"SELECT id, {run_id_expr}, tier, lower(kind) AS k FROM raw_records ORDER BY id"
@@ -117,7 +119,11 @@ class ReplaySource:
         runs: list[ReplayRun] = []
         current_id: str | None = None
         legacy_n = 0
-        seen_legacy_marker = False
+        # True once a substantive (non-opening-cluster) legacy row has been
+        # seen since the last legacy boundary — arms the next opening-kind
+        # row to cut a new segment. Starts True so the very first row (of
+        # either kind) opens segment 1.
+        awaiting_boundary = True
         lo: int | None = None
         hi: int | None = None
         seen_run_ids: set[str] = set()
@@ -137,12 +143,20 @@ class ReplaySource:
                 boundary = stamped_id != current_id
                 next_id = stamped_id
             else:
-                is_marker = row["tier"] == "self" and (
-                    row["k"] == "user" or row["k"].endswith(".user")
+                k = row["k"]
+                is_opening = (
+                    (row["tier"] == "self" and (k == "user" or k.endswith(".user")))
+                    or k == "resolvedpeer" or k.endswith(".resolvedpeer")
+                    or k == "chatfull" or k.endswith(".chatfull")
                 )
-                boundary = True if is_marker and seen_legacy_marker else current_id is None
-                if is_marker:
-                    seen_legacy_marker = True
+                boundary = current_id is None or (is_opening and awaiting_boundary)
+                if is_opening:
+                    if boundary:
+                        awaiting_boundary = False
+                    # else: another member of the same opening cluster —
+                    # awaiting_boundary is already False, leave it.
+                else:
+                    awaiting_boundary = True
                 if boundary:
                     next_id = f"legacy-{legacy_n + 1:04d}"
                 else:
