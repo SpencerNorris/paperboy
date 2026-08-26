@@ -5,6 +5,7 @@ involved."""
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -222,6 +223,60 @@ def test_runs_segments_legacy_rows_at_self_markers(tmp_path):
     src = ReplaySource.open(db, tmp_path / "media")
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 2), ("legacy-0002", 3, 4),
+    ]
+
+
+def test_runs_handles_a_source_predating_the_run_id_column(tmp_path):
+    # A real archive captured before this feature existed has only
+    # 0001_init/0002_web applied — raw_records has NO run_id column at all
+    # (found running the R6 real-archive smoke, ADR-0005). Every migration up
+    # through 0002 is applied by hand (not via Store.open, which would also
+    # apply 0003 and add the column) to reproduce that exact pre-migration
+    # shape; runs() must treat the whole log as legacy, not crash.
+    db = tmp_path / "pre_migration.sqlite"
+    conn = sqlite3.connect(db)
+    migrations_dir = Path("src/paperboy/store/migrations")
+    conn.executescript((migrations_dir / "0001_init.sql").read_text())
+    conn.executescript((migrations_dir / "0002_web.sql").read_text())
+    conn.execute(
+        "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json) "
+        "VALUES ('user', '2026-01-01T00:00:00+00:00', 'self', NULL, '{}')"
+    )
+    conn.execute(
+        "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json) "
+        "VALUES ('message', '2026-01-01T00:00:01+00:00', 'stranger', "
+        "'{\"channel_id\": 5}', '{\"id\": 1}')"
+    )
+    conn.commit()
+    conn.close()
+
+    src = ReplaySource.open(db, tmp_path / "media")
+    runs = src.runs()
+    assert [(r.run_id, r.lo, r.hi) for r in runs] == [("legacy-0001", 1, 2)]
+
+
+def test_runs_absorbs_leading_rows_written_before_the_first_self_marker(tmp_path):
+    # Found running the R6 real-archive smoke (ADR-0005): a real archive's
+    # earliest collect pass(es) predate the "self written first" invariant —
+    # its first raw writes are resolve/full, THEN self. Only the SECOND and
+    # later self markers may cut a new segment; the first one just confirms
+    # the segment already open, so these leading rows stay attached to the
+    # run they belong to rather than becoming an orphan segment with no self
+    # record (which would have no target to resolve on replay, silently
+    # dropping that whole run).
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                   {"target": "@x"})
+        st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        # A genuinely new pass: its own self marker cuts a real boundary.
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
     ]
 
 

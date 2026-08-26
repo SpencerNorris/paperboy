@@ -68,6 +68,15 @@ class ReplaySource:
     def __init__(self, conn: sqlite3.Connection, media_root: Path) -> None:
         self.conn = conn
         self.media_root = media_root
+        # A real archive captured before this feature existed (ADR-0005) has
+        # only pre-0003 migrations applied — `raw_records` has no `run_id`
+        # column at all yet, not merely NULL values in it. `ReplaySource` is
+        # strictly read-only and never applies migrations to the source, so
+        # `runs()` must fall back to treating the whole log as legacy rather
+        # than querying a column that may not exist.
+        self._has_run_id = any(
+            r[1] == "run_id" for r in conn.execute("PRAGMA table_info(raw_records)")
+        )
 
     @classmethod
     def open(cls, db_path: Path, media_root: Path) -> Self:
@@ -87,17 +96,28 @@ class ReplaySource:
     def runs(self) -> list[ReplayRun]:
         """Capture-ordered collect passes (ADR-0005). Stamped rows group by
         `run_id`; legacy NULL rows are segmented at each `tier='self'` User
-        record — every collect pass's first raw write (`collectors/channel.py`
-        writes self before anything, and the CLI refuses dependent phases
-        without `channel`) — rows before the first marker join the first
-        segment. Runs must be contiguous rowid ranges (one sequential process
-        per pass); interleaving means a corrupt source and fails loudly."""
+        record — every collect pass's first raw write under the CURRENT
+        collector (`collectors/channel.py` writes self before anything, and
+        the CLI refuses dependent phases without `channel`).
+
+        A real archive can predate that invariant (found running the R6
+        real-archive smoke, ADR-0005): its earliest pass(es) wrote
+        resolve/full BEFORE self. Only the SECOND and later self markers cut
+        a new segment — the first one encountered confirms/continues
+        whatever segment is already open, so any pre-invariant leading rows
+        stay attached to the run they actually belong to instead of forming
+        an orphan segment with no self record (which would then have no
+        target to resolve on replay, silently dropping that run's data).
+        Runs must be contiguous rowid ranges (one sequential process per
+        pass); interleaving means a corrupt source and fails loudly."""
+        run_id_expr = "run_id" if self._has_run_id else "NULL AS run_id"
         rows = self.conn.execute(
-            "SELECT id, run_id, tier, lower(kind) AS k FROM raw_records ORDER BY id"
+            f"SELECT id, {run_id_expr}, tier, lower(kind) AS k FROM raw_records ORDER BY id"
         ).fetchall()
         runs: list[ReplayRun] = []
         current_id: str | None = None
         legacy_n = 0
+        seen_legacy_marker = False
         lo: int | None = None
         hi: int | None = None
         seen_run_ids: set[str] = set()
@@ -120,7 +140,9 @@ class ReplaySource:
                 is_marker = row["tier"] == "self" and (
                     row["k"] == "user" or row["k"].endswith(".user")
                 )
-                boundary = is_marker or current_id is None
+                boundary = True if is_marker and seen_legacy_marker else current_id is None
+                if is_marker:
+                    seen_legacy_marker = True
                 if boundary:
                     next_id = f"legacy-{legacy_n + 1:04d}"
                 else:
