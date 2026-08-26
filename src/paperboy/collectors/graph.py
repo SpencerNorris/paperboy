@@ -30,7 +30,6 @@ from paperboy.ids import (
     parse_tme_link,
     user_uri,
     username_uri,
-    utc_now_iso,
     utf16_slice,
 )
 from paperboy.store.edges import add_edge_once
@@ -63,8 +62,8 @@ class GraphCollector:
         await self._collect_recommendations(ctx, counts)
 
         rows = ctx.store.conn.execute(
-            "SELECT channel_id, msg_id, text, entities_json, source_raw_id FROM messages "
-            "WHERE channel_id=? AND entities_json IS NOT NULL",
+            "SELECT channel_id, msg_id, text, entities_json, source_raw_id, first_seen "
+            "FROM messages WHERE channel_id=? AND entities_json IS NOT NULL",
             (ctx.channel_id,),
         ).fetchall()
         mention_edges, invite_hashes = _scan_message_entities(rows)
@@ -84,9 +83,10 @@ class GraphCollector:
             counts["skipped"] += 1
             return
 
-        observed_at = utc_now_iso()
+        observed_at = ctx.clock.for_payload(result)
         raw_id = ctx.store.add_raw(
-            result.get("_", "ChatsSlice"), result, ctx.tier, {"channel_id": ctx.channel_id}
+            result.get("_", "ChatsSlice"), result, ctx.tier, {"channel_id": ctx.channel_id},
+            observed_at=observed_at,
         )
         counts["raw"] += 1
         chats = result.get("chats", [])
@@ -114,11 +114,14 @@ class GraphCollector:
     def _write_mention_edges(
         self,
         ctx: CollectContext,
-        mention_edges: list[tuple[str, str, dict, int | None]],
+        mention_edges: list[tuple[str, str, dict, int | None, str]],
         counts: dict,
     ) -> None:
-        observed_at = utc_now_iso()
-        for subject, object_, evidence, source_raw_id in mention_edges:
+        # `observed_at` here is the message OBSERVATION the mention was found
+        # in (its `first_seen`, D3) — the entity scan itself is RPC-free and
+        # adds no new observation, so it must not stamp "now" (that would make
+        # the edge unreproducible from raw alone on reproject).
+        for subject, object_, evidence, source_raw_id, observed_at in mention_edges:
             if add_edge_once(
                 ctx.store, subject, _MENTIONS, object_, observed_at, ctx.tier, source_raw_id,
                 evidence,
@@ -136,9 +139,10 @@ class GraphCollector:
                 counts["skipped"] += 1
                 continue
 
-            observed_at = utc_now_iso()
+            observed_at = ctx.clock.for_payload(preview)
             raw_id = ctx.store.add_raw(
-                preview.get("_", "ChatInvite"), preview, ctx.tier, {"hash": hash_}
+                preview.get("_", "ChatInvite"), preview, ctx.tier, {"hash": hash_},
+                observed_at=observed_at,
             )
             counts["raw"] += 1
 
@@ -213,16 +217,20 @@ class GraphCollector:
         if kind == "sponsoredmessagesempty":
             return
 
-        observed_at = utc_now_iso()
         subject = channel_uri(ctx.channel_id)
         for sponsored in result.get("messages", []):
+            # Stamped per-message, not once for the envelope: on replay the
+            # envelope itself is synthetic (D4.2 — reconstructed from the
+            # individually-stored SponsoredMessage records), so only the
+            # per-message lookup has a registered clock stamp.
+            observed_at = ctx.clock.for_payload(sponsored)
             # No dedicated table (spec instruction) — raw + edges only. Every
             # sponsored message is raw-logged individually (not just the
             # envelope) so `sponsor_info`/`url`/`title` are each queryable
             # from `raw_records` without re-parsing the batch.
             raw_id = ctx.store.add_raw(
                 sponsored.get("_", "SponsoredMessage"), sponsored, ctx.tier,
-                {"channel_id": ctx.channel_id},
+                {"channel_id": ctx.channel_id}, observed_at=observed_at,
             )
             counts["raw"] += 1
 
@@ -246,16 +254,19 @@ class GraphCollector:
 
 def _scan_message_entities(
     rows: list[sqlite3.Row],
-) -> tuple[list[tuple[str, str, dict, int | None]], dict[str, list[str]]]:
+) -> tuple[list[tuple[str, str, dict, int | None, str]], dict[str, list[str]]]:
     """Walk stored messages' `entities_json` for `MentionName`/`TextUrl`/`Url`
     entities, without any RPC. Returns `(mention_edges, invite_hashes)`:
-    `mention_edges` is `(subject_uri, object_uri, evidence, source_raw_id)`
-    ready for `add_edge` (provenance borrowed from the message's own raw
-    record); `invite_hashes` maps each distinct invite hash found to the
-    list of message URIs that referenced it, for `_collect_invite_previews`
-    to dedupe the `checkChatInvite` RPC by hash rather than by mention.
+    `mention_edges` is `(subject_uri, object_uri, evidence, source_raw_id,
+    observed_at)` ready for `add_edge` (provenance borrowed from the
+    message's own raw record — `observed_at` is the message's own
+    `first_seen`, D3: the scan itself is RPC-free and adds no new
+    observation); `invite_hashes` maps each distinct invite hash found to
+    the list of message URIs that referenced it, for
+    `_collect_invite_previews` to dedupe the `checkChatInvite` RPC by hash
+    rather than by mention.
     """
-    mention_edges: list[tuple[str, str, dict, int | None]] = []
+    mention_edges: list[tuple[str, str, dict, int | None, str]] = []
     invite_hashes: dict[str, list[str]] = {}
 
     for row in rows:
@@ -263,6 +274,7 @@ def _scan_message_entities(
         text = row["text"] or ""
         uri = msg_uri(row["channel_id"], row["msg_id"])
         source_raw_id = row["source_raw_id"]
+        observed_at = row["first_seen"]
 
         for entity in entities:
             kind = (entity.get("_") or "").lower()
@@ -271,12 +283,12 @@ def _scan_message_entities(
                 if user_id is not None:
                     mention_edges.append((
                         uri, user_uri(user_id),
-                        {"entity": "MessageEntityMentionName"}, source_raw_id,
+                        {"entity": "MessageEntityMentionName"}, source_raw_id, observed_at,
                     ))
             elif kind == "messageentitytexturl":
                 _record_link(
                     uri, entity.get("url", ""), "MessageEntityTextUrl", source_raw_id,
-                    mention_edges, invite_hashes,
+                    observed_at, mention_edges, invite_hashes,
                 )
             elif kind == "messageentityurl":
                 offset, length = entity.get("offset"), entity.get("length")
@@ -284,7 +296,8 @@ def _scan_message_entities(
                     continue
                 url = utf16_slice(text, offset, length)
                 _record_link(
-                    uri, url, "MessageEntityUrl", source_raw_id, mention_edges, invite_hashes
+                    uri, url, "MessageEntityUrl", source_raw_id, observed_at,
+                    mention_edges, invite_hashes,
                 )
             # else: MessageEntityMention (bare @name) and every other entity
             # kind (bold, code, custom emoji, ...) carry nothing graph-shaped.
@@ -297,7 +310,8 @@ def _record_link(
     url: str,
     entity_name: str,
     source_raw_id: int | None,
-    mention_edges: list[tuple[str, str, dict, int | None]],
+    observed_at: str,
+    mention_edges: list[tuple[str, str, dict, int | None, str]],
     invite_hashes: dict[str, list[str]],
 ) -> None:
     parsed = parse_tme_link(url)
@@ -306,7 +320,7 @@ def _record_link(
     kind, value = parsed
     object_uri = invite_uri(value) if kind == "invite" else username_uri(value)
     mention_edges.append((
-        subject_uri, object_uri, {"entity": entity_name, "url": url}, source_raw_id,
+        subject_uri, object_uri, {"entity": entity_name, "url": url}, source_raw_id, observed_at,
     ))
     if kind == "invite":
         invite_hashes.setdefault(value, []).append(subject_uri)

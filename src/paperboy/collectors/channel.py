@@ -5,7 +5,7 @@ project it, and prime `ctx` for `history` (and later Phase 2 collectors).
 from __future__ import annotations
 
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import channel_uri, user_uri, utc_now_iso
+from paperboy.ids import channel_uri, user_uri
 from paperboy.store.channels import upsert_channel
 from paperboy.store.edges import add_edge
 from paperboy.store.peers import upsert_peer
@@ -74,7 +74,6 @@ class ChannelCollector:
         return target.is_channel_like
 
     async def collect(self, ctx: CollectContext) -> CollectResult:
-        observed_at = utc_now_iso()
         peer_uris: set[str] = set()
 
         # Learn (and record) the collecting account FIRST, so `is_self` is
@@ -84,20 +83,27 @@ class ChannelCollector:
         # kept (redacted) so provenance can still say which account observed;
         # the id lives in sync_state only, never as a peer row.
         self_user = _redact_self(await ctx.gateway.get_self())
-        ctx.store.add_raw(self_user.get("_", "User"), self_user, "self", None)
+        t_self = ctx.clock.for_payload(self_user)
+        ctx.store.add_raw(
+            self_user.get("_", "User"), self_user, "self", None, observed_at=t_self
+        )
         self_uri = user_uri(self_user["id"])
         set_state(ctx.store, "account", "self", {"uri": self_uri, "id": self_user.get("id")})
 
         resolved = await ctx.gateway.resolve(ctx.target.value)
+        t_resolved = ctx.clock.for_payload(resolved)
         resolve_raw_id = ctx.store.add_raw(
-            resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw}
+            resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw},
+            observed_at=t_resolved,
         )
         chan = _pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
         input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
 
         full = await ctx.gateway.get_full_channel(input_channel)
+        t_full = ctx.clock.for_payload(full)
         full_raw_id = ctx.store.add_raw(
-            full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": chan["id"]}
+            full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": chan["id"]},
+            observed_at=t_full,
         )
         full_chat = full["full_chat"]
         # getFullChannel(input_channel) must answer for the channel we asked
@@ -117,7 +123,7 @@ class ChannelCollector:
 
         channel_id = chan_for_channel["id"]
         channel_uri_ = upsert_channel(
-            ctx.store, full_chat, chan_for_channel, full_raw_id, observed_at
+            ctx.store, full_chat, chan_for_channel, full_raw_id, t_full
         )
 
         set_state(ctx.store, "channel", str(channel_id), {"pts": full_chat["pts"]})
@@ -126,14 +132,16 @@ class ChannelCollector:
         if linked_chat_id:
             add_edge(
                 ctx.store, channel_uri_, "linked_group", channel_uri(linked_chat_id),
-                observed_at, ctx.tier, full_raw_id,
+                t_full, ctx.tier, full_raw_id,
                 {"field": "linked_chat_id"},
             )
 
-        for source_raw_id, payload in ((resolve_raw_id, resolved), (full_raw_id, full)):
+        for source_raw_id, payload, t in (
+            (resolve_raw_id, resolved, t_resolved), (full_raw_id, full, t_full),
+        ):
             for obj in (*payload.get("chats", []), *payload.get("users", [])):
                 uri = upsert_peer(
-                    ctx.store, obj, source_raw_id, observed_at,
+                    ctx.store, obj, source_raw_id, t,
                     seen_in_chat=None, seen_in_msg=None,
                 )
                 if uri is not None:  # None => self, kept out of the store (#12)

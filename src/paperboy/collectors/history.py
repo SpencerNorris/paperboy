@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, peer_ref_uri, utc_now_iso
+from paperboy.ids import msg_uri, peer_ref_uri
 from paperboy.store.edges import add_edge
 from paperboy.store.messages import mark_deleted, upsert_message
 from paperboy.store.peers import upsert_peer
@@ -181,15 +181,19 @@ class HistoryCollector:
         # `_probe_gaps` uses instead, and stop before the peer/edge
         # projection below, which has nothing to project for a placeholder.
         if m.get("_", "").lower() == "messageempty":
-            observed_at = utc_now_iso()
-            ctx.store.add_raw("MessageEmpty", m, ctx.tier, {"channel_id": channel_id})
+            observed_at = ctx.clock.for_payload(m)
+            ctx.store.add_raw(
+                "MessageEmpty", m, ctx.tier, {"channel_id": channel_id},
+                observed_at=observed_at,
+            )
             mark_deleted(ctx.store, channel_id, m["id"], "empty", observed_at)
             counts["tombstones"] += 1
             return
 
-        observed_at = utc_now_iso()
+        observed_at = ctx.clock.for_payload(m)
         raw_id = ctx.store.add_raw(
-            m.get("_", "Message"), m, ctx.tier, {"channel_id": channel_id}
+            m.get("_", "Message"), m, ctx.tier, {"channel_id": channel_id},
+            observed_at=observed_at,
         )
         uri = msg_uri(channel_id, m["id"])
         before = _latest_revision_hash(ctx, uri)
@@ -244,8 +248,11 @@ class HistoryCollector:
             for r in results:
                 if r.get("_", "").lower() != "messageempty":
                     continue
-                observed_at = utc_now_iso()
-                ctx.store.add_raw("MessageEmpty", r, ctx.tier, {"channel_id": channel_id})
+                observed_at = ctx.clock.for_payload(r)
+                ctx.store.add_raw(
+                    "MessageEmpty", r, ctx.tier, {"channel_id": channel_id},
+                    observed_at=observed_at,
+                )
                 mark_deleted(ctx.store, channel_id, r["id"], "empty", observed_at)
                 counts["tombstones"] += 1
 
@@ -303,8 +310,10 @@ class HistoryCollector:
                 if not exc.counts:
                     raise PhaseStop(str(exc), counts=counts) from exc
                 raise
+            t_diff = ctx.clock.for_payload(diff)
             ctx.store.add_raw(
-                diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id}
+                diff.get("_", "ChannelDifference"), diff, ctx.tier, {"channel_id": channel_id},
+                observed_at=t_diff,
             )
 
             if diff.get("_", "").lower() == "channeldifferencetoolong":
@@ -337,7 +346,7 @@ class HistoryCollector:
                     self._observe_message(ctx, channel_id, update["message"], counts)
                 elif kind == "updatedeletechannelmessages":
                     for mid in update.get("messages", []):
-                        mark_deleted(ctx.store, channel_id, mid, "update", utc_now_iso())
+                        mark_deleted(ctx.store, channel_id, mid, "update", t_diff)
                         counts["tombstones"] += 1
 
             new_pts = diff.get("pts", pts)

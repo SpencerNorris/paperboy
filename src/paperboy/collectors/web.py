@@ -19,7 +19,7 @@ import httpx
 
 from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, utc_now_iso
+from paperboy.ids import msg_uri
 from paperboy.store.sync import set_state
 from paperboy.store.web import insert_tme_snapshot, insert_wayback_snapshot
 from paperboy.targets import Target, TargetKind
@@ -157,12 +157,13 @@ class WebCollector:
                 url += f"?before={before_cursor}"
 
             response = self._paced_get(client, url)
-            fetched_at = utc_now_iso()
+            raw_payload = {
+                "url": url, "status_code": response.status_code, "text": response.text,
+            }
+            fetched_at = ctx.clock.for_payload(raw_payload)
             ctx.store.add_raw(
-                "tme_page",
-                {"url": url, "status_code": response.status_code, "text": response.text},
-                ctx.tier,
-                {"channel_username": username},
+                "tme_page", raw_payload, ctx.tier,
+                {"channel_username": username}, observed_at=fetched_at,
             )
 
             if _is_ambiguous_failure(response.status_code):
@@ -249,12 +250,13 @@ class WebCollector:
             f"&output=json&filter=statuscode:200&collapse=digest&limit={_WAYBACK_CDX_LIMIT}"
         )
         response = self._paced_get(client, url)
-        fetched_at = utc_now_iso()
+        raw_payload = {
+            "url": url, "status_code": response.status_code, "text": response.text,
+        }
+        fetched_at = ctx.clock.for_payload(raw_payload)
         ctx.store.add_raw(
-            "wayback_cdx",
-            {"url": url, "status_code": response.status_code, "text": response.text},
-            ctx.tier,
-            {"channel_username": username},
+            "wayback_cdx", raw_payload, ctx.tier,
+            {"channel_username": username}, observed_at=fetched_at,
         )
 
         if _is_ambiguous_failure(response.status_code):
