@@ -83,14 +83,27 @@ class Store:
                 (stem, utc_now_iso()),
             )
 
-    def add_raw(self, kind: str, payload: dict, tier: str, context: dict | None) -> int:
-        """Append one TL object (as `to_dict()`) to the raw log; returns its rowid."""
+    def add_raw(
+        self,
+        kind: str,
+        payload: dict,
+        tier: str,
+        context: dict | None,
+        observed_at: str | None = None,
+    ) -> int:
+        """Append one TL object (as `to_dict()`) to the raw log; returns its rowid.
+
+        `observed_at` is the caller's per-record observation stamp — the same
+        value the caller passes to every projection of this record, so raw and
+        projection agree (spec §5, the reproject clock seam). `None` (legacy
+        callers, tests) stamps now.
+        """
         cur = self.conn.execute(
             "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json) "
             "VALUES (?, ?, ?, ?, ?)",
             (
                 kind,
-                utc_now_iso(),
+                observed_at if observed_at is not None else utc_now_iso(),
                 tier,
                 dumps(context) if context is not None else None,
                 dumps(payload),
