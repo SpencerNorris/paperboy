@@ -1,7 +1,9 @@
 # Feature: `reproject`
 
-**Status:** shipped. **Spec:** `docs/superpowers/specs/2026-08-25-reproject-design.md`.
+**Status:** shipped, including the ADR-0005 run-structure revision (below).
+**Spec:** `docs/superpowers/specs/2026-08-25-reproject-design.md`.
 **Plan:** `docs/superpowers/plans/2026-08-26-reproject.md`.
+**ADR:** `docs/adr/0005-run-structure.md`.
 
 ## Purpose
 
@@ -33,12 +35,47 @@ each message and `catch_up` projects messages nested inside a
 `ChannelDifference` envelope. `ReplayClock` is fed by the replay gateway as it
 serves each raw record.
 
-**Phase auto-detection.** `detect_phases(source)` infers which phases the
-original run(s) executed from which raw *kinds* are present (a source that
-never ran `graph` has no `ChatsSlice`/`ChatInvite*`/`SponsoredMessage` raws,
-so reproject doesn't invent `graph`-only projections it never had) —
-overridable with `--phases`. Detection is currently **source-wide, not
-per-target** — see Known limitations.
+**Phase auto-detection.** `detect_phases(source, run)` infers which phases
+ONE historical run executed from which raw *kinds* it left behind (a run
+that never did `graph` has no `ChatsSlice`/`ChatInvite*`/`SponsoredMessage`
+raws for that run, so reproject doesn't invent `graph`-only projections it
+never had) — overridable with `--phases`. Detection is per-run (ADR-0005),
+not source-wide: a source whose early runs never did `discussion` and whose
+later runs did gets exactly that phase history back.
+
+## Run structure (ADR-0005)
+
+The design above models replay as ONE undifferentiated pass over the whole
+raw log. That is wrong for any archive built from more than one `collect`
+invocation (the ordinary shape — see `docs/adr/0005-run-structure.md` for
+the full diagnosis): per-call-site `_latest()` lookups silently collapse a
+multi-run archive's time series (`channel_snapshots`, `web_snapshots`,
+per-run `custody_log` entries, ...) down to whichever run happened to write
+last.
+
+**`raw_records.run_id`** (migration `0003_run_id.sql`) records which collect
+pass produced each raw record. `Store.begin_run()` mints an opaque id at the
+start of every `collect_channel` call; a source built before this migration
+has `NULL` run_id throughout, and `ReplaySource.runs()` infers pass
+boundaries for those rows from the OPENING CLUSTER every pass writes once —
+`resolve()`'s `ResolvedPeer`, `getFullChannel()`'s `ChatFull`, and the self
+`User` record — in whatever order the collector version that captured them
+used (current code writes self first; older archives predate that and wrote
+resolve/full before self). `reproject` then replays **once per run**:
+`RawReplayGateway`/`RawReplayWebClient` are constructed per run, every query
+scoped to that run's own `raw_records` rowid range, and each run's raw
+`run_id` (or inferred `legacy-NNNN` label) is stamped onto the target store
+via `collect_channel(run_id=...)` — so a reprojected DB carries the same
+pass structure as its source and is itself faithfully re-reprojectable.
+
+`HistoryCollector`'s live-collection incremental-vs-full-sweep bookkeeping
+(`sync_state` scopes `history`/`history_sweep`) is reset before every
+replayed run: under LIVE collection that state legitimately persists across
+re-runs (Telegram's history only grows forward, so "already fully swept" is
+permanent), but under per-run REPLAY a run's own raw window naturally
+running dry is a scope artifact, not a Telegram-side fact — left uncleared,
+that flag wrongly short-circuits a later run's OWN, entirely-older raw
+messages. See `src/paperboy/reproject.py::_reset_incremental_backfill_state`.
 
 ## CLI
 
@@ -118,27 +155,43 @@ excluded (operational/bookkeeping, not projections of raw content).
 
 ## Known limitations
 
-- **Phase detection is source-wide, not per-target.** If one source DB
-  contains raws from more than one resolved target — e.g. two historical
-  `collect` runs against slightly different spellings of the same channel's
-  handle — every target replays the *union* of phases seen anywhere in the
-  source, and (if those targets resolve to the same underlying channel)
-  redundantly re-projects it once per target-spelling. This does not produce
-  *incorrect* rows — every row is a faithful replay of a real historical
-  observation — but it inflates append-only time-series tables
-  (`web_snapshots`, `custody_log`, `message_metrics`, `message_tombstones`)
-  beyond the source's own counts. Found on the real archive (below); tracked
-  as [#35](https://github.com/SpencerNorris/paperboy/issues/35).
-- **A target that no longer resolves to a channel fails cleanly per-target,
-  not silently.** `channel.collect` raises a bare `ValueError` when a
-  resolved peer isn't a channel — the same crash a live `collect` against
-  that target would hit today. Reproject's multi-target loop catches it,
-  logs it, records it as a failed `target` phase in that target's own
-  results table, and continues with the other targets rather than losing
-  every already-committed target's projections to one bad historical entry.
-  The underlying `channel.py` crash-instead-of-skip behavior is itself
-  tracked as [#34](https://github.com/SpencerNorris/paperboy/issues/34)
-  (orthogonal to reproject — it's pre-existing live-collect behavior).
+Two limitations from the first (single-run) implementation are resolved by
+the ADR-0005 run-structure revision:
+
+- ~~Phase detection is source-wide, not per-target~~ — **resolved.** Phase
+  detection and target resolution are now per-run (`detect_phases(source,
+  run)`, `resolve_targets(run)`): two historical `collect` runs against
+  different spellings of the same channel's handle each replay only within
+  their own run(s), so there is no more redundant re-projection of one
+  channel under two target strings. Was
+  [#35](https://github.com/SpencerNorris/paperboy/issues/35).
+- ~~A target that no longer resolves to a channel fails cleanly per-target,
+  not silently~~ — **resolved.** `channel.py`'s `_resolved_channel_id` now
+  raises `SkipAndRecord` for a non-channel resolution (issue
+  [#34](https://github.com/SpencerNorris/paperboy/issues/34)), so it is a
+  normal per-run `channel: skip` phase result — reproject's multi-target
+  `try/except Exception` fallback (still present, for genuinely unexpected
+  failures) is no longer what handles this case.
+
+One residual, narrowed but not closed by this revision:
+
+- **A historical run whose media phase downloaded nothing NEW leaves no raw
+  trace, so its duplicate-custody observations are not reproduced.**
+  `detect_phases`'s `media` inclusion is raw-*kind*-based per run (spec
+  D4.5): a run that only re-encountered media already downloaded by an
+  earlier run writes no `MediaDownload` raw record for it, so reproject
+  correctly infers "media didn't run" for that specific run and skips the
+  phase there — which also means that run's `custody_log` entry (a real,
+  historical observation: "this run saw this file again, attached to this
+  message") never gets replayed. On the real archive (below) this narrows
+  `media`/`custody_log` below the source's counts (`media` 451→293,
+  `custody_log` 607→443) — every row that IS present is correct and
+  complete; nothing beyond a media file's OWN raw trace round-trips.
+  Deliberately not attempted in this revision (fixing it properly means
+  detecting "ran but found nothing new" as distinct from "didn't run" from
+  raw kinds alone, without fabricating custody observations for runs that
+  genuinely never touched media) — tracked as
+  [#36](https://github.com/SpencerNorris/paperboy/issues/36).
 - Deferred (spec §9, deliberately out of scope): an in-place `--force` mode,
   a `--verify`-only mode, incremental reproject of a single phase into an
   existing DB.
@@ -268,3 +321,171 @@ above). The underlying `channel.py` crash-instead-of-skip behavior is
 tracked separately as [#34](https://github.com/SpencerNorris/paperboy/issues/34)
 — orthogonal to reproject, since it's a live-collect defect this smoke test
 happened to surface, not something reproject's replay introduced.
+
+---
+
+## ADR-0005 revision — multi-run real-archive smoke (2026-08-26)
+
+The transcript above pins the FIRST implementation, which modeled replay as
+one undifferentiated pass over the whole raw log (`_latest()` per call
+site). Re-running it against the same real `default` archive after that
+implementation landed is what surfaced #35 and #36's evidence and the
+`channel_snapshots`/`web_snapshots`/`message_metrics` collapse the ADR-0005
+run-structure redesign exists to fix (`docs/adr/0005-run-structure.md`).
+This section pins the run-scoped replay instead: `reproject` now replays
+**once per historical run**, with `ReplaySource.runs()` segmenting this
+archive's raw log (captured entirely before migration `0003_run_id`, so
+every boundary is inferred, not stamped) into 7 legacy runs.
+
+Same guardrails as before: source opened read-only throughout, `--out`
+pointed outside the profile directory, no network/keychain access (asserted
+by the guardrail tests; consistent with total runtime for ~6,500 raw
+records / ~5,500 messages, which real Telegram pacing could not match).
+
+```
+$ PAPERBOY_DATA_DIR=.../data uv run paperboy reproject --profile default --out /tmp/reprojected.sqlite
+▶ channel
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=543 revisions=543 tombstones=258 edges=238 · 1s
+▶ graph
+  graph invite preview skipped for LS-77p_pVyRiZDRk: replay: no ChatInvite recorded for hash 'LS-77p_pVyRiZDRk'
+✓ graph · edges=120 peers=21 raw=5 skipped=1 · 0s
+▶ web
+  web: wayback CDX returned HTTP 429 for national_resistance_movement — reporting failure, not zero
+✓ web · tme_posts=362 deleted_recovered=0 wayback_failed=429 · 0s
+▶ media
+  media: skipping msg 413: replay: media file missing for sha b006ec25...
+  media: skipping msg 414: replay: media file missing for sha 295dbde0...
+✓ media · downloaded=150 duplicates=0 unavailable=302 skipped_kind=27 skipped=2 · 7s
+▶ channel                                          [run 2, same target spelling]
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=0 revisions=0 tombstones=0 edges=0 · 0s
+▶ media
+✓ media · downloaded=143 duplicates=150 unavailable=161 skipped_kind=27 skipped=0 · 7s
+
+  reproject @national_resistance_movement -> /tmp/reprojected.sqlite
+  [2-row table: run 1's channel/history/graph/web/media, run 2's channel/history/media]
+
+▶ channel                                          [run 3: @atom8388]
+⏹ channel · skip · 0s
+  phase channel skipped: replay: no self User recorded
+▶ history
+⏹ history · phase_stop · 0s
+▶ media
+⏹ media · phase_stop · 0s
+
+  reproject @atom8388 -> /tmp/reprojected.sqlite
+  [clean per-run skip — NOT an error row this time; #34's fix (below)]
+
+▶ channel                                          [runs 4-7: 'national_resistance_movement', no leading @]
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=0 revisions=0 tombstones=0 edges=0 · 0s
+▶ discussion
+✓ discussion · messages=300 revisions=300 tombstones=0 edges=256 backfilled_peers=31 unmapped=6 · 2s
+[... 3 more channel/history/discussion blocks: 300, 1200, 3153 discussion messages ...]
+
+  reproject national_resistance_movement -> /tmp/reprojected.sqlite
+  [4-row table, one per run]
+
+     row counts — source vs reprojected
+┌────────────────────┬────────┬─────────────┐
+│ table               │ source │ reprojected │
+├────────────────────┼────────┼─────────────┤
+│ raw_records         │ 6258   │ 6104        │
+│ channels            │ 1      │ 1           │
+│ channel_snapshots   │ 6      │ 6           │
+│ peers               │ 158    │ 160         │
+│ messages            │ 5496   │ 5496        │
+│ message_revisions   │ 5496   │ 5496        │
+│ message_metrics     │ 4020   │ 4020        │
+│ message_tombstones  │ 258    │ 258         │
+│ edges               │ 2503   │ 2522        │
+│ media               │ 451    │ 293         │
+│ custody_log         │ 607    │ 443         │
+│ web_snapshots       │ 362    │ 362         │
+└────────────────────┴────────┴─────────────┘
+```
+
+**Segmentation.** `run_events` (a manual cross-check only, per ADR-0005 —
+it's a projection-side table, not raw) shows 6 `channel: complete` events;
+`ReplaySource.runs()` found 7 legacy segments. The extra one is `@atom8388`
+(run 3) — its channel phase never completed live (`ChannelPrivateError` or
+similar; the archive's `ResolvedPeer` for it is the only trace), so it never
+wrote a `channel: complete` event, but it IS its own genuine historical
+collect pass and correctly gets its own run.
+
+**The ADR's headline payoff, confirmed exactly:** `channel_snapshots` (6→6),
+`web_snapshots` (362→362), and `message_metrics` (4020→4020) all now
+round-trip **exactly** — these are the three tables that collapsed under
+the single-pass design (6→2, 362→724, 4020→4186 in the first transcript
+above). `messages`/`message_revisions` also match exactly (5496/5496).
+
+**Round-1's payoffs still hold:** `channels.flags_json` still corrects from
+the source's 10 pre-#20-fix flags to the full 48-flag set current code
+captures; the source's one pre-#12 self peer row still projects to zero in
+the reprojected copy (same verification queries as the first transcript,
+against `/tmp/reprojected.sqlite` from this run — unchanged, omitted here).
+
+**`@atom8388` now shows as a clean per-run skip, not an error row** — #34's
+fix (`_resolved_channel_id` raises `SkipAndRecord`, not a bare `ValueError`)
+landed in this revision (Task R4) and is exercised directly by the real
+archive: no ERROR line, no `stopped="error: ..."` row, just an ordinary
+`channel: skip` result like a live `collect` against a private/deleted
+target would produce.
+
+**`peers`/`edges` are up slightly** (158→160, 2503→2522) — the same kind of
+"current code corrects old code's projections" delta round 1 documented, not
+a defect; every extra row is a legitimate current-projection fact the
+original archive's older collector code didn't capture.
+
+**`media`/`custody_log`/`raw_records` are the #36 residual** (see Known
+limitations): 293/443/6104 vs the source's 451/607/6258. Every row present
+is a faithful replay; what's missing is the custody trail for media a LATER
+historical run re-observed as already-downloaded (no gateway call, so no
+raw trace for a future replay to iterate over) — deliberately not attempted
+in this revision.
+
+### Two bugs found and fixed by this smoke test (no-shed)
+
+Both were caught by re-running this exact command against the real archive
+BEFORE committing the run-structure implementation — the round-trip test
+battery's synthetic fixtures did not happen to exercise either shape.
+
+**1. Legacy run segmentation orphaned a real archive's pre-invariant leading
+rows, dropping whole runs.** `ReplaySource.runs()` infers legacy (pre-`0003_
+run_id`) run boundaries from the `tier='self'` marker every collect pass
+writes first — but THIS archive's earliest collector code wrote
+`resolve()`/`getFullChannel()` BEFORE `self`, and that ordering recurred at
+EVERY historical pass boundary, not just the first. The initial fix (cut a
+boundary at every self marker except the very first) still left every run's
+own leading `ResolvedPeer`/`ChatFull` attached to the PRECEDING run instead
+of the one they actually opened — silently dropping the archive's single
+largest run (3154 of 6258 raw records, discovered as `raw_records` /
+`messages` undercounting by roughly that amount on the first re-run).
+Fixed by anchoring a new legacy segment on the first row of the whole
+OPENING CLUSTER (`ResolvedPeer`/`ChatFull`/self, in whatever order) seen
+after at least one substantive row, so all three land together in the run
+they belong to regardless of order. Pinned by
+`tests/test_replay_gateway.py::test_runs_absorbs_resolve_before_self_at_every_boundary`.
+
+**2. `HistoryCollector`'s incremental-sync state leaked across replayed
+runs, silently dropping a later run's own older messages.** `iter_history`
+is scoped to one run's raw window (by design, ADR-0005) — so it naturally
+runs out the moment that window is exhausted, and `history.py` reads that as
+"reached the real end of the channel's history," persisting
+`backfill_complete=True`. That is correct for a LIVE gateway (Telegram's
+history only grows forward). Left uncleared across REPLAYED runs, it wrongly
+switches the NEXT run to incremental-only (ids above the previous run's
+high-water mark) — and a real multi-session backward backfill (this
+archive's discussion group: msg-id bands 26955–34977, then 4525–26954, then
+3220–4524, then 1–3219, each a separate historical run extending further
+into the past) is exactly the shape that trips it, since every subsequent
+run's messages are entirely BELOW the high-water mark. Fixed by clearing the
+`history`/`history_sweep` `sync_state` scopes before every replayed run —
+free under replay (no network, no rate limit to economize on), and safe
+because idempotent projection upserts make any resulting re-processing of
+already-seen messages harmless. Pinned by
+`tests/test_reproject.py::test_reproject_does_not_truncate_a_backward_multi_run_backfill`.
