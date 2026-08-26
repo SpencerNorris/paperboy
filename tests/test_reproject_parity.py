@@ -156,17 +156,32 @@ async def run_full_collect(
 
 def dump_db(conn, data_dir: Path, tables=PARITY_TABLES) -> dict[str, list]:
     """Canonical dump: per table, sorted rows as column->value dicts, with the
-    machine-specific data_dir prefix normalized out of path-bearing values."""
+    machine-specific data_dir prefix normalized out of path-bearing values.
+
+    `raw_records.run_id` (ADR-0005) is a random uuid4 hex per process, so it
+    is normalized to `run-0001`, `run-0002`, ... in order of first appearance
+    (by raw rowid) — otherwise the golden would be non-reproducible.
+    """
     prefix = str(data_dir)
+    run_ids: dict[str, str] = {}
+
+    def _norm_run_id(v: str | None) -> str | None:
+        if v is None:
+            return None
+        return run_ids.setdefault(v, f"run-{len(run_ids) + 1:04d}")
+
     out: dict[str, list] = {}
     for table in tables:
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
         rows = []
-        for row in conn.execute(f"SELECT * FROM {table}"):
+        query = f"SELECT * FROM {table}" + (" ORDER BY id" if table == "raw_records" else "")
+        for row in conn.execute(query):
             d = {
                 c: (v.replace(prefix, "<DATA_DIR>") if isinstance(v, str) else v)
                 for c, v in zip(cols, row, strict=True)
             }
+            if table == "raw_records":
+                d["run_id"] = _norm_run_id(d["run_id"])
             rows.append(d)
         out[table] = sorted(rows, key=lambda d: json.dumps(d, sort_keys=True, default=str))
     return out
