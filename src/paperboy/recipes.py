@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
+from paperboy.clock import LiveClock
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.discussion import DiscussionCollector
@@ -35,6 +36,7 @@ from paperboy.progress import Progress
 from paperboy.store.events import record_run_event
 
 if TYPE_CHECKING:
+    from paperboy.clock import Clock
     from paperboy.collectors.base import Collector
     from paperboy.config import Settings
     from paperboy.gateway import Gateway
@@ -107,6 +109,8 @@ async def collect_channel(
     media: bool = False,
     web: bool = False,
     profile: str = "default",
+    clock: Clock | None = None,
+    run_id: str | None = None,
 ) -> list[CollectResult]:
     """Run `channel`, then `history` (+ its `catch_up`), then `graph`, against `target`.
 
@@ -117,9 +121,19 @@ async def collect_channel(
     for `media`'s content-addressed download path. `collectors` overrides the
     default active list entirely — used by tests to inject a stub that raises
     `HardStop`/`PhaseStop`/`SkipAndRecord` without needing a real gateway
-    failure to trigger one.
+    failure to trigger one. `clock` (default `LiveClock()`) is where every
+    projection's `observed_at` comes from — `reproject` passes a `ReplayClock`
+    fed by the replay gateway so timestamps are reproduced from raw (spec §5).
+    `run_id` (ADR-0005) marks every raw record this call writes as belonging
+    to one collect pass — `None` (live callers) mints a fresh opaque id;
+    `reproject` passes the SOURCE run's id so a reprojected DB carries the
+    same pass boundaries and is itself re-reprojectable.
     """
-    ctx = CollectContext(gateway, store, settings, target, None, None, "stranger", log, profile)
+    store.begin_run(run_id)
+    ctx = CollectContext(
+        gateway, store, settings, target, None, None, "stranger", log, profile,
+        clock or LiveClock(),
+    )
     include_media = media or (phases is not None and "media" in phases)
     include_web = web or (phases is not None and "web" in phases)
     active = collectors if collectors is not None else _default_collectors(

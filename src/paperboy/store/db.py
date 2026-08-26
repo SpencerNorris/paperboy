@@ -25,6 +25,7 @@ from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Self
+from uuid import uuid4
 
 from paperboy.ids import to_iso, utc_now_iso
 
@@ -54,6 +55,7 @@ class Store:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
+        self._run_id: str | None = None
 
     @classmethod
     def open(cls, path: Path) -> Self:
@@ -83,17 +85,42 @@ class Store:
                 (stem, utc_now_iso()),
             )
 
-    def add_raw(self, kind: str, payload: dict, tier: str, context: dict | None) -> int:
-        """Append one TL object (as `to_dict()`) to the raw log; returns its rowid."""
+    def begin_run(self, run_id: str | None = None) -> str:
+        """Mark the start of one collect pass (ADR-0005): every subsequent
+        `add_raw` carries this id, so replay can reconstruct pass boundaries.
+        Replay injects the SOURCE run's id, making a reprojected DB itself
+        re-reprojectable; live runs take a fresh opaque id."""
+        self._run_id = run_id if run_id is not None else uuid4().hex
+        return self._run_id
+
+    def add_raw(
+        self,
+        kind: str,
+        payload: dict,
+        tier: str,
+        context: dict | None,
+        observed_at: str | None = None,
+    ) -> int:
+        """Append one TL object (as `to_dict()`) to the raw log; returns its rowid.
+
+        `observed_at` is the caller's per-record observation stamp — the same
+        value the caller passes to every projection of this record, so raw and
+        projection agree (spec §5, the reproject clock seam). `None` (legacy
+        callers, tests) stamps now. `run_id` (ADR-0005) is whatever
+        `begin_run` last set — `None` until a run is begun, which is how
+        legacy pre-migration rows and any caller that skips `begin_run` stay
+        NULL, distinguishable from a stamped run at replay time.
+        """
         cur = self.conn.execute(
-            "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 kind,
-                utc_now_iso(),
+                observed_at if observed_at is not None else utc_now_iso(),
                 tier,
                 dumps(context) if context is not None else None,
                 dumps(payload),
+                self._run_id,
             ),
         )
         assert cur.lastrowid is not None

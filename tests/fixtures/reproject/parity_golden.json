@@ -1,0 +1,525 @@
+{
+ "channel_snapshots": [
+  {
+   "about_hash": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+   "channel_id": 5,
+   "id": 1,
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "online_count": null,
+   "participants_count": 100,
+   "source_raw_id": 3,
+   "title": "Durov",
+   "username": "durov"
+  }
+ ],
+ "channels": [
+  {
+   "about": "x",
+   "created_at": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "flags_json": "{\"broadcast\": true}",
+   "id": 5,
+   "kind": "broadcast",
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "linked_chat_id": null,
+   "participants_count": 100,
+   "restriction_json": null,
+   "source_raw_id": 3,
+   "title": "Durov",
+   "uri": "tg:channel:5",
+   "username": "durov"
+  }
+ ],
+ "custody_log": [
+  {
+   "id": 1,
+   "path": "<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
+   "recorded_at": "2026-01-01T00:00:00+00:00",
+   "sha256": "7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd",
+   "source_message_uri": "tg:msg:5/2"
+  }
+ ],
+ "edges": [
+  {
+   "evidence_json": "{\"entity\": \"MessageEntityUrl\", \"url\": \"https://t.me/other_chann\"}",
+   "id": 3,
+   "object_uri": "tg:username:other_chann",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "predicate": "mentions",
+   "source_raw_id": 4,
+   "subject_uri": "tg:msg:5/3",
+   "tier": "stranger"
+  },
+  {
+   "evidence_json": "{\"source\": \"sponsored\", \"sponsor_info\": \"Acme Corp\", \"title\": \"Sponsor Title\", \"url\": \"https://t.me/sponsorchannel\"}",
+   "id": 4,
+   "object_uri": "tg:username:sponsorchannel",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "predicate": "mentions",
+   "source_raw_id": 10,
+   "subject_uri": "tg:channel:5",
+   "tier": "stranger"
+  },
+  {
+   "evidence_json": "{\"total_count\": 37}",
+   "id": 1,
+   "object_uri": "tg:channel:501",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "predicate": "recommended_with",
+   "source_raw_id": 9,
+   "subject_uri": "tg:channel:5",
+   "tier": "stranger"
+  },
+  {
+   "evidence_json": "{\"total_count\": 37}",
+   "id": 2,
+   "object_uri": "tg:channel:502",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "predicate": "recommended_with",
+   "source_raw_id": 9,
+   "subject_uri": "tg:channel:5",
+   "tier": "stranger"
+  }
+ ],
+ "media": [
+  {
+   "attributes_json": "[{\"_\": \"DocumentAttributeFilename\", \"file_name\": \"a.txt\"}]",
+   "downloaded_at": "2026-01-01T00:00:00+00:00",
+   "exif_json": null,
+   "file_name": "a.txt",
+   "kind": "document",
+   "message_uri": "tg:msg:5/2",
+   "mime_type": "text/plain",
+   "path": "<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
+   "sha256": "7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd",
+   "size": 13
+  }
+ ],
+ "message_metrics": [
+  {
+   "forwards": null,
+   "id": 1,
+   "message_uri": "tg:msg:5/3",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "reactions_json": null,
+   "replies": null,
+   "views": 10
+  }
+ ],
+ "message_revisions": [
+  {
+   "content_hash": "b8383b252cc26516dbeb87c69fe748e07f993ebfba2a96ccfeabd21e63fcd906",
+   "edit_date": null,
+   "entities_json": "[{\"_\": \"MessageEntityUrl\", \"length\": 24, \"offset\": 4}]",
+   "id": 1,
+   "media_json": null,
+   "message_uri": "tg:msg:5/3",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "source_raw_id": 4,
+   "text": "see https://t.me/other_channel"
+  },
+  {
+   "content_hash": "c9a6f3d62c0fc4d3d70b0a279e52e404ba7ebd44de82f7ad784a89800f09e322",
+   "edit_date": null,
+   "entities_json": null,
+   "id": 3,
+   "media_json": null,
+   "message_uri": "tg:msg:5/1",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "source_raw_id": 6,
+   "text": "m1"
+  },
+  {
+   "content_hash": "d9b8e2f1d655c91e6216db7882860bd91daf169c58790140aa5f7e2231232e75",
+   "edit_date": null,
+   "entities_json": null,
+   "id": 2,
+   "media_json": "{\"_\": \"MessageMediaDocument\", \"document\": {\"_\": \"Document\", \"access_hash\": 1, \"attributes\": [{\"_\": \"DocumentAttributeFilename\", \"file_name\": \"a.txt\"}], \"id\": 9, \"mime_type\": \"text/plain\"}}",
+   "message_uri": "tg:msg:5/2",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "source_raw_id": 5,
+   "text": ""
+  },
+  {
+   "content_hash": "dda82ba9e87abca05597a883a3bf57a79e24f9ea42cb75a8f34f3fce2ab051ea",
+   "edit_date": "2026-01-02T02:56:40+00:00",
+   "entities_json": null,
+   "id": 4,
+   "media_json": null,
+   "message_uri": "tg:msg:5/1",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "source_raw_id": 8,
+   "text": "m1 edited"
+  }
+ ],
+ "message_tombstones": [],
+ "messages": [
+  {
+   "action_json": null,
+   "channel_id": 5,
+   "content_hash": "b8383b252cc26516dbeb87c69fe748e07f993ebfba2a96ccfeabd21e63fcd906",
+   "date": "2026-01-02T02:55:00+00:00",
+   "deleted_at": null,
+   "edit_date": null,
+   "entities_json": "[{\"_\": \"MessageEntityUrl\", \"length\": 24, \"offset\": 4}]",
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "from_uri": null,
+   "fwd_json": null,
+   "grouped_id": null,
+   "is_service": 0,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "media_json": null,
+   "media_kind": null,
+   "msg_id": 3,
+   "post_author": null,
+   "reply_to_msg_id": null,
+   "reply_to_top_id": null,
+   "source_raw_id": 4,
+   "text": "see https://t.me/other_channel",
+   "uri": "tg:msg:5/3",
+   "via_bot_id": null
+  },
+  {
+   "action_json": null,
+   "channel_id": 5,
+   "content_hash": "d9b8e2f1d655c91e6216db7882860bd91daf169c58790140aa5f7e2231232e75",
+   "date": "2026-01-02T02:54:05+00:00",
+   "deleted_at": null,
+   "edit_date": null,
+   "entities_json": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "from_uri": null,
+   "fwd_json": null,
+   "grouped_id": null,
+   "is_service": 0,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "media_json": "{\"_\": \"MessageMediaDocument\", \"document\": {\"_\": \"Document\", \"access_hash\": 1, \"attributes\": [{\"_\": \"DocumentAttributeFilename\", \"file_name\": \"a.txt\"}], \"id\": 9, \"mime_type\": \"text/plain\"}}",
+   "media_kind": "MessageMediaDocument",
+   "msg_id": 2,
+   "post_author": null,
+   "reply_to_msg_id": null,
+   "reply_to_top_id": null,
+   "source_raw_id": 5,
+   "text": "",
+   "uri": "tg:msg:5/2",
+   "via_bot_id": null
+  },
+  {
+   "action_json": null,
+   "channel_id": 5,
+   "content_hash": "dda82ba9e87abca05597a883a3bf57a79e24f9ea42cb75a8f34f3fce2ab051ea",
+   "date": "2026-01-02T02:53:20+00:00",
+   "deleted_at": null,
+   "edit_date": "2026-01-02T02:56:40+00:00",
+   "entities_json": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "from_uri": null,
+   "fwd_json": null,
+   "grouped_id": null,
+   "is_service": 0,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "media_json": null,
+   "media_kind": null,
+   "msg_id": 1,
+   "post_author": null,
+   "reply_to_msg_id": null,
+   "reply_to_top_id": null,
+   "source_raw_id": 8,
+   "text": "m1 edited",
+   "uri": "tg:msg:5/1",
+   "via_bot_id": null
+  }
+ ],
+ "peers": [
+  {
+   "access_hash": 1001,
+   "first_name": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "flags_json": "{\"broadcast\": true}",
+   "id": 501,
+   "is_min": 0,
+   "kind": "channel",
+   "last_name": null,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "seen_in_chat": null,
+   "seen_in_msg": null,
+   "source_raw_id": 9,
+   "title": "Similar One",
+   "uri": "tg:channel:501",
+   "username": "similarone"
+  },
+  {
+   "access_hash": 1002,
+   "first_name": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "flags_json": "{\"broadcast\": true}",
+   "id": 502,
+   "is_min": 0,
+   "kind": "channel",
+   "last_name": null,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "seen_in_chat": null,
+   "seen_in_msg": null,
+   "source_raw_id": 9,
+   "title": "Similar Two",
+   "uri": "tg:channel:502",
+   "username": "similartwo"
+  },
+  {
+   "access_hash": 99,
+   "first_name": null,
+   "first_seen": "2026-01-01T00:00:00+00:00",
+   "flags_json": "{\"broadcast\": true}",
+   "id": 5,
+   "is_min": 0,
+   "kind": "channel",
+   "last_name": null,
+   "last_seen": "2026-01-01T00:00:00+00:00",
+   "seen_in_chat": null,
+   "seen_in_msg": null,
+   "source_raw_id": 3,
+   "title": "Durov",
+   "uri": "tg:channel:5",
+   "username": "durov"
+  }
+ ],
+ "raw_records": [
+  {
+   "context_json": "{\"channel_id\": 5, \"msg_id\": 2}",
+   "id": 14,
+   "kind": "MediaDownload",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"file_name\": \"a.txt\", \"kind\": \"document\", \"message_uri\": \"tg:msg:5/2\", \"mime_type\": \"text/plain\", \"path\": \"<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt\", \"sha256\": \"7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd\", \"size\": 13}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 10,
+   "kind": "SponsoredMessage",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"SponsoredMessage\", \"additional_info\": \"Promoted\", \"button_text\": \"View\", \"message\": \"Check this out\", \"random_id\": \"AAAAAAAA\", \"sponsor_info\": \"Acme Corp\", \"title\": \"Sponsor Title\", \"url\": \"https://t.me/sponsorchannel\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 3,
+   "kind": "messages.chatFull",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"messages.chatFull\", \"chats\": [{\"_\": \"channel\", \"access_hash\": 99, \"broadcast\": true, \"id\": 5, \"title\": \"Durov\", \"username\": \"durov\"}], \"full_chat\": {\"_\": \"channelFull\", \"about\": \"x\", \"id\": 5, \"linked_chat_id\": 0, \"participants_count\": 100, \"pts\": 42}, \"users\": []}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 4,
+   "kind": "message",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"message\", \"date\": 1767322500, \"entities\": [{\"_\": \"MessageEntityUrl\", \"length\": 24, \"offset\": 4}], \"id\": 3, \"message\": \"see https://t.me/other_channel\", \"views\": 10}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 5,
+   "kind": "message",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"message\", \"date\": 1767322445, \"id\": 2, \"media\": {\"_\": \"MessageMediaDocument\", \"document\": {\"_\": \"Document\", \"access_hash\": 1, \"attributes\": [{\"_\": \"DocumentAttributeFilename\", \"file_name\": \"a.txt\"}], \"id\": 9, \"mime_type\": \"text/plain\"}}, \"message\": \"\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 6,
+   "kind": "message",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"message\", \"date\": 1767322400, \"id\": 1, \"message\": \"m1\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 7,
+   "kind": "updates.channelDifference",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"updates.channelDifference\", \"final\": true, \"new_messages\": [{\"_\": \"message\", \"date\": 1767322400, \"edit_date\": 1767322600, \"id\": 1, \"message\": \"m1 edited\"}], \"other_updates\": [], \"pts\": 43}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 8,
+   "kind": "message",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"message\", \"date\": 1767322400, \"edit_date\": 1767322600, \"id\": 1, \"message\": \"m1 edited\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 9,
+   "kind": "ChatsSlice",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"ChatsSlice\", \"chats\": [{\"_\": \"Channel\", \"access_hash\": 1001, \"broadcast\": true, \"id\": 501, \"title\": \"Similar One\", \"username\": \"similarone\"}, {\"_\": \"Channel\", \"access_hash\": 1002, \"broadcast\": true, \"id\": 502, \"title\": \"Similar Two\", \"username\": \"similartwo\"}], \"count\": 37}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_username\": \"durov\"}",
+   "id": 11,
+   "kind": "tme_page",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body>\\n<div class=\\\"tgme_widget_message\\\" data-post=\\\"durov/1\\\">\\n  <div class=\\\"tgme_widget_message_text\\\">m1</div>\\n  <time datetime=\\\"2026-01-01T00:00:00+00:00\\\"></time>\\n</div>\\n</body></html>\", \"url\": \"https://t.me/s/durov\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_username\": \"durov\"}",
+   "id": 12,
+   "kind": "tme_page",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body></body></html>\", \"url\": \"https://t.me/s/durov?before=1\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_username\": \"durov\"}",
+   "id": 13,
+   "kind": "wayback_cdx",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"status_code\": 200, \"text\": \"[[\\\"urlkey\\\", \\\"timestamp\\\", \\\"original\\\", \\\"mimetype\\\", \\\"statuscode\\\", \\\"digest\\\", \\\"length\\\"], [\\\"me,t)/s/durov\\\", \\\"20260101000000\\\", \\\"https://t.me/s/durov\\\", \\\"text/html\\\", \\\"200\\\", \\\"DIGEST1\\\", \\\"1234\\\"]]\", \"url\": \"https://web.archive.org/cdx/search/cdx?url=t.me/s/durov*&output=json&filter=statuscode:200&collapse=digest&limit=10000\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"target\": \"@durov\"}",
+   "id": 2,
+   "kind": "contacts.resolvedPeer",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"contacts.resolvedPeer\", \"chats\": [{\"_\": \"channel\", \"access_hash\": 99, \"broadcast\": true, \"id\": 5, \"title\": \"Durov\", \"username\": \"durov\"}], \"peer\": {\"_\": \"PeerChannel\", \"channel_id\": 5}, \"users\": []}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": null,
+   "id": 1,
+   "kind": "user",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"user\", \"id\": 1, \"self\": true}",
+   "run_id": "run-0001",
+   "tier": "self"
+  }
+ ],
+ "run_events": [
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"backfilled_peers\": 0, \"edges\": 0, \"messages\": 0, \"revisions\": 0, \"tombstones\": 0, \"unmapped\": 0}, \"stopped\": \"no linked discussion group\"}",
+   "id": 3,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "discussion"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"channels\": 1, \"peers\": 1}, \"stopped\": null}",
+   "id": 1,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "channel"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"deleted_recovered\": 0, \"tme_posts\": 1, \"wayback_rows\": 1}, \"stopped\": null}",
+   "id": 5,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "web"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"downloaded\": 1, \"duplicates\": 0, \"skipped\": 0, \"skipped_kind\": 0, \"unavailable\": 0}, \"stopped\": null}",
+   "id": 6,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "media"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"edges\": 0, \"messages\": 4, \"revisions\": 4, \"tombstones\": 0}, \"stopped\": null}",
+   "id": 2,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "history"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"edges\": 4, \"peers\": 2, \"raw\": 2, \"skipped\": 0}, \"stopped\": null}",
+   "id": 4,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "graph"
+  }
+ ],
+ "sync_ranges": [
+  {
+   "channel_id": 5,
+   "hi": 3,
+   "id": 1,
+   "lo": 1
+  }
+ ],
+ "sync_state": [
+  {
+   "key": "5",
+   "scope": "channel",
+   "value_json": "{\"pts\": 43}"
+  },
+  {
+   "key": "5",
+   "scope": "history",
+   "value_json": "{\"offset_id\": 1}"
+  },
+  {
+   "key": "5",
+   "scope": "history_sweep",
+   "value_json": "{\"backfill_complete\": true, \"incremental_in_progress\": false, \"max_id_seen\": 3, \"pending_high\": 3}"
+  },
+  {
+   "key": "durov",
+   "scope": "web_tme",
+   "value_json": "{\"newest_seen\": 1}"
+  },
+  {
+   "key": "self",
+   "scope": "account",
+   "value_json": "{\"id\": 1, \"uri\": \"tg:user:1\"}"
+  }
+ ],
+ "web_snapshots": [
+  {
+   "channel_username": "durov",
+   "content_hash": "DIGEST1",
+   "fetched_at": "2026-01-01T00:00:00+00:00",
+   "id": 2,
+   "meta_json": "{\"length\": \"1234\", \"mimetype\": \"text/html\", \"statuscode\": \"200\"}",
+   "msg_id": null,
+   "raw": "{\"digest\": \"DIGEST1\", \"length\": \"1234\", \"mimetype\": \"text/html\", \"original\": \"https://t.me/s/durov\", \"statuscode\": \"200\", \"timestamp\": \"20260101000000\", \"urlkey\": \"me,t)/s/durov\"}",
+   "source": "wayback",
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "url": "https://t.me/s/durov"
+  },
+  {
+   "channel_username": "durov",
+   "content_hash": "ca0df2c95aa144c1d0ff2ff3c8f967fdc1de9ef0c4120b3726416701b519d619",
+   "fetched_at": "2026-01-01T00:00:00+00:00",
+   "id": 1,
+   "meta_json": "{\"author_signature\": null, \"forwarded_from\": null, \"tombstoned_in_store\": false, \"views\": null}",
+   "msg_id": 1,
+   "raw": "{\"author_signature\": null, \"datetime\": \"2026-01-01T00:00:00+00:00\", \"forwarded_from\": null, \"post_id\": \"durov/1\", \"text\": \"m1\", \"views\": null}",
+   "source": "tme",
+   "timestamp": "2026-01-01T00:00:00+00:00",
+   "url": "https://t.me/durov/1"
+  }
+ ]
+}

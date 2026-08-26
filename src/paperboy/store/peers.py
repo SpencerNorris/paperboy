@@ -6,6 +6,14 @@ authoritative. If a fuller (non-min) row already exists, a `min` observation
 updates only *where we last saw it referenced* (`seen_in_chat`/`seen_in_msg`,
 used later for `inputPeerFromMessage`) and `last_seen`, never clobbering the
 richer stored profile with blanks.
+
+Observations can arrive out of order — a live re-run, and especially replay
+(ADR-0005 §6, which replays one historical run at a time and can revisit an
+id observed earlier by a later run) — so every upsert here is
+newest-observation-wins, not last-write-wins: current-state columns only
+move when the incoming `observed_at` is at least as new as the stored
+`last_seen`, while `first_seen`/`last_seen` themselves always widen to the
+true min/max window regardless of arrival order.
 """
 
 from __future__ import annotations
@@ -60,10 +68,21 @@ def upsert_peer(
 
     existing = store.conn.execute("SELECT is_min FROM peers WHERE uri=?", (uri,)).fetchone()
     if is_min and existing is not None and not existing["is_min"]:
+        # Newest-observation-wins (ADR-0005 §6): only move provenance forward
+        # when this observation is at least as new as what is stored; the
+        # window always widens.
         store.conn.execute(
-            "UPDATE peers SET seen_in_chat=?, seen_in_msg=?, source_raw_id=?, last_seen=? "
+            "UPDATE peers SET "
+            "seen_in_chat = CASE WHEN ? >= last_seen THEN ? ELSE seen_in_chat END, "
+            "seen_in_msg  = CASE WHEN ? >= last_seen THEN ? ELSE seen_in_msg  END, "
+            "source_raw_id = CASE WHEN ? >= last_seen THEN ? ELSE source_raw_id END, "
+            "first_seen = MIN(first_seen, ?), "
+            "last_seen = MAX(last_seen, ?) "
             "WHERE uri=?",
-            (seen_in_chat, seen_in_msg, source_raw_id, observed_at, uri),
+            (
+                observed_at, seen_in_chat, observed_at, seen_in_msg,
+                observed_at, source_raw_id, observed_at, observed_at, uri,
+            ),
         )
         return uri
 
@@ -78,19 +97,59 @@ def upsert_peer(
             first_seen, last_seen
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uri) DO UPDATE SET
-            kind=excluded.kind,
-            id=excluded.id,
-            access_hash=excluded.access_hash,
-            is_min=excluded.is_min,
-            seen_in_chat=excluded.seen_in_chat,
-            seen_in_msg=excluded.seen_in_msg,
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_name=excluded.last_name,
-            title=excluded.title,
-            flags_json=excluded.flags_json,
-            source_raw_id=excluded.source_raw_id,
-            last_seen=excluded.last_seen
+            -- Composed richness ∘ recency (ADR-0005 §6, amended 2026-08-26,
+            -- round-2 finding A): identity/profile columns (plus
+            -- source_raw_id, which records the observation that produced
+            -- them) move on recency ALONE between two full observations, but
+            -- richness overrides recency when the stored row is currently
+            -- `min` and this observation is `full` — the best profile data
+            -- known wins even if the full observation is older, because a
+            -- min row never had trustworthy profile data to defend. Between
+            -- two `min` observations recency alone applies (no richness
+            -- distinction between them). Provenance columns
+            -- (`seen_in_chat`/`seen_in_msg`) always keep the plain recency
+            -- guard — they record where THIS observation was witnessed, not
+            -- how rich it was. `full ← min` (existing full row, incoming
+            -- min) never reaches this INSERT..ON CONFLICT at all; it is
+            -- handled by the early-return branch above, which never moves
+            -- identity/profile and gates provenance on recency alone — the
+            -- other half of the same composed lattice.
+            kind = CASE WHEN excluded.last_seen >= peers.last_seen
+                        OR (peers.is_min AND NOT excluded.is_min)
+                        THEN excluded.kind ELSE peers.kind END,
+            id = CASE WHEN excluded.last_seen >= peers.last_seen
+                      OR (peers.is_min AND NOT excluded.is_min)
+                      THEN excluded.id ELSE peers.id END,
+            access_hash = CASE WHEN excluded.last_seen >= peers.last_seen
+                               OR (peers.is_min AND NOT excluded.is_min)
+                               THEN excluded.access_hash ELSE peers.access_hash END,
+            is_min = CASE WHEN excluded.last_seen >= peers.last_seen
+                          OR (peers.is_min AND NOT excluded.is_min)
+                          THEN excluded.is_min ELSE peers.is_min END,
+            seen_in_chat = CASE WHEN excluded.last_seen >= peers.last_seen
+                                THEN excluded.seen_in_chat ELSE peers.seen_in_chat END,
+            seen_in_msg = CASE WHEN excluded.last_seen >= peers.last_seen
+                               THEN excluded.seen_in_msg ELSE peers.seen_in_msg END,
+            username = CASE WHEN excluded.last_seen >= peers.last_seen
+                            OR (peers.is_min AND NOT excluded.is_min)
+                            THEN excluded.username ELSE peers.username END,
+            first_name = CASE WHEN excluded.last_seen >= peers.last_seen
+                              OR (peers.is_min AND NOT excluded.is_min)
+                              THEN excluded.first_name ELSE peers.first_name END,
+            last_name = CASE WHEN excluded.last_seen >= peers.last_seen
+                             OR (peers.is_min AND NOT excluded.is_min)
+                             THEN excluded.last_name ELSE peers.last_name END,
+            title = CASE WHEN excluded.last_seen >= peers.last_seen
+                         OR (peers.is_min AND NOT excluded.is_min)
+                         THEN excluded.title ELSE peers.title END,
+            flags_json = CASE WHEN excluded.last_seen >= peers.last_seen
+                              OR (peers.is_min AND NOT excluded.is_min)
+                              THEN excluded.flags_json ELSE peers.flags_json END,
+            source_raw_id = CASE WHEN excluded.last_seen >= peers.last_seen
+                                 OR (peers.is_min AND NOT excluded.is_min)
+                                 THEN excluded.source_raw_id ELSE peers.source_raw_id END,
+            first_seen = MIN(peers.first_seen, excluded.first_seen),
+            last_seen = MAX(peers.last_seen, excluded.last_seen)
         """,
         (
             uri, kind, id_, obj.get("access_hash"), int(is_min), seen_in_chat, seen_in_msg,
