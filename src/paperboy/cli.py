@@ -325,8 +325,6 @@ def reproject(
     """Rebuild all projections from raw_records into a fresh DB — offline,
     no network, no credentials. See docs/features/reproject.md."""
     settings = _settings_with_overrides(profile)
-    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
-    log = logging.getLogger("paperboy.cli")
     out_path = Path(out) if out else profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
     phase_list = phases.split(",") if phases else None
 
@@ -335,6 +333,11 @@ def reproject(
     except composition.ConfigError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from None
+    # Only now that the profile is validated: configure_logging mkdirs the
+    # profile dir, so doing it earlier manufactured `data/<typo>/` for a
+    # profile build_reproject was about to reject (#33 round-2 smoke case 8).
+    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    log = logging.getLogger("paperboy.cli")
     try:
         with source, out_store:
             summary = asyncio.run(

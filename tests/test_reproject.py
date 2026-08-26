@@ -75,6 +75,17 @@ def test_cli_reproject_refuses_existing_out(tmp_path, monkeypatch):
     assert "refusing" in result.output.lower()
 
 
+def test_cli_reproject_nonexistent_profile_creates_no_dir(tmp_path, monkeypatch):
+    """#33 round-2 smoke case 8: a rejected profile must not leave a ghost
+    profile directory behind (configure_logging used to mkdir it before
+    build_reproject ever validated that a source DB exists)."""
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "ghost"])
+    assert result.exit_code == 1
+    assert "ghost" in result.output
+    assert not (tmp_path / "ghost").exists()
+
+
 def test_cli_reproject_empty_source_exits_1(tmp_path, monkeypatch):
     # Zero raw_records at all -> zero runs -> the "empty log" message
     # (ADR-0005): distinct from "has runs but none resolved anything",
