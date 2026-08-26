@@ -17,31 +17,28 @@ the archive was captured, without re-scraping Telegram.
 
 ## How it works
 
-A `RawReplayGateway` (plus `RawReplayWebClient` for the `web` collector's
-plain-HTTP vector) implements the same `Gateway`/`WebGetter` seams the real
-collectors already depend on, but serves every response from a source DB's
-`raw_records` instead of the network. `recipes.collect_channel` then runs
-**unchanged** against the replay pair into a fresh target `Store` — same
-collector code path as a live collect, so the reprojection is provably
-identical to one (`tests/test_reproject.py::test_round_trip_identity`).
+Behavior statements below live in exactly one place — the code's own
+docstrings — this section only orients a reader toward them, it does not
+restate them (round 2 of #33's review found paraphrased narrative here going
+stale independently of the code; see "Documentation" in the ADR-0005 section
+below for what replaced that).
 
-**The clock seam.** Projections stamp `observed_at` at write time; a live
-collect wants "now", but a faithful reproject wants the *original* observation
-time, not reproject-time. `paperboy.clock.Clock` (`LiveClock`/`ReplayClock`)
-is threaded through every collector as `ctx.clock.for_payload(payload)`,
-looked up by the payload's own canonical JSON — payload-keyed, not
-call-order-keyed, because `history` consumes a whole page before projecting
-each message and `catch_up` projects messages nested inside a
-`ChannelDifference` envelope. `ReplayClock` is fed by the replay gateway as it
-serves each raw record.
-
-**Phase auto-detection.** `detect_phases(source, run)` infers which phases
-ONE historical run executed from which raw *kinds* it left behind (a run
-that never did `graph` has no `ChatsSlice`/`ChatInvite*`/`SponsoredMessage`
-raws for that run, so reproject doesn't invent `graph`-only projections it
-never had) — overridable with `--phases`. Detection is per-run (ADR-0005),
-not source-wide: a source whose early runs never did `discussion` and whose
-later runs did gets exactly that phase history back.
+- `src/paperboy/replay.py` — `ReplaySource` (read-only raw access + run
+  segmentation) and `RawReplayGateway`/`RawReplayWebClient` (the same
+  `Gateway`/`WebGetter` seams the real collectors depend on, served from
+  `raw_records` instead of the network). `recipes.collect_channel` runs
+  **unchanged** against the replay pair into a fresh target `Store` — same
+  collector code path as a live collect, so the reprojection is provably
+  identical to one (`tests/test_reproject.py::test_round_trip_identity`).
+- `src/paperboy/clock.py` — `Clock`/`LiveClock`/`ReplayClock`: where a
+  projection's `observed_at` comes from, so a reproject reproduces the
+  *original* observation time rather than stamping reproject-time.
+- `src/paperboy/reproject.py` — `detect_phases` (per-run phase
+  auto-detection from which raw kinds a run left behind, overridable with
+  `--phases`), target/run orchestration, the row-count diff summary.
+- `src/paperboy/store/peers.py` — `upsert_peer`'s composed richness ∘
+  recency merge (ADR-0005 §6); see "Peer projection composition" below for
+  the pointer, this doc does not restate the lattice.
 
 ## Run structure (ADR-0005)
 
@@ -69,13 +66,34 @@ via `collect_channel(run_id=...)` — so a reprojected DB carries the same
 pass structure as its source and is itself faithfully re-reprojectable.
 
 `HistoryCollector`'s live-collection incremental-vs-full-sweep bookkeeping
-(`sync_state` scopes `history`/`history_sweep`) is reset before every
-replayed run: under LIVE collection that state legitimately persists across
-re-runs (Telegram's history only grows forward, so "already fully swept" is
-permanent), but under per-run REPLAY a run's own raw window naturally
-running dry is a scope artifact, not a Telegram-side fact — left uncleared,
-that flag wrongly short-circuits a later run's OWN, entirely-older raw
-messages. See `src/paperboy/reproject.py::_reset_incremental_backfill_state`.
+(`sync_state` scopes `history`/`history_sweep`) needs *some* per-run reset
+before replaying, because a run's own raw window naturally running dry is a
+REPLAY scope artifact, not the Telegram-side "reached the true end of
+history" fact `history.py` would read it as under live collection — but not
+a *blanket* reset: `history_sweep`'s high-water-mark columns must keep
+widening monotonically across replayed runs the same way they would across
+live sessions, or a multi-run backward backfill silently truncates to its
+last run's own local window (found in round-2 review; #33). Exactly what
+resets and what survives is `_reset_incremental_backfill_state`'s docstring
+in `src/paperboy/reproject.py` — read that, not a paraphrase of it, since
+this is precisely the kind of statement round 2 found going stale here
+independently of the code.
+
+## Peer projection composition (ADR-0005 §6)
+
+`upsert_peer` (`src/paperboy/store/peers.py`) composes two independent
+orderings when merging an observation into the `peers` table — richness
+(a `full` peer object beats a `min` stub regardless of timestamp) and
+recency (a newer observation beats an older one) — because replay does not
+guarantee `observed_at`-order delivery even within one run. The lattice
+itself, cell by cell, is documented in ADR-0005 §6 (amended 2026-08-26) and
+pinned by `tests/test_store_peers.py::test_upsert_peer_composed_lattice`;
+this doc does not restate it. Known residual: the composed merge is not
+associative when a `min` observation's timestamp exceeds two `full`
+observations it is sandwiched between in arrival order — narrowed and
+tracked as [#38](https://github.com/SpencerNorris/paperboy/issues/38), not
+fixed in round 3 (needs a richness-scoped timestamp benchmark distinct from
+`last_seen`, a real design change, not this round's narrow scope).
 
 ## CLI
 
@@ -201,11 +219,32 @@ real-archive re-run"):
   the DoD smoke transcript below: two files are genuinely missing from this
   profile's local media directory on disk, so replay's own content-addressed
   lookup correctly reports them unavailable rather than fabricating bytes.)
+- **A replayed backfill sweep can absorb messages the live run captured via
+  catch-up**, because both write byte-identical raw shapes and
+  `iter_history` replay cannot tell them apart — inflating the replayed
+  `sync_state('history_sweep', …)`/`sync_ranges` bookkeeping relative to
+  the source's. Projection tables are unaffected (the same messages project
+  identically through either path) and sync bookkeeping is outside the
+  round-trip equality contract (D5); it matters only if a reprojected DB is
+  swapped in and then live-collected against. Tracked as
+  [#37](https://github.com/SpencerNorris/paperboy/issues/37).
+- **The composed peer merge is not associative in one corner** — a `min`
+  observation stamped newer than two `full` observations it lands between
+  can shield the older-stamped-but-newer `full` from applying. See "Peer
+  projection composition" above; tracked as
+  [#38](https://github.com/SpencerNorris/paperboy/issues/38).
 - Deferred (spec §9, deliberately out of scope): an in-place `--force` mode,
   a `--verify`-only mode, incremental reproject of a single phase into an
   existing DB.
 
 ## Definition-of-Done smoke transcript (2026-08-26, profile `default`, real archive)
+
+> **Historical record** (2026-08-26, commit `3d85519`). This transcript pins
+> the FIRST (single-pass) reproject implementation, superseded below by the
+> ADR-0005 run-structure revision. Kept as DoD evidence for that
+> implementation; for current behavior see the module docstrings pointed to
+> under "How it works" above, and the later transcripts below for the
+> current run-scoped replay.
 
 Read-only throughout: the source `<data_dir>/default/paperboy.sqlite` (the
 real, live-collected archive currently tracked in this repo's `data/`) was
@@ -334,6 +373,11 @@ happened to surface, not something reproject's replay introduced.
 ---
 
 ## ADR-0005 revision — multi-run real-archive smoke (2026-08-26)
+
+> **Historical record** (2026-08-26, commits `5990f93`/`2269372`). This
+> transcript is DoD evidence for the run-scoped replay as reviewed in
+> round 2 of #33. Numbers are that run's; behavior statements live in the
+> module docstrings pointed to under "How it works" above.
 
 The transcript above pins the FIRST implementation, which modeled replay as
 one undifferentiated pass over the whole raw log (`_latest()` per call
@@ -496,12 +540,20 @@ high-water mark) — and a real multi-session backward backfill (this
 archive's discussion group: msg-id bands 26955–34977, then 4525–26954, then
 3220–4524, then 1–3219, each a separate historical run extending further
 into the past) is exactly the shape that trips it, since every subsequent
-run's messages are entirely BELOW the high-water mark. Fixed by clearing the
-`history`/`history_sweep` `sync_state` scopes before every replayed run —
-free under replay (no network, no rate limit to economize on), and safe
-because idempotent projection upserts make any resulting re-processing of
-already-seen messages harmless. Pinned by
+run's messages are entirely BELOW the high-water mark. Fixed, at the time,
+by clearing the `history`/`history_sweep` `sync_state` scopes before every
+replayed run. Pinned by
 `tests/test_reproject.py::test_reproject_does_not_truncate_a_backward_multi_run_backfill`.
+
+> **Superseded.** The blanket `history_sweep` clear above was itself found
+> broken in round-2 review — it discarded a widened high-water mark along
+> with the per-run flags, truncating a two-run backward backfill to its
+> last run's own local window. `_reset_incremental_backfill_state` (in
+> `src/paperboy/reproject.py`) now clears only the two per-run-artifact
+> flags; the high-water-mark columns are read back unchanged and carried
+> forward. That docstring is canonical — the paragraph above is kept as the
+> historical record of what this smoke test originally found and fixed, not
+> a description of current behavior.
 
 ### A third bug found and fixed by a later real-archive re-run (2026-08-26)
 
