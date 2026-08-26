@@ -1970,3 +1970,553 @@ git commit -m "docs(reproject): feature doc with real-archive smoke, spec implem
 - **Known judgment calls** (flag in the PR body): D3's live-behavior change
   for derived-edge timestamps; D4.1–D4.5; D5's `source_raw_id` exclusion and
   distinct-row comparison. Each is argued inline where implemented.
+
+---
+
+# Revision R (2026-08-26): run-structure redesign (ADR-0005)
+
+> Authorized after the first review loop exhausted (#33, escalation comment).
+> Base: `40088db` on `feat/reproject` — the green single-run implementation of
+> Tasks 1–8 **without** the rejected `_backfill_older_*` shadow path (that
+> path exists only on parked branch `worktree-wf_d33e1b80-e14-7`; do not merge
+> it — R5 re-derives multi-run support from the run-id design instead).
+> Read `docs/adr/0005-run-structure.md` and spec §11 before starting.
+> The D1–D5 design decisions above still stand; R-tasks build on them.
+
+**Goal of the revision:** faithful replay of multi-run archives by recording
+run structure (`raw_records.run_id`) and replaying once per historical run —
+deleting the need for any projection logic outside the collectors.
+
+## Task R1: The two-run round-trip gate (red first, committed as strict xfail)
+
+The missing convergence signal from #33. Written and confirmed failing
+BEFORE any implementation, committed with `@pytest.mark.xfail(strict=True)`
+so every intermediate commit stays green while the gate stays real — R5
+removes the marker and the test must then pass (strict xfail turns an
+unexpected pass into a failure, so the marker cannot silently linger).
+
+**Files:**
+- Modify: `tests/test_reproject_parity.py` (a fixtures hook on
+  `run_full_collect`), `tests/test_reproject.py` (the gate test)
+
+**Interfaces:**
+- `run_full_collect(data_dir: Path, mutate_fixtures: Callable[[dict], dict] | None = None) -> Path`
+  — the hook applies to the FakeGateway fixtures dict only; web transport
+  unchanged. Existing callers unaffected (default None).
+
+- [ ] **Step 1: Add the hook** — in `run_full_collect`, replace
+  `FakeGateway(full_collect_fixtures())` with:
+
+```python
+    fixtures = full_collect_fixtures()
+    if mutate_fixtures is not None:
+        fixtures = mutate_fixtures(fixtures)
+    ...
+        await collect_channel(FakeGateway(fixtures), store, settings, ...)
+```
+
+- [ ] **Step 2: Write the gate test** (append to `tests/test_reproject.py`)
+
+```python
+def _second_run_fixtures(fx: dict) -> dict:
+    """Run 2 observes one NEW message carrying NEW media, on top of
+    everything run 1 saw — so run 2 exercises incremental backfill, repeat
+    snapshots/metrics/web captures, AND a fresh MediaDownload (which is what
+    makes run 2's media phase raw-detectable, spec D4.5/ADR-0005 residual)."""
+    fx = {**fx, "history": [
+        {
+            "_": "message", "id": 4, "message": "new in run 2",
+            "date": 1769322400, "views": 3,
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 77, "access_hash": 1,
+                    "mime_type": "text/plain",
+                    "attributes": [
+                        {"_": "DocumentAttributeFilename", "file_name": "b.txt"}
+                    ],
+                },
+            },
+        },
+        *fx["history"],
+    ]}
+    fx["media"] = {**fx["media"], 4: b"second run bytes"}
+    return fx
+
+
+@pytest.mark.xfail(
+    reason="#33 / ADR-0005: multi-run replay lands in tasks R2-R5",
+    strict=True,
+)
+def test_two_run_round_trip_identity(tmp_path, monkeypatch):
+    """ADR-0005 gate: a source built from TWO collect passes — the ordinary
+    real-archive shape — must round-trip identically, time series included."""
+    asyncio.run(run_full_collect(tmp_path))
+    db1 = asyncio.run(run_full_collect(tmp_path, mutate_fixtures=_second_run_fixtures))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db1, tmp_path / "default" / "paperboy.reprojected.sqlite")
+```
+
+- [ ] **Step 3: Verify it fails for the RIGHT reason** — run once with the
+  xfail marker commented out:
+  `uv run pytest tests/test_reproject.py::test_two_run_round_trip_identity -q`
+  Expected: FAIL with table divergence (at minimum `channel_snapshots`,
+  `web_snapshots`, `raw_records` counts collapsed to one run's worth —
+  the #33 reproduction). Restore the marker; the run must then report
+  xfailed, and the FULL suite stays green.
+
+- [ ] **Step 4: Commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add tests/test_reproject_parity.py tests/test_reproject.py
+git commit -m "test(reproject): two-run round-trip gate, strict-xfail until ADR-0005 lands (#33)"
+```
+
+## Task R2: `run_id` in the raw log
+
+**Files:**
+- Create: `src/paperboy/store/migrations/0003_run_id.sql`
+- Modify: `src/paperboy/store/db.py` (`begin_run`, `add_raw`),
+  `src/paperboy/recipes.py` (`collect_channel(run_id=...)`),
+  `tests/test_reproject_parity.py` (`dump_db` run_id normalization),
+  `tests/fixtures/reproject/parity_golden.json` (regenerated, see step 5)
+- Test: `tests/test_clock.py` or `tests/test_store_migrations.py` additions
+
+**Interfaces:**
+- `Store.begin_run(run_id: str | None = None) -> str` — sets the id stamped
+  on every subsequent `add_raw`; generates `uuid4().hex` when None.
+- `collect_channel(..., run_id: str | None = None)` — calls
+  `store.begin_run(run_id)` before building the context. Live callers pass
+  nothing (fresh id); replay passes the source run's id.
+
+- [ ] **Step 1: Failing tests**
+
+```python
+def test_add_raw_stamps_the_begun_run(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        rid = store.begin_run()
+        store.add_raw("Message", {"_": "Message", "id": 1}, "stranger", None)
+        row = store.conn.execute("SELECT run_id FROM raw_records").fetchone()
+        assert row["run_id"] == rid and len(rid) == 32
+
+
+def test_add_raw_without_begin_run_leaves_null(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        store.add_raw("Message", {"_": "Message", "id": 1}, "stranger", None)
+        assert store.conn.execute(
+            "SELECT run_id FROM raw_records"
+        ).fetchone()["run_id"] is None
+
+
+def test_begin_run_accepts_injected_id(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        assert store.begin_run("legacy-0001") == "legacy-0001"
+```
+
+- [ ] **Step 2: Migration** — `0003_run_id.sql`:
+
+```sql
+-- 0003_run_id: which collect pass produced each raw record (ADR-0005).
+-- Nullable: legacy rows predate the column and are segmented at replay
+-- time by the tier='self' marker rule — never rewritten here.
+ALTER TABLE raw_records ADD COLUMN run_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_raw_records_run ON raw_records(run_id);
+```
+
+  NOTE: `executescript` re-runs the whole file if interrupted, and
+  `ALTER TABLE ADD COLUMN` is not idempotent — but `schema_migrations`
+  gates by stem exactly as for 0001/0002, and the index line is. Match the
+  existing migration style; no special handling needed.
+
+- [ ] **Step 3: `Store.begin_run` + `add_raw` stamping**
+
+```python
+    def begin_run(self, run_id: str | None = None) -> str:
+        """Mark the start of one collect pass (ADR-0005): every subsequent
+        `add_raw` carries this id, so replay can reconstruct pass boundaries.
+        Replay injects the SOURCE run's id, making a reprojected DB itself
+        re-reprojectable; live runs take a fresh opaque id."""
+        self._run_id = run_id if run_id is not None else uuid4().hex
+        return self._run_id
+```
+
+  with `self._run_id: str | None = None` initialised in `__init__`, and the
+  INSERT extended with `run_id` = `self._run_id`.
+
+- [ ] **Step 4: `collect_channel` begins the run** — add keyword
+  `run_id: str | None = None`; first statement of the function body:
+  `store.begin_run(run_id)`.
+
+- [ ] **Step 5: Parity golden — normalize and regenerate ONCE, reviewed**
+
+  `run_id` values are random per process, so `dump_db` must normalize them:
+  map each distinct non-NULL `run_id` to `run-0001`, `run-0002`, … in order
+  of first appearance (by raw rowid). Then regenerate the golden
+  (`UPDATE_GOLDEN=1 …`) and **diff-review it**: the ONLY change must be the
+  new `"run_id": "run-0001"` field on `raw_records` rows. Any other diff
+  means live behavior changed — stop and fix instead of committing. This is
+  the one sanctioned regeneration (schema addition), per the golden's
+  protocol.
+
+- [ ] **Step 6: Full suite + lint/type; commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add -A src/paperboy tests
+git commit -m "feat(store): run_id on raw_records + begin_run seam (ADR-0005)"
+```
+
+## Task R3: Order-independent `upsert_peer` / `upsert_channel`
+
+A live-collect correctness fix in its own right (two observations applied
+out of order must not invert `first_seen`/`last_seen` or let stale data
+clobber newer state), and defense-in-depth for replay.
+
+**Files:**
+- Modify: `src/paperboy/store/peers.py`, `src/paperboy/store/channels.py`
+- Test: `tests/test_store_peers.py`, `tests/test_store_channels.py`
+
+- [ ] **Step 1: Failing tests** (one shown per module; mirror for channels)
+
+```python
+def test_out_of_order_observation_keeps_seen_window_and_newest_state(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        raw_new = store.add_raw("User", {"_": "user", "id": 9}, "stranger", None)
+        raw_old = store.add_raw("User", {"_": "user", "id": 9}, "stranger", None)
+        upsert_peer(store, {"_": "user", "id": 9, "username": "new_name"},
+                    raw_new, "2026-02-01T00:00:00+00:00",
+                    seen_in_chat=None, seen_in_msg=None)
+        # The OLDER observation arrives second (out of order):
+        upsert_peer(store, {"_": "user", "id": 9, "username": "old_name"},
+                    raw_old, "2026-01-01T00:00:00+00:00",
+                    seen_in_chat=None, seen_in_msg=None)
+        row = store.conn.execute(
+            "SELECT username, first_seen, last_seen FROM peers"
+        ).fetchone()
+        assert row["first_seen"] == "2026-01-01T00:00:00+00:00"
+        assert row["last_seen"] == "2026-02-01T00:00:00+00:00"
+        assert row["username"] == "new_name"   # stale data must not clobber
+```
+
+- [ ] **Step 2: Implement** — in `upsert_peer`'s main upsert, guard every
+  current-state column and widen the seen window (ISO-8601 UTC strings
+  compare lexicographically — the repo's canonical timestamp form):
+
+```sql
+ON CONFLICT(uri) DO UPDATE SET
+    kind        = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.kind        ELSE peers.kind        END,
+    id          = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.id          ELSE peers.id          END,
+    access_hash = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.access_hash ELSE peers.access_hash END,
+    is_min      = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.is_min      ELSE peers.is_min      END,
+    seen_in_chat= CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.seen_in_chat ELSE peers.seen_in_chat END,
+    seen_in_msg = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.seen_in_msg ELSE peers.seen_in_msg END,
+    username    = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.username    ELSE peers.username    END,
+    first_name  = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.first_name  ELSE peers.first_name  END,
+    last_name   = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.last_name   ELSE peers.last_name   END,
+    title       = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.title       ELSE peers.title       END,
+    flags_json  = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.flags_json  ELSE peers.flags_json  END,
+    source_raw_id = CASE WHEN excluded.last_seen >= peers.last_seen THEN excluded.source_raw_id ELSE peers.source_raw_id END,
+    first_seen  = MIN(peers.first_seen, excluded.first_seen),
+    last_seen   = MAX(peers.last_seen,  excluded.last_seen)
+```
+
+  The min-observation-on-richer-row branch (`UPDATE peers SET seen_in_chat=…
+  WHERE uri=?`) gets the same treatment: apply its field updates only when
+  `? >= last_seen` (bind `observed_at`), and always
+  `last_seen = MAX(last_seen, ?)`. `upsert_channel`: same CASE pattern for
+  its update set; `channel_snapshots` append stays unconditional (it is the
+  time series). Update both docstrings: last-write-wins becomes
+  newest-observation-wins, and say why (ADR-0005 §6).
+
+- [ ] **Step 3: Full suite + parity golden still green** (frozen clock ⇒
+  all comparisons `>=` true ⇒ behavior identical) **; commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add src/paperboy/store tests
+git commit -m "fix(store): order-independent peer/channel upserts — newest observation wins (ADR-0005)"
+```
+
+## Task R4: #34 — non-channel resolution is a skip, not a crash
+
+**Files:**
+- Modify: `src/paperboy/collectors/channel.py` (`_resolved_channel_id`)
+- Test: `tests/test_collector_channel.py`
+
+- [ ] **Step 1: Failing test** — a `resolve` fixture whose `peer` is
+  `{"_": "PeerUser", "user_id": 7}` run through `collect_channel` must yield
+  the channel phase `stopped="skip"` (and the run continue), not a raised
+  `ValueError`. Check the existing non-channel test asserting `ValueError`
+  and repoint it at `SkipAndRecord`.
+
+- [ ] **Step 2: Implement** — in `_resolved_channel_id`, replace
+  `raise ValueError(...)` with `raise SkipAndRecord(...)` (import from
+  `paperboy.budget`), keeping the message; update its docstring ("refuse" →
+  "skip cleanly: a username can legitimately be a user or basic group —
+  issue #34"). `_pick_channel`'s `ValueError` stays: that one is an internal
+  invariant breach (resolve *said* channel but chats disagree), not a
+  data condition.
+
+- [ ] **Step 3: Full suite; commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add src/paperboy/collectors/channel.py tests/test_collector_channel.py
+git commit -m "fix(channel): non-channel resolution skips cleanly instead of crashing (#34)"
+```
+
+## Task R5: Per-run replay (the core)
+
+**Files:**
+- Modify: `src/paperboy/replay.py`, `src/paperboy/reproject.py`,
+  `tests/test_replay_gateway.py`, `tests/test_replay_web.py`,
+  `tests/test_reproject.py` (remove the R1 xfail marker)
+
+**Interfaces:**
+
+```python
+@dataclass(frozen=True)
+class ReplayRun:
+    run_id: str      # real id, or "legacy-000N" for an inferred segment
+    lo: int          # first raw rowid of the pass (inclusive)
+    hi: int          # last raw rowid of the pass (inclusive)
+
+class ReplaySource:
+    def runs(self) -> list[ReplayRun]: ...                      # capture order
+    def resolve_targets(self, run: ReplayRun) -> list[str]: ... # now run-scoped
+    def linked_group_ids(self, run: ReplayRun) -> set[int]: ...
+    def has_kind(self, run: ReplayRun, *kinds: str) -> bool: ...
+    def has_context_channel(self, run: ReplayRun, channel_ids: set[int]) -> bool: ...
+
+class RawReplayGateway:
+    def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None: ...
+
+class RawReplayWebClient:
+    def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None: ...
+
+def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]: ...
+```
+
+- [ ] **Step 1: Failing tests for `runs()`** (in `test_replay_gateway.py`)
+
+```python
+def test_runs_groups_by_run_id_in_capture_order(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("aaa")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        st.begin_run("bbb")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+    src = ReplaySource.open(db, tmp_path / "media")
+    runs = src.runs()
+    assert [(r.run_id, r.lo, r.hi) for r in runs] == [("aaa", 1, 2), ("bbb", 3, 3)]
+
+
+def test_runs_segments_legacy_rows_at_self_markers(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 2), ("legacy-0002", 3, 4),
+    ]
+
+
+def test_runs_mixed_legacy_then_stamped(tmp_path):
+    # Legacy segment(s) precede stamped runs — the migration boundary shape.
+    ...  # two legacy rows (one self marker), then begin_run("ccc") + rows;
+         # expect [("legacy-0001", 1, 2), ("ccc", 3, ...)]
+```
+
+  (Write the `...` body out fully in the actual test file.)
+
+- [ ] **Step 2: Implement `ReplaySource.runs()`**
+
+```python
+    def runs(self) -> list[ReplayRun]:
+        """Capture-ordered collect passes (ADR-0005). Stamped rows group by
+        run_id; legacy NULL rows are segmented at each tier='self' User
+        record — every collect pass's first raw write (channel.py writes
+        self before anything, and the CLI refuses dependent phases without
+        `channel`) — rows before the first marker join the first segment.
+        Runs must be contiguous rowid ranges (one sequential process per
+        pass); interleaving means a corrupt source and fails loudly."""
+        rows = self.conn.execute(
+            "SELECT id, run_id, tier, lower(kind) AS k FROM raw_records ORDER BY id"
+        ).fetchall()
+        runs: list[ReplayRun] = []
+        current_id: str | None = None
+        legacy_n = 0
+        lo = hi = None
+        seen_run_ids: set[str] = set()
+
+        def _flush() -> None:
+            nonlocal lo, hi
+            if lo is not None:
+                assert current_id is not None
+                runs.append(ReplayRun(current_id, lo, hi))
+                lo = hi = None
+
+        for row in rows:
+            if row["run_id"] is not None:
+                boundary = row["run_id"] != current_id
+                next_id = row["run_id"]
+            else:
+                is_marker = row["tier"] == "self" and (
+                    row["k"] == "user" or row["k"].endswith(".user")
+                )
+                boundary = is_marker or current_id is None
+                next_id = f"legacy-{legacy_n + 1:04d}" if boundary else current_id
+            if boundary:
+                _flush()
+                if next_id in seen_run_ids:
+                    raise ReprojectSourceError(
+                        f"raw log run {next_id!r} is not contiguous — refusing to replay"
+                    )
+                seen_run_ids.add(next_id)
+                if row["run_id"] is None:
+                    legacy_n += 1
+                current_id = next_id
+                lo = row["id"]
+            hi = row["id"]
+        _flush()
+        return runs
+```
+
+  with `class ReprojectSourceError(Exception)` in `replay.py` (re-exported or
+  caught by `reproject.py` as operator-facing). NOTE the subtlety the first
+  legacy segment needs: `boundary` is also true for the very first NULL row
+  even when it is not a marker — rows before the first marker form
+  `legacy-0001`, and a later marker then STARTS `legacy-0002`. Hand-check
+  against `test_runs_segments_legacy_rows_at_self_markers` (marker-first
+  source: the marker itself opens segment 1 — the `current_id is None`
+  clause must not double-count it; get this right against the tests, they
+  are the contract).
+
+- [ ] **Step 3: Scope every replay query to the run** — `RawReplayGateway`
+  and `RawReplayWebClient` take `run: ReplayRun`; every SQL in both classes
+  gains `AND id BETWEEN ? AND ?` (bind `run.lo`, `run.hi`) — including
+  `_latest`, `resolve`, `iter_history`, `get_messages`, the diff query and
+  its synthetic-stamp `MAX(observed_at)` query, `download_media`,
+  recommendations/invites/sponsored, and the web client's URL lookup (whose
+  `id > ?` cursor then starts at `run.lo - 1`). `ReplaySource`'s helper
+  queries (`resolve_targets`, `linked_group_ids`, `has_kind`,
+  `has_context_channel`) same. Within one run each call site now has at
+  most one record, which is what makes `_latest`'s "a live RPC has one
+  now" comment true again — update the comments accordingly. Update every
+  existing test in `test_replay_gateway.py`/`test_replay_web.py` to build
+  the gateway with `src.runs()[0]` (the seeded fixtures are single-run, so
+  behavior is unchanged — no assertion should need to move; if one does,
+  that is a real regression to investigate, not adjust).
+
+- [ ] **Step 4: Per-run orchestration in `reproject()`**
+
+  Replace the per-target loop with runs-outer / targets-inner; per-run
+  detection; thread the run id into the target store:
+
+```python
+    runs = source.runs()
+    if not runs:
+        raise ReprojectError("source raw log is empty — nothing to reproject")
+    replayed_any = False
+    for run in runs:
+        run_phases = phases if phases is not None else detect_phases(source, run)
+        for raw_target in source.resolve_targets(run):
+            replayed_any = True
+            clock = ReplayClock()
+            gateway = RawReplayGateway(source, clock, run)
+            web_client = RawReplayWebClient(source, clock, run)
+            collectors = [...]  # unchanged list
+            try:
+                run_results = await collect_channel(
+                    gateway, out_store, replay_settings, parse_target(raw_target),
+                    list(run_phases), log,
+                    collectors=collectors, profile=profile, clock=clock,
+                    run_id=run.run_id,
+                )
+            except Exception as exc:
+                ...  # existing per-target isolation (D4.7), keyed per run
+            results.setdefault(raw_target, []).extend(run_results)
+    if not replayed_any:
+        raise ReprojectError(
+            "source has no resolve records in raw_records — nothing to reproject"
+        )
+```
+
+  `ReprojectSummary.phases` becomes the union in first-seen order (or a
+  per-run mapping — pick one, render it sensibly in the CLI tables; the CLI
+  currently prints one table per target, which still works with
+  results-extended-per-run). `detect_phases(source, run)` passes `run`
+  through to the source helpers; docstring keeps the D4.5 conservatism note
+  and adds the per-run scope (ADR-0005). Catch `ReprojectSourceError` in
+  the CLI alongside `ReprojectError`.
+
+- [ ] **Step 5: Remove the R1 xfail marker.** Run the gate:
+  `uv run pytest tests/test_reproject.py::test_two_run_round_trip_identity -q`
+  Expected: PASS — the redesign's definition of done. Then the whole
+  battery: every single-run test (round-trip, corrected-projection,
+  zero-network, partial-source, media-no-rewrite) must still pass — a
+  single-run source is now just the one-run case of the same model.
+
+- [ ] **Step 6: Full suite + lint/type; commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add -A src/paperboy tests
+git commit -m "feat(reproject): replay once per historical run — run-scoped gateway, per-run phases (ADR-0005, #33)"
+```
+
+## Task R6: Docs + real-archive smoke (multi-run this time)
+
+**Files:**
+- Modify: `docs/features/reproject.md` (run-structure section + NEW smoke
+  transcript), `CLAUDE.md` (status), ADR-0005 (status stays accepted; add a
+  "verified" note with the smoke date)
+
+- [ ] **Step 1: Real-archive smoke.** Delete any stale
+  `data/default/paperboy.reprojected.sqlite` from the previous round first
+  (it is a generated artifact of this feature's own earlier smoke — confirm
+  the filename matches before deleting; touch nothing else under `data/`).
+
+```bash
+uv run paperboy reproject --profile default
+```
+
+  Verify, and paste actual output into the feature doc:
+  - segmentation: number of replayed runs ≈ `run_events`' distinct run count
+    (cross-check only — `SELECT count(*) FROM run_events WHERE kind='complete'
+    AND phase='channel'` approximates pass count);
+  - time series now survive: `web_snapshots`, `channel_snapshots`,
+    `message_metrics` reprojected counts match the source's (they collapsed
+    to one run's worth in round 1 — the #33 evidence table);
+  - the round-1 payoffs still hold: 48-flag `flags_json`, zero self peers;
+  - `@atom8388` (the non-channel target) now shows as a clean per-run skip
+    in the output, not an error row.
+
+- [ ] **Step 2: Update docs; full suite; commit**
+
+```bash
+uv run pytest -q && uv run ruff check && uv run pyright
+git add docs CLAUDE.md
+git commit -m "docs(reproject): ADR-0005 run-structure revision — multi-run real-archive smoke"
+```
+
+## Revision self-review
+
+- R1 is the gate #33 said was missing, strict-xfail keeps commits green
+  while it is red, and its fixture varies run 2 (new message + new media) so
+  incremental backfill and per-run media detection are both exercised.
+- R2/R3/R4 are independent, individually-tested, and each is also a
+  live-collect improvement; R5 consumes R2's ids and R1's gate; R6 proves
+  the ADR's claims against the archive that broke round 1.
+- Deliberately NOT done: merging `worktree-wf_d33e1b80-e14-7` (the shadow
+  path), sticky media detection (would fabricate custody observations for
+  runs that never ran media — #36 stays open, narrowed), and any mutation of
+  the source DB for legacy segmentation (replay-time inference only).

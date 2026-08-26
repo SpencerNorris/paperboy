@@ -230,3 +230,50 @@ raw content. Verified live against the real `default` archive
 (`docs/features/reproject.md`): source `channels.flags_json` (10 flags,
 pre-#20-fix) reprojects to the current 48-flag set; the source's one
 leftover self peer row (pre-#12-fix) reprojects to zero.
+
+## 11. Revision 2 (2026-08-26): run structure — replay per collect pass (ADR-0005)
+
+The first implementation round failed its review gate (#33): a source built
+from **several historical collect runs** — the ordinary shape, the real
+`default` archive has seven — cannot be faithfully replayed by a one-run
+model, because the projection is a function of the raw log *plus the run
+structure*, which §2–§3 above never recorded. The review loop showed
+negative convergence against hand-written compensation ("backfill older
+observations" outside the collectors); the design fix is to record the
+missing datum and delete the compensation. Full rationale and options:
+`docs/adr/0005-run-structure.md`.
+
+This section **supersedes** the affected wording above:
+
+- **§2/§3 (one replay pass):** `reproject` now replays **once per historical
+  run**, in capture order. Per run: that run's targets (its `ResolvedPeer`
+  records), that run's detected phase set, and a gateway whose every query is
+  scoped to that run's rowid range. `_latest()`-style "serve the newest
+  record" semantics apply *within one run* (where each call site has at most
+  one record — a live RPC's one "now"), never across runs. The target store
+  carries `sync_state`/projections across replayed runs exactly as the live
+  store did across real runs, so incremental backfills, repeat snapshots,
+  `first_seen`/`last_seen` evolution, and per-run web captures reproduce by
+  construction.
+- **Schema:** `raw_records.run_id TEXT` (migration `0003_run_id.sql`),
+  stamped by `Store.begin_run()` per `collect_channel` invocation. Replay
+  passes the source run's id through, so a reprojected DB is itself
+  re-reprojectable. Legacy rows (NULL) are segmented at replay time by the
+  `tier='self'` User marker — every collect pass's first raw write — labeled
+  `legacy-0001…`; the source is never mutated.
+- **§5 unchanged** (the clock seam is orthogonal and stands), but
+  `upsert_peer`/`upsert_channel` additionally become order-independent
+  (`first_seen = MIN`, `last_seen = MAX`, current-state fields only from an
+  observation ≥ the stored `last_seen`) — a live-collect correctness fix in
+  its own right, not a replay workaround.
+- **§7 (round-trip):** the identity contract now explicitly covers a
+  **two-run source** (two full collect passes at distinct times into one DB,
+  then reproject) — this fixture is the convergence gate the first round
+  lacked, and is written red-first.
+- **D4.7's per-target error isolation** stays; #34's underlying
+  crash-instead-of-skip (`_resolved_channel_id` raising a bare `ValueError`
+  for a non-channel resolution) is fixed in this revision as `SkipAndRecord`
+  (it is on this feature's replay path for the real archive: `@atom8388`).
+- **Known residual (narrowed #36):** a historical run whose media phase
+  downloaded nothing new leaves no raw trace, so per-run phase detection
+  (D4.5, conservative by design) cannot replay its duplicate-custody rows.
