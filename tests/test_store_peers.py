@@ -60,6 +60,30 @@ def test_channel_typed_peer_stores_title(tmp_path):
         assert row["title"] == "Durov"
 
 
+def test_out_of_order_observation_keeps_seen_window_and_newest_state(tmp_path):
+    # ADR-0005 §6: replay serves records in RECORDED order, not necessarily
+    # observed_at order across runs — an older observation can arrive at
+    # upsert_peer AFTER a newer one already landed. first_seen/last_seen must
+    # widen to the true window regardless of arrival order, and stale data
+    # must never clobber a newer value.
+    with Store.open(tmp_path / "p.sqlite") as store:
+        raw_new = store.add_raw("User", {"_": "user", "id": 9}, "stranger", None)
+        raw_old = store.add_raw("User", {"_": "user", "id": 9}, "stranger", None)
+        upsert_peer(store, {"_": "user", "id": 9, "username": "new_name"},
+                    raw_new, "2026-02-01T00:00:00+00:00",
+                    seen_in_chat=None, seen_in_msg=None)
+        # The OLDER observation arrives second (out of order):
+        upsert_peer(store, {"_": "user", "id": 9, "username": "old_name"},
+                    raw_old, "2026-01-01T00:00:00+00:00",
+                    seen_in_chat=None, seen_in_msg=None)
+        row = store.conn.execute(
+            "SELECT username, first_seen, last_seen FROM peers"
+        ).fetchone()
+        assert row["first_seen"] == "2026-01-01T00:00:00+00:00"
+        assert row["last_seen"] == "2026-02-01T00:00:00+00:00"
+        assert row["username"] == "new_name"   # stale data must not clobber
+
+
 def test_join_to_send_flag_is_persisted(tmp_path):
     """`join_to_send` is the passivity guardrail the `discussion` collector's
     preflight relies on to decide whether reading a linked group requires

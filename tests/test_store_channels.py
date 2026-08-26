@@ -93,6 +93,28 @@ def test_upsert_channel_records_a_new_snapshot_each_call(tmp_path):
         assert [s["participants_count"] for s in snaps] == [100, 150]  # history preserved
 
 
+def test_out_of_order_observation_keeps_newest_state(tmp_path):
+    # ADR-0005 §6: same order-independence contract as peers — an older
+    # observation arriving after a newer one must not clobber current state,
+    # but the observation window (first_seen/last_seen, via channel_snapshots
+    # remaining an unconditional append) still reflects the true range.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        chan = {"_": "channel", "id": 5, "title": "Durov", "broadcast": True}
+        full_new = {"_": "channelFull", "id": 5, "participants_count": 200}
+        r_new = st.add_raw("channelFull", full_new, "stranger", None)
+        upsert_channel(st, full_new, chan, r_new, "2026-02-01T00:00:00+00:00")
+        full_old = {"_": "channelFull", "id": 5, "participants_count": 100}
+        r_old = st.add_raw("channelFull", full_old, "stranger", None)
+        # The OLDER observation arrives second (out of order):
+        upsert_channel(st, full_old, chan, r_old, "2026-01-01T00:00:00+00:00")
+        row = st.conn.execute(
+            "select participants_count, first_seen, last_seen from channels where id=5"
+        ).fetchone()
+        assert row["participants_count"] == 200  # stale data must not clobber
+        assert row["first_seen"] == "2026-01-01T00:00:00+00:00"
+        assert row["last_seen"] == "2026-02-01T00:00:00+00:00"
+
+
 def test_linked_chat_id_preserved_when_present(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         chan = {"_": "channel", "id": 5, "title": "Durov", "broadcast": True}
