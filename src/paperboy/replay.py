@@ -108,9 +108,22 @@ class ReplaySource:
         after at least one substantive (non-opening) row, but it is not
         committed as a boundary until the whole contiguous run of
         opening-kind rows that follows is known — i.e. until the next
-        substantive row, a stamped row, or the log's end ends it. The
-        boundary is committed only if that cluster contains its own self
-        marker (`tier='self'` `User`); otherwise the cluster is a foreign
+        substantive row, a stamped row, or the log's end ends it.
+
+        One collect pass writes each opening role — self / ResolvedPeer /
+        ChatFull — AT MOST ONCE. A contiguous run of opening-kind rows can
+        therefore still span more than one pass (e.g. two back-to-back
+        `--phases channel` runs, which write nothing but their own opening
+        cluster and never hit a substantive row to end the pending cluster
+        in between) — found running this fix's own regression battery. The
+        pending cluster is split into one SUB-cluster per pass by cutting at
+        the first REPEATED role: a second `self`/`ResolvedPeer`/`ChatFull`
+        seen starts the next pass's sub-cluster rather than extending the
+        current one.
+
+        Each sub-cluster is then committed as a boundary only if it contains
+        its own self marker (`tier='self'` `User`) — or nothing is open yet
+        (the very start of the log); otherwise the sub-cluster is a foreign
         single-row intrusion — nothing in this codebase stops two `collect`
         invocations from writing to the same profile concurrently, and a
         lone `ResolvedPeer`/`ChatFull` from an unrelated short-lived process
@@ -119,7 +132,7 @@ class ReplaySource:
         that silently fails replay at `get_self()` (found on the real
         archive: a lone stray resolve mid-`MediaDownload`-loop discarded 157
         rows, 156 of them genuine historical `MediaDownload` observations).
-        A genuine cluster still absorbs every opening-kind row in it
+        A genuine sub-cluster still absorbs every opening-kind row in it
         regardless of order, so all three land in the run they actually
         belong to rather than splitting off an orphan with no target to
         resolve. Runs must be contiguous rowid ranges (one sequential
@@ -151,6 +164,16 @@ class ReplaySource:
             k = row["k"]
             return row["tier"] == "self" and (k == "user" or k.endswith(".user"))
 
+        def _opening_role(row: sqlite3.Row) -> str:
+            """Which opening role `row` is — self / resolvedpeer / chatfull.
+            Only ever called on rows `_is_opening()` already matched."""
+            if _is_self_marker(row):
+                return "self"
+            k = row["k"]
+            if k == "resolvedpeer" or k.endswith(".resolvedpeer"):
+                return "resolvedpeer"
+            return "chatfull"
+
         def _flush() -> None:
             nonlocal lo, hi
             if lo is not None:
@@ -175,14 +198,32 @@ class ReplaySource:
             nonlocal hi
             if not pending:
                 return
-            # No open segment to fold noise into (the very start of the
-            # log) — the cluster must open segment 1 regardless of whether
-            # it happens to contain a self marker.
-            genuine = current_id is None or any(_is_self_marker(r) for r in pending)
-            if genuine:
-                _flush()
-                _open_new_legacy(pending[0]["id"])
-            hi = pending[-1]["id"]
+            # Split the pending cluster into one sub-cluster per collect
+            # pass: walk it accumulating a sub-cluster, and when a row's
+            # opening role has already been seen in the CURRENT sub-cluster,
+            # that role is starting over — close the sub-cluster and start a
+            # new one at that row (see the docstring above).
+            sub_clusters: list[list[sqlite3.Row]] = []
+            sub: list[sqlite3.Row] = []
+            seen_roles: set[str] = set()
+            for row in pending:
+                role = _opening_role(row)
+                if role in seen_roles:
+                    sub_clusters.append(sub)
+                    sub, seen_roles = [], set()
+                sub.append(row)
+                seen_roles.add(role)
+            sub_clusters.append(sub)
+
+            for cluster in sub_clusters:
+                # No open segment to fold noise into (the very start of the
+                # log) — the cluster must open segment 1 regardless of
+                # whether it happens to contain a self marker.
+                genuine = current_id is None or any(_is_self_marker(r) for r in cluster)
+                if genuine:
+                    _flush()
+                    _open_new_legacy(cluster[0]["id"])
+                hi = cluster[-1]["id"]
             pending.clear()
 
         for row in rows:

@@ -84,6 +84,34 @@ def test_out_of_order_observation_keeps_seen_window_and_newest_state(tmp_path):
         assert row["username"] == "new_name"   # stale data must not clobber
 
 
+def test_min_observation_older_than_first_seen_still_widens_the_window(tmp_path):
+    # adversarial-reviewer, round 2: the min-over-an-existing-non-min-row
+    # branch widened only `last_seen` (MAX), never `first_seen` (MIN) — a
+    # regression against this module's own documented invariant
+    # ("first_seen/last_seen themselves always widen to the true min/max
+    # window regardless of arrival order"). A min observation OLDER than the
+    # stored full row's first_seen must still pull first_seen backward, the
+    # same way the full-upsert branch already does (`test_out_of_order_
+    # observation_keeps_seen_window_and_newest_state` above covers that
+    # branch; this covers the min branch, which took a different code path
+    # untouched by that test).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        full = {"_": "user", "id": 9, "access_hash": 111, "username": "real"}
+        r1 = st.add_raw("user", full, "member", None)
+        upsert_peer(st, full, r1, "2026-01-02T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None)
+        mn = {"_": "user", "id": 9, "min": True}
+        r2 = st.add_raw("user", mn, "stranger", None)
+        # The min observation is OLDER than the stored row's first_seen —
+        # replay can serve records out of `observed_at` order (ADR-0005 §6).
+        upsert_peer(st, mn, r2, "2026-01-01T00:00:00+00:00", seen_in_chat=7, seen_in_msg=1)
+        row = st.conn.execute(
+            "select first_seen, last_seen, username from peers where uri='tg:user:9'"
+        ).fetchone()
+        assert row["first_seen"] == "2026-01-01T00:00:00+00:00"  # widened backward
+        assert row["last_seen"] == "2026-01-02T00:00:00+00:00"  # unaffected
+        assert row["username"] == "real"  # stale min observation didn't clobber state
+
+
 def test_join_to_send_flag_is_persisted(tmp_path):
     """`join_to_send` is the passivity guardrail the `discussion` collector's
     preflight relies on to decide whether reading a linked group requires

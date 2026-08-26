@@ -182,6 +182,73 @@ def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkey
     assert "notachannel" in result.output
 
 
+def test_reproject_warns_on_a_zero_target_run(tmp_path, monkeypatch, caplog):
+    # A run with no ResolvedPeer at all has no target to replay a collect
+    # against, so every raw row in its window is silently dropped from the
+    # reprojected DB. `replayed_any` only catches the all-runs-empty case;
+    # a single zero-target run in an otherwise healthy source must still
+    # surface a warning (adversarial-reviewer, round 2), and the good run
+    # must still reproject. `reproject`'s own `log.warning` reaches the
+    # `paperboy.cli` logger's RichHandler (console output goes through a
+    # separate `rich.Console`, never `CliRunner`'s captured `result.output`
+    # — see `configure_logging`), so this asserts on `caplog`, not output.
+    db = tmp_path / "default" / "paperboy.sqlite"
+    resolve = json.loads(Path("tests/fixtures/tl/resolve_durov.json").read_text())
+    full_channel = json.loads(Path("tests/fixtures/tl/full_channel.json").read_text())
+    with Store.open(db) as st:
+        st.begin_run("good")
+        st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw(resolve.get("_"), resolve, "stranger", {"target": "@durov"})
+        st.add_raw(full_channel.get("_"), full_channel, "stranger", {"channel_id": 5})
+        st.begin_run("orphan")
+        st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="paperboy.cli"):
+        result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert "orphan" in caplog.text and "no resolve records" in caplog.text
+    out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
+    assert out.execute("SELECT count(*) FROM channels WHERE id=5").fetchone()[0] == 1
+    out.close()
+
+
+def test_reproject_preserves_every_pass_of_consecutive_channel_only_runs(tmp_path, monkeypatch):
+    # `paperboy collect @x --phases channel` (a legal phase set — cli.py only
+    # rejects *dependent* phases without `channel`) writes exactly self /
+    # ResolvedPeer / ChatFull — all opening-kind rows, nothing substantive.
+    # Two or more such passes in a row leave no non-opening row between them
+    # to end the pending cluster, so a segmentation bug that only cuts once
+    # per contiguous run of opening rows collapses all three passes into one
+    # run (correctness-reviewer, round 2) — silently discarding two of three
+    # real historical `channel_snapshots` observations. Verified directly
+    # against `replay.py`'s `_resolve_pending`: reverting the per-pass-role
+    # split back to a single cut per cluster drops this from 3 to 1 run.
+    db = tmp_path / "default" / "paperboy.sqlite"
+    resolve = json.loads(Path("tests/fixtures/tl/resolve_durov.json").read_text())
+    full_channel = json.loads(Path("tests/fixtures/tl/full_channel.json").read_text())
+    counts = (1000, 1001, 1002)
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        for n in counts:
+            full = {
+                **full_channel,
+                "full_chat": {**full_channel["full_chat"], "participants_count": n},
+            }
+            st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
+            st.add_raw(resolve.get("_"), resolve, "stranger", {"target": "@durov"})
+            st.add_raw(full_channel.get("_"), full, "stranger", {"channel_id": 5})
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
+    seen = [
+        r[0] for r in out.execute(
+            "SELECT participants_count FROM channel_snapshots ORDER BY id"
+        )
+    ]
+    out.close()
+    assert seen == list(counts)
+
+
 # ---------------------------------------------------------------------------
 # Task 7: the correctness battery — round-trip identity + guardrails (spec §7)
 # ---------------------------------------------------------------------------
@@ -189,16 +256,20 @@ def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkey
 # D5 (plan): equality modulo autoincrement pks and source_raw_id, compared as
 # DISTINCT row sets — replay legitimately serves one observation through two
 # paths (getHistory + getChannelDifference), duplicating byte-identical rows.
-# `raw_records.run_id` (ADR-0005) is excluded too, same spirit as `id`: it is
-# a synthetic pass-grouping identifier, not observed content. A legacy
-# (pre-migration) source's rows carry NULL run_id but replay LABELS their
-# inferred segment `legacy-0001...` when writing the target, so literal
-# run_id equality would never hold for a real archive predating this column
-# even though the replay is faithful; for a stamped source the source's own
-# run_id is threaded straight through to the target, so excluding it here
-# loses no real signal either way.
+# `raw_records.run_id` is NOT excluded: every source these tests build goes
+# through `collect_channel`, which always calls `store.begin_run(...)`, so
+# every source here is STAMPED — the source's own run_id is threaded straight
+# through to the target (recipes.py's `run_id` parameter / `reproject.py`
+# passing `run.run_id`), and literal equality is exactly ADR-0005's headline
+# invariant ("a reprojected DB carries the same pass structure as its source
+# and is itself faithfully re-reprojectable"). A genuinely legacy (pre-
+# migration, unstamped) source would need its NULL run_ids mapped through
+# replay's inferred `legacy-NNNN` labels before comparing — see
+# `test_reproject_parity.py`'s `_norm_run_id` for that normalisation — but no
+# round-trip source built here is legacy, so excluding the column would only
+# hide a regression, not accommodate a real case.
 ROUND_TRIP_EXCLUDE = {
-    "raw_records": {"id", "run_id"},
+    "raw_records": {"id"},
     "channels": {"source_raw_id"},
     "channel_snapshots": {"id", "source_raw_id"},
     "peers": {"source_raw_id"},
@@ -484,5 +555,21 @@ def test_reproject_does_not_truncate_a_backward_multi_run_backfill(tmp_path, mon
     assert result.exit_code == 0, result.output
     out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
     reprojected_ids = {r[0] for r in out.execute("SELECT msg_id FROM messages")}
+    sweep = json.loads(
+        out.execute(
+            "SELECT value_json FROM sync_state WHERE scope='history_sweep' AND key='5'"
+        ).fetchone()[0]
+    )
     out.close()
     assert reprojected_ids == source_ids
+    # adversarial-reviewer, round 2: `_reset_incremental_backfill_state`
+    # used to blanket-DELETE `history_sweep` before EVERY replayed run,
+    # discarding run 1's high-water mark before run 2 ran — the
+    # reprojected DB ended with `max_id_seen=850` (run 2's own local
+    # window) instead of the true global maximum (1000, from run 1). The
+    # high-water mark must now survive across runs, widening monotonically
+    # exactly as a live multi-session backfill's does; only the per-run
+    # completeness flags reset.
+    assert sweep["max_id_seen"] == 1000
+    assert sweep["pending_high"] == 1000
+    assert sweep["backfill_complete"] is True
