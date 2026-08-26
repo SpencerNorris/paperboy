@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
@@ -23,6 +24,24 @@ from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
+
+
+class ReprojectSourceError(Exception):
+    """The source raw log's run structure cannot be trusted (ADR-0005) — a
+    corrupt or hand-edited DB, never a data condition a normal collect could
+    produce. Operator-facing: `reproject.py`/`cli.py` catch it."""
+
+
+@dataclass(frozen=True)
+class ReplayRun:
+    """One historical collect pass (ADR-0005), as a contiguous `raw_records`
+    rowid range. `run_id` is the real stamped id for a post-migration pass,
+    or an inferred `legacy-NNNN` label (capture order) for pre-migration rows
+    — see `ReplaySource.runs()`."""
+
+    run_id: str
+    lo: int  # first raw rowid of the pass (inclusive)
+    hi: int  # last raw rowid of the pass (inclusive)
 
 
 def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
@@ -65,55 +84,118 @@ class ReplaySource:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def resolve_targets(self) -> list[str]:
-        """Every distinct `target` a `resolve()` was recorded against, in
-        first-seen (capture) order — `reproject` re-runs a full collect per
-        target."""
+    def runs(self) -> list[ReplayRun]:
+        """Capture-ordered collect passes (ADR-0005). Stamped rows group by
+        `run_id`; legacy NULL rows are segmented at each `tier='self'` User
+        record — every collect pass's first raw write (`collectors/channel.py`
+        writes self before anything, and the CLI refuses dependent phases
+        without `channel`) — rows before the first marker join the first
+        segment. Runs must be contiguous rowid ranges (one sequential process
+        per pass); interleaving means a corrupt source and fails loudly."""
+        rows = self.conn.execute(
+            "SELECT id, run_id, tier, lower(kind) AS k FROM raw_records ORDER BY id"
+        ).fetchall()
+        runs: list[ReplayRun] = []
+        current_id: str | None = None
+        legacy_n = 0
+        lo: int | None = None
+        hi: int | None = None
+        seen_run_ids: set[str] = set()
+
+        def _flush() -> None:
+            nonlocal lo, hi
+            if lo is not None:
+                assert current_id is not None
+                assert hi is not None
+                runs.append(ReplayRun(current_id, lo, hi))
+                lo = hi = None
+
+        for row in rows:
+            next_id: str
+            if row["run_id"] is not None:
+                stamped_id: str = row["run_id"]
+                boundary = stamped_id != current_id
+                next_id = stamped_id
+            else:
+                is_marker = row["tier"] == "self" and (
+                    row["k"] == "user" or row["k"].endswith(".user")
+                )
+                boundary = is_marker or current_id is None
+                if boundary:
+                    next_id = f"legacy-{legacy_n + 1:04d}"
+                else:
+                    assert current_id is not None  # boundary is False => not the first row
+                    next_id = current_id
+            if boundary:
+                _flush()
+                if next_id in seen_run_ids:
+                    raise ReprojectSourceError(
+                        f"raw log run {next_id!r} is not contiguous — refusing to replay"
+                    )
+                seen_run_ids.add(next_id)
+                if row["run_id"] is None:
+                    legacy_n += 1
+                current_id = next_id
+                lo = row["id"]
+            hi = row["id"]
+        _flush()
+        return runs
+
+    def resolve_targets(self, run: ReplayRun) -> list[str]:
+        """Every distinct `target` a `resolve()` was recorded against WITHIN
+        `run`, in first-seen (capture) order — `reproject` re-runs a full
+        collect per target per historical run (ADR-0005)."""
         kind_sql, kind_params = _kind_clause(("resolvedpeer",))
         rows = self.conn.execute(
             "SELECT json_extract(context_json, '$.target') AS target FROM raw_records "
-            f"WHERE {kind_sql} AND target IS NOT NULL ORDER BY id",
-            kind_params,
+            f"WHERE {kind_sql} AND target IS NOT NULL AND id BETWEEN ? AND ? ORDER BY id",
+            (*kind_params, run.lo, run.hi),
         ).fetchall()
         seen: dict[str, None] = {}
         for r in rows:
             seen.setdefault(r["target"])
         return list(seen)
 
-    def linked_group_ids(self) -> set[int]:
+    def linked_group_ids(self, run: ReplayRun) -> set[int]:
         kind_sql, kind_params = _kind_clause(("chatfull",))
         rows = self.conn.execute(
             "SELECT json_extract(payload_json, '$.full_chat.linked_chat_id') AS g "
-            f"FROM raw_records WHERE {kind_sql}",
-            kind_params,
+            f"FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ?",
+            (*kind_params, run.lo, run.hi),
         ).fetchall()
         return {r["g"] for r in rows if r["g"]}
 
-    def has_kind(self, *kinds: str) -> bool:
+    def has_kind(self, run: ReplayRun, *kinds: str) -> bool:
         kind_sql, kind_params = _kind_clause(kinds)
         return self.conn.execute(
-            f"SELECT 1 FROM raw_records WHERE {kind_sql} LIMIT 1",
-            kind_params,
+            f"SELECT 1 FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ? LIMIT 1",
+            (*kind_params, run.lo, run.hi),
         ).fetchone() is not None
 
-    def has_context_channel(self, channel_ids: set[int]) -> bool:
+    def has_context_channel(self, run: ReplayRun, channel_ids: set[int]) -> bool:
         return any(
             self.conn.execute(
                 "SELECT 1 FROM raw_records "
-                "WHERE json_extract(context_json, '$.channel_id') = ? LIMIT 1",
-                (cid,),
+                "WHERE json_extract(context_json, '$.channel_id') = ? "
+                "AND id BETWEEN ? AND ? LIMIT 1",
+                (cid, run.lo, run.hi),
             ).fetchone() is not None
             for cid in channel_ids
         )
 
 
 class RawReplayGateway:
-    """`Gateway` served from a raw log. Never touches the network — there is
-    no client, no session, no `Budget` anywhere in this class."""
+    """`Gateway` served from a raw log, scoped to ONE historical `ReplayRun`
+    (ADR-0005) — every query below is additionally bounded to
+    `id BETWEEN run.lo AND run.hi`, so within one run each call site has at
+    most one matching record, same as a live RPC has one now. Never touches
+    the network — there is no client, no session, no `Budget` anywhere in
+    this class."""
 
-    def __init__(self, source: ReplaySource, clock: ReplayClock) -> None:
+    def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None:
         self._src = source
         self._clock = clock
+        self._run = run
         # get_channel_difference is inherently sequential (a pts catch-up
         # loop); a per-channel cursor over the stored pages models that.
         self._diff_cursor: dict[int, int] = {}
@@ -124,8 +206,8 @@ class RawReplayGateway:
         kind_sql, kind_params = _kind_clause(kinds)
         return self._src.conn.execute(
             f"SELECT observed_at, payload_json FROM raw_records "
-            f"WHERE {kind_sql} AND {where} ORDER BY id DESC LIMIT 1",
-            (*kind_params, *params),
+            f"WHERE {kind_sql} AND {where} AND id BETWEEN ? AND ? ORDER BY id DESC LIMIT 1",
+            (*kind_params, *params, self._run.lo, self._run.hi),
         ).fetchone()
 
     def _serve(self, row: sqlite3.Row) -> dict:
@@ -139,8 +221,8 @@ class RawReplayGateway:
         rows = self._src.conn.execute(
             "SELECT observed_at, payload_json, "
             "json_extract(context_json, '$.target') AS target "
-            f"FROM raw_records WHERE {kind_sql} ORDER BY id DESC",
-            kind_params,
+            f"FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ? ORDER BY id DESC",
+            (*kind_params, self._run.lo, self._run.hi),
         ).fetchall()
         for row in rows:
             raw_target = row["target"]
@@ -181,8 +263,12 @@ class RawReplayGateway:
             f"WHERE {kind_sql} "
             "AND json_extract(context_json, '$.channel_id') = ? "
             "AND (? = 0 OR CAST(json_extract(payload_json, '$.id') AS INTEGER) < ?) "
+            "AND id BETWEEN ? AND ? "
             "ORDER BY msg_id DESC, id ASC",
-            (*kind_params, input_channel["channel_id"], offset_id, offset_id),
+            (
+                *kind_params, input_channel["channel_id"], offset_id, offset_id,
+                self._run.lo, self._run.hi,
+            ),
         ).fetchall()
         # Never split one msg_id's records across pages: the collector's next
         # cursor is `min(page ids)` and the next page takes strictly-below,
@@ -232,8 +318,9 @@ class RawReplayGateway:
             "SELECT observed_at, payload_json FROM raw_records "
             "WHERE lower(kind) LIKE '%channeldifference%' "
             "AND json_extract(context_json, '$.channel_id') = ? "
+            "AND id BETWEEN ? AND ? "
             "ORDER BY id ASC LIMIT 1 OFFSET ?",
-            (channel_id, idx),
+            (channel_id, self._run.lo, self._run.hi, idx),
         ).fetchone()
         self._diff_cursor[channel_id] = idx + 1
 
@@ -244,8 +331,9 @@ class RawReplayGateway:
             # counts already applied this run.
             stamp = self._src.conn.execute(
                 "SELECT MAX(observed_at) AS t FROM raw_records "
-                "WHERE json_extract(context_json, '$.channel_id') = ?",
-                (channel_id,),
+                "WHERE json_extract(context_json, '$.channel_id') = ? "
+                "AND id BETWEEN ? AND ?",
+                (channel_id, self._run.lo, self._run.hi),
             ).fetchone()
             synthetic = {"_": "updates.channelDifferenceEmpty", "final": True, "pts": pts}
             self._clock.begin_batch()
@@ -348,8 +436,9 @@ class RawReplayGateway:
         rows = self._src.conn.execute(
             "SELECT observed_at, payload_json FROM raw_records "
             f"WHERE {kind_sql} "
-            "AND json_extract(context_json, '$.channel_id') = ? ORDER BY id ASC",
-            (*kind_params, input_channel["channel_id"]),
+            "AND json_extract(context_json, '$.channel_id') = ? "
+            "AND id BETWEEN ? AND ? ORDER BY id ASC",
+            (*kind_params, input_channel["channel_id"], self._run.lo, self._run.hi),
         ).fetchall()
         self._clock.begin_batch()
         if not rows:
@@ -365,27 +454,31 @@ class RawReplayGateway:
 
 
 class RawReplayWebClient:
-    """Serve stored `tme_page`/`wayback_cdx` captures as `httpx.Response`s.
+    """Serve stored `tme_page`/`wayback_cdx` captures as `httpx.Response`s,
+    scoped to ONE historical `ReplayRun` (ADR-0005).
 
     Keyed by exact URL — the web collector re-derives the same URL sequence
     from the same parsed posts, so replay requests exactly the recorded set.
-    Repeat captures of one URL (multi-run sources) serve in capture order.
-    An unrecorded URL is a definitive empty 404: the page loop must stop
-    cleanly there, exactly where the original run stopped.
+    Repeat captures of one URL WITHIN a run serve in capture order (a
+    reproject re-instantiates this client per run, so the cursor never
+    crosses a run boundary). An unrecorded URL is a definitive empty 404: the
+    page loop must stop cleanly there, exactly where the original run
+    stopped.
     """
 
-    def __init__(self, source: ReplaySource, clock: ReplayClock) -> None:
+    def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None:
         self._src = source
         self._clock = clock
+        self._run = run
         self._served: dict[str, int] = {}  # url -> raw id already served
 
     def get(self, url: str) -> httpx.Response:
         row = self._src.conn.execute(
             "SELECT id, observed_at, payload_json FROM raw_records "
             "WHERE lower(kind) IN ('tme_page', 'wayback_cdx') "
-            "AND json_extract(payload_json, '$.url') = ? AND id > ? "
+            "AND json_extract(payload_json, '$.url') = ? AND id > ? AND id <= ? "
             "ORDER BY id ASC LIMIT 1",
-            (url, self._served.get(url, 0)),
+            (url, self._served.get(url, self._run.lo - 1), self._run.hi),
         ).fetchone()
         if row is None:
             return httpx.Response(404, text="")
