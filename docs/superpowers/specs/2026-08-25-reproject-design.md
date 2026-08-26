@@ -1,8 +1,8 @@
 # `reproject` — rebuild projections from the raw log, no network
 
-**Status:** design, 2026-08-25. Realizes the raw-first thesis
-(`raw_records` is the system of record; normalized tables are a projection that
-can be rebuilt from raw) as an actual command.
+**Status:** shipped, 2026-08-26 (see §10, Implementation notes). Realizes the
+raw-first thesis (`raw_records` is the system of record; normalized tables
+are a projection that can be rebuilt from raw) as an actual command.
 **Execution:** one `single-feature-run` on `feat/reproject`.
 
 ## 1. Goal
@@ -147,3 +147,86 @@ real collectors run.
   everything already captured, including the since-deleted content that lives
   only in raw — with no Telegram call. A live re-run is then needed only for
   genuinely-new data and the people layer.
+
+## 10. Implementation notes (2026-08-26)
+
+Shipped per `docs/superpowers/plans/2026-08-26-reproject.md`. Deviations from
+§3/§7 above, each forced by the round-trip identity test (D5 below) being the
+correctness contract rather than a direction change:
+
+- **D4.1 — `get_messages` placeholder.** An id with no raw record returns
+  `{"_": "ReplayUnknownMessage", "id": i}`, not a synthetic `messageEmpty` —
+  the latter would fabricate deletion evidence (`mark_deleted(evidence=
+  'empty')`) for ids the original run never actually observed as deleted
+  (a gap the probe found alive, or a range only reachable via replayed
+  catch-up). The collector skips any non-`messageEmpty` shape, so the
+  placeholder projects nothing — exactly the source's state.
+- **D4.2 — `get_sponsored_messages` envelope reconstruction.** The original
+  collector never stores the `SponsoredMessages` envelope, only each
+  `SponsoredMessage` individually; replay reconstructs
+  `{"_": "SponsoredMessages", "messages": [...]}` from those records, and
+  serves `{"_": "sponsoredMessagesEmpty"}` when none exist (empty-and-skipped
+  originals are indistinguishable; both project nothing).
+- **D4.3 — `join_channel` is a synthetic no-op**, and reproject always runs
+  with `allow_join=True` — otherwise a source whose original run used
+  `--join` would skip its discussion sweep and lose projections on replay.
+  No network is involved; nothing is joined, because no session exists.
+- **D4.4 — `get_channel_difference` past the last stored page** serves a
+  synthetic final `{"_": "updates.channelDifferenceEmpty", "final": True,
+  "pts": pts}`, not `SkipAndRecord` — a mid-`catch_up` `SkipAndRecord` would
+  mark the whole folded history phase skipped and discard the backfill
+  counts already applied that run. This is why the round-trip test excludes
+  `raw_records` specifically for an interrupted/partial source
+  (`test_partial_interrupted_source_reprojects_to_same_partial_state`): the
+  synthetic closing page has no raw counterpart in the (crashed) original.
+- **D4.5 — phase-set reproduction is by raw-*kind* detection**
+  (`detect_phases`), not per-method `SkipAndRecord` alone — the `graph`
+  phase's mention scan is RPC-free and would otherwise project edges into a
+  graph-less source's reproject that the original run never had.
+- **D4.6 — kind matching is namespace-tolerant, found live, not in
+  design.** Telethon's `to_dict()` prefixes some RPC-result *envelope*
+  types with their TL namespace (`contacts.resolvedPeer` for `ResolvedPeer`,
+  `messages.chatFull` for `ChatFull`, `updates.channelDifference*` for
+  `ChannelDifference*`) but not others (`Message`, `ChatInvite*`,
+  `SponsoredMessage`, `MediaDownload`, `User`, ...). §3's method table
+  implicitly assumed one consistent shape; every kind lookup in `replay.py`
+  now matches a bare kind or any `<namespace>.<kind>` suffix
+  (`_kind_clause`). Undetected against the hand-authored fixtures (which
+  happened to use the real casing already) — only surfaced running
+  `reproject` against the actual `default` archive, which is exactly why
+  §9's real-archive smoke step exists as part of DoD, not just the fixture
+  suite.
+- **D4.7 — one bad historical target must not abort the whole run.** Not
+  anticipated by §3/§7 at all: a source can carry raws from more than one
+  historically-resolved target (successive live `collect` invocations), and
+  `collect_channel` was designed for exactly one target per call — it has no
+  notion of "this target, among several, turned out bad" (e.g. one later
+  resolving to a non-channel peer, which crashes `channel.collect` with a
+  bare `ValueError` even on a live run). Found on the real archive: a stray
+  historical target crashed the *entire* multi-target reproject after the
+  primary channel's full phase set had already completed and committed.
+  Fixed with a per-target `try/except` in `reproject()` that logs the
+  failure and records it as that target's own failed result, leaving every
+  other target's already-committed projections intact. The underlying
+  `channel.py` crash-instead-of-skip behavior is orthogonal to reproject (a
+  live-collect defect this smoke test happened to surface) and is tracked
+  separately as issue #34; the source-wide-not-per-target phase-detection
+  scope this multi-target case also exposed (one source, two spellings of
+  the same channel, redundantly reprojected twice) is tracked as issue #35.
+
+**D5 — round-trip equality contract.** All of `raw_records`, `channels`,
+`channel_snapshots`, `peers`, `messages`, `message_revisions`,
+`message_metrics`, `message_tombstones`, `edges`, `media`, `custody_log`,
+`web_snapshots` compared as **sets of distinct rows** after dropping
+autoincrement pk columns and `source_raw_id` (`source_raw_id` is such an id
+transitively — the referenced record's *content* round-trips via the
+`raw_records` comparison itself). Set, not multiset: a message delivered by
+both `getHistory` and `getChannelDifference` is legitimately served twice on
+replay, producing byte-identical duplicate raw/metrics rows — real signal
+(two independent observations), not a bug to dedupe away. `run_events`,
+`sync_state`, `sync_ranges`, `flood_log`, `schema_migrations`,
+`messages_fts` are excluded as operational/bookkeeping, not projections of
+raw content. Verified live against the real `default` archive
+(`docs/features/reproject.md`): source `channels.flags_json` (10 flags,
+pre-#20-fix) reprojects to the current 48-flag set; the source's one
+leftover self peer row (pre-#12-fix) reprojects to zero.
