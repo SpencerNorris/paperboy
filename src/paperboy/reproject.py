@@ -93,11 +93,26 @@ async def reproject(
             WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
             MediaCollector(),
         ]
-        results[raw_target] = await collect_channel(
-            gateway, out_store, replay_settings, parse_target(raw_target),
-            list(active_phases), log,
-            collectors=collectors, profile=profile, clock=clock,
-        )
+        try:
+            results[raw_target] = await collect_channel(
+                gateway, out_store, replay_settings, parse_target(raw_target),
+                list(active_phases), log,
+                collectors=collectors, profile=profile, clock=clock,
+            )
+        except Exception as exc:
+            # collect_channel was designed for exactly one target per run and
+            # has no notion of "this target, among several, turned out bad" —
+            # e.g. a historically-resolved target that later resolves to a
+            # non-channel peer crashes channel.collect with a bare
+            # ValueError even on a live run (found exercising this against a
+            # real archive — DoD smoke, docs/features/reproject.md). A
+            # multi-target reproject must not let one such target discard
+            # every other target's projections already committed to
+            # out_store this run. The failure is recorded, not swallowed.
+            log.error("reproject: target %r failed: %s", raw_target, exc)
+            results[raw_target] = [
+                CollectResult(name="target", counts={}, stopped=f"error: {exc}")
+            ]
 
     counts = {
         t: (

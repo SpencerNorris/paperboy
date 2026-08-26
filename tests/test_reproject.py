@@ -111,6 +111,38 @@ def test_cli_reproject_custom_out_path(tmp_path, monkeypatch):
     assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
 
 
+def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkeypatch):
+    # A source archive can carry more than one resolved target across its
+    # history (successive `collect` runs against different inputs, found
+    # exercising this against a real archive — DoD smoke, see the feature
+    # doc). One later turning out not to be a channel (an accidental collect
+    # against a user, say) crashes `channel.collect`'s `_resolved_channel_id`
+    # with a bare ValueError even on a live run; reproject's multi-target
+    # loop must not let that discard every other target's already-committed
+    # projections the way a single crashed `collect` run naturally would.
+    db = tmp_path / "default" / "paperboy.sqlite"
+    with Store.open(db) as st:
+        resolve = json.loads(Path("tests/fixtures/tl/resolve_durov.json").read_text())
+        full_channel = json.loads(Path("tests/fixtures/tl/full_channel.json").read_text())
+        st.add_raw(resolve.get("_"), resolve, "stranger", {"target": "@durov"})
+        st.add_raw(full_channel.get("_"), full_channel, "stranger", {"channel_id": 5})
+        st.add_raw("user", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw(
+            "contacts.resolvedPeer",
+            {"_": "contacts.resolvedPeer", "peer": {"_": "PeerUser", "user_id": 999},
+             "chats": [], "users": [{"_": "User", "id": 999}]},
+            "stranger", {"target": "@notachannel"},
+        )
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    out = sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite")
+    # The good target's channel landed despite the bad target existing too.
+    assert out.execute("SELECT count(*) FROM channels WHERE id=5").fetchone()[0] == 1
+    out.close()
+    assert "notachannel" in result.output
+
+
 # ---------------------------------------------------------------------------
 # Task 7: the correctness battery — round-trip identity + guardrails (spec §7)
 # ---------------------------------------------------------------------------

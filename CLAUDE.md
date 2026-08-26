@@ -12,12 +12,14 @@ database for OSINT / investigative-journalism use. Architected as an entity
 graph so later recipes (user dossier, phone lookup, watchlists) are thin
 additions. See `README.md` for the user-facing summary and disclaimer.
 
-**Status (2026-08-21):** Phase 1 (core) shipped on `feat/core` — `paperboy
+**Status (2026-08-26):** Phase 1 (core) shipped on `feat/core` — `paperboy
 collect`/`status`/`export`/`doctor`/`auth` work end to end against live
 Telegram (see `docs/features/collect-channel.md` for the DoD smoke
-transcript). `watch` and `lookup` are Phase 2 stubs. Phase 2 collectors
-(`discussion`, `participants`, `profiles`, `media`, `graph`, `web`) are not
-started.
+transcript). `watch` and `lookup` are Phase 2 stubs. `paperboy reproject`
+(rebuild every projection from `raw_records`, offline, zero network/
+credentials — see `docs/features/reproject.md`) shipped on `feat/reproject`.
+Phase 2 collectors: `discussion`/`graph`/`media`/`web` are implemented;
+`participants`/`profiles` are not started.
 
 ## Read these first
 
@@ -74,8 +76,10 @@ started.
 [--phases channel,history] [--unsafe]`, `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
-`scripts/login.py`, or `paperboy auth`). `watch`/`lookup` exit 1 with a
-"Phase 2" message — not implemented yet.
+`scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out
+PATH] [--phases a,b,c]` needs none of that — it never touches the network or
+the keychain, only a source `paperboy.sqlite`'s `raw_records`. `watch`/
+`lookup` exit 1 with a "Phase 2" message — not implemented yet.
 
 ## Workflow
 
