@@ -362,3 +362,49 @@ def test_reproject_never_rewrites_media_files(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "write_bytes", _no_write)
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# Revision R (ADR-0005): the two-run round-trip gate (#33)
+# ---------------------------------------------------------------------------
+
+
+def _second_run_fixtures(fx: dict) -> dict:
+    """Run 2 observes one NEW message carrying NEW media, on top of
+    everything run 1 saw — so run 2 exercises incremental backfill, repeat
+    snapshots/metrics/web captures, AND a fresh MediaDownload (which is what
+    makes run 2's media phase raw-detectable, spec D4.5/ADR-0005 residual)."""
+    fx = {**fx, "history": [
+        {
+            "_": "message", "id": 4, "message": "new in run 2",
+            "date": 1769322400, "views": 3,
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 77, "access_hash": 1,
+                    "mime_type": "text/plain",
+                    "attributes": [
+                        {"_": "DocumentAttributeFilename", "file_name": "b.txt"}
+                    ],
+                },
+            },
+        },
+        *fx["history"],
+    ]}
+    fx["media"] = {**fx["media"], 4: b"second run bytes"}
+    return fx
+
+
+@pytest.mark.xfail(
+    reason="#33 / ADR-0005: multi-run replay lands in tasks R2-R5",
+    strict=True,
+)
+def test_two_run_round_trip_identity(tmp_path, monkeypatch):
+    """ADR-0005 gate: a source built from TWO collect passes — the ordinary
+    real-archive shape — must round-trip identically, time series included."""
+    asyncio.run(run_full_collect(tmp_path))
+    db1 = asyncio.run(run_full_collect(tmp_path, mutate_fixtures=_second_run_fixtures))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db1, tmp_path / "default" / "paperboy.reprojected.sqlite")

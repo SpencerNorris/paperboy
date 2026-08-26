@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -118,8 +119,17 @@ def _web_transport() -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-async def run_full_collect(data_dir: Path) -> Path:
-    """Collect every phase into <data_dir>/default/paperboy.sqlite; returns the DB path."""
+async def run_full_collect(
+    data_dir: Path,
+    mutate_fixtures: Callable[[dict], dict] | None = None,
+) -> Path:
+    """Collect every phase into <data_dir>/default/paperboy.sqlite; returns the DB path.
+
+    `mutate_fixtures` (ADR-0005 / #33) lets a caller run a SECOND collect pass
+    against the same DB with varied FakeGateway fixtures — e.g. a later run
+    observing a new message — to exercise multi-run replay. The web transport
+    is unchanged; only the FakeGateway fixtures dict is mutated.
+    """
     settings = load_settings("default", {"data_dir": data_dir})
     db = data_dir / "default" / "paperboy.sqlite"
     web = WebCollector(
@@ -131,9 +141,12 @@ async def run_full_collect(data_dir: Path) -> Path:
     collectors = [
         c for c in _default_collectors(include_media=False, include_web=False)
     ] + [web, MediaCollector()]
+    fixtures = full_collect_fixtures()
+    if mutate_fixtures is not None:
+        fixtures = mutate_fixtures(fixtures)
     with Store.open(db) as store:
         await collect_channel(
-            FakeGateway(full_collect_fixtures()), store, settings,
+            FakeGateway(fixtures), store, settings,
             parse_target("@durov"),
             phases=["channel", "history", "discussion", "graph", "web", "media"],
             log=logging.getLogger("parity"), collectors=collectors,
