@@ -6,6 +6,7 @@ every real object gets built here so tests can monkeypatch one seam
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import keyring
@@ -14,6 +15,7 @@ from paperboy.budget import Budget
 from paperboy.config import profile_dir
 from paperboy.gateway import TelethonGateway
 from paperboy.logging_setup import register_secret
+from paperboy.replay import ReplaySource
 from paperboy.secrets import SERVICE, KeyringSecrets
 from paperboy.store.db import Store
 
@@ -125,3 +127,22 @@ async def build_gateway(
 def build_store(settings: Settings, profile: str) -> Store:
     path = profile_dir(settings, profile) / "paperboy.sqlite"
     return Store.open(path)
+
+
+def build_reproject(
+    settings: Settings, profile: str, out_path: Path
+) -> tuple[ReplaySource, Store]:
+    """Wire the replay pair's source + a fresh target `Store`. Deliberately
+    the ONLY composition path for `reproject`: no client, no gateway, no
+    `Budget`, no secrets — a reproject is incapable of touching Telegram,
+    the web, or the keychain (spec §2, §8).
+    """
+    source_db = profile_dir(settings, profile) / "paperboy.sqlite"
+    if not source_db.exists():
+        raise ConfigError(f"no source DB for profile {profile!r} at {source_db}")
+    if out_path.exists():
+        raise ConfigError(
+            f"refusing to overwrite existing {out_path} — move it aside or pass a fresh --out"
+        )
+    media_root = profile_dir(settings, profile) / "media"
+    return ReplaySource.open(source_db, media_root), Store.open(out_path)

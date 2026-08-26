@@ -25,6 +25,24 @@ from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
 
+def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+    """A `WHERE`-fragment matching `lower(kind)` against any of `kinds`,
+    tolerant of the dotted namespace prefix Telethon's `to_dict()` adds to
+    some RPC-result envelope types (`contacts.resolvedPeer` for
+    `ResolvedPeer`, `messages.chatFull` for `ChatFull`) but not others
+    (`Message`, `ChatInvite*`, `SponsoredMessage`, `MediaDownload`, ...).
+    Collectors record `payload.get("_", ...)` verbatim, so replay must match
+    whichever shape the source actually stored, not assume one.
+    """
+    parts: list[str] = []
+    params: list[str] = []
+    for k in kinds:
+        parts.append("(lower(kind) = ? OR lower(kind) LIKE ?)")
+        params.append(k)
+        params.append(f"%.{k}")
+    return "(" + " OR ".join(parts) + ")", tuple(params)
+
+
 class ReplaySource:
     """Read-only access to a source DB's raw log + its content-addressed media."""
 
@@ -51,9 +69,11 @@ class ReplaySource:
         """Every distinct `target` a `resolve()` was recorded against, in
         first-seen (capture) order — `reproject` re-runs a full collect per
         target."""
+        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
         rows = self.conn.execute(
             "SELECT json_extract(context_json, '$.target') AS target FROM raw_records "
-            "WHERE lower(kind) = 'resolvedpeer' AND target IS NOT NULL ORDER BY id"
+            f"WHERE {kind_sql} AND target IS NOT NULL ORDER BY id",
+            kind_params,
         ).fetchall()
         seen: dict[str, None] = {}
         for r in rows:
@@ -61,17 +81,19 @@ class ReplaySource:
         return list(seen)
 
     def linked_group_ids(self) -> set[int]:
+        kind_sql, kind_params = _kind_clause(("chatfull",))
         rows = self.conn.execute(
             "SELECT json_extract(payload_json, '$.full_chat.linked_chat_id') AS g "
-            "FROM raw_records WHERE lower(kind) = 'chatfull'"
+            f"FROM raw_records WHERE {kind_sql}",
+            kind_params,
         ).fetchall()
         return {r["g"] for r in rows if r["g"]}
 
     def has_kind(self, *kinds: str) -> bool:
-        qmarks = ",".join("?" * len(kinds))
+        kind_sql, kind_params = _kind_clause(kinds)
         return self.conn.execute(
-            f"SELECT 1 FROM raw_records WHERE lower(kind) IN ({qmarks}) LIMIT 1",
-            kinds,
+            f"SELECT 1 FROM raw_records WHERE {kind_sql} LIMIT 1",
+            kind_params,
         ).fetchone() is not None
 
     def has_context_channel(self, channel_ids: set[int]) -> bool:
@@ -99,11 +121,11 @@ class RawReplayGateway:
     def _latest(
         self, kinds: tuple[str, ...], where: str, params: tuple
     ) -> sqlite3.Row | None:
-        qmarks = ",".join("?" * len(kinds))
+        kind_sql, kind_params = _kind_clause(kinds)
         return self._src.conn.execute(
             f"SELECT observed_at, payload_json FROM raw_records "
-            f"WHERE lower(kind) IN ({qmarks}) AND {where} ORDER BY id DESC LIMIT 1",
-            (*kinds, *params),
+            f"WHERE {kind_sql} AND {where} ORDER BY id DESC LIMIT 1",
+            (*kind_params, *params),
         ).fetchone()
 
     def _serve(self, row: sqlite3.Row) -> dict:
@@ -113,10 +135,12 @@ class RawReplayGateway:
         return payload
 
     async def resolve(self, target_value: str) -> dict:
+        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
         rows = self._src.conn.execute(
             "SELECT observed_at, payload_json, "
             "json_extract(context_json, '$.target') AS target "
-            "FROM raw_records WHERE lower(kind) = 'resolvedpeer' ORDER BY id DESC"
+            f"FROM raw_records WHERE {kind_sql} ORDER BY id DESC",
+            kind_params,
         ).fetchall()
         for row in rows:
             raw_target = row["target"]
@@ -149,15 +173,16 @@ class RawReplayGateway:
         # cursor. Secondary order id ASC (capture order) so an edited
         # message's revisions replay oldest-first. MessageEmpty is excluded —
         # getHistory never yielded one; they came from the probe.
+        kind_sql, kind_params = _kind_clause(("message", "messageservice"))
         rows = self._src.conn.execute(
             "SELECT id, observed_at, payload_json, "
             "CAST(json_extract(payload_json, '$.id') AS INTEGER) AS msg_id "
             "FROM raw_records "
-            "WHERE lower(kind) IN ('message', 'messageservice') "
+            f"WHERE {kind_sql} "
             "AND json_extract(context_json, '$.channel_id') = ? "
             "AND (? = 0 OR CAST(json_extract(payload_json, '$.id') AS INTEGER) < ?) "
             "ORDER BY msg_id DESC, id ASC",
-            (input_channel["channel_id"], offset_id, offset_id),
+            (*kind_params, input_channel["channel_id"], offset_id, offset_id),
         ).fetchall()
         # Never split one msg_id's records across pages: the collector's next
         # cursor is `min(page ids)` and the next page takes strictly-below,
@@ -199,9 +224,13 @@ class RawReplayGateway:
         del limit
         channel_id = input_channel["channel_id"]
         idx = self._diff_cursor.get(channel_id, 0)
+        # Substring, not prefix/suffix: the stored kind is one of
+        # `updates.channelDifference`/`...Empty`/`...TooLong` — namespaced
+        # AND suffixed, so `_kind_clause`'s suffix tolerance doesn't cover
+        # it; a plain "contains" match does.
         row = self._src.conn.execute(
             "SELECT observed_at, payload_json FROM raw_records "
-            "WHERE lower(kind) LIKE 'channeldifference%' "
+            "WHERE lower(kind) LIKE '%channeldifference%' "
             "AND json_extract(context_json, '$.channel_id') = ? "
             "ORDER BY id ASC LIMIT 1 OFFSET ?",
             (channel_id, idx),
@@ -315,11 +344,12 @@ class RawReplayGateway:
         return {"_": "Updates", "updates": []}
 
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
+        kind_sql, kind_params = _kind_clause(("sponsoredmessage",))
         rows = self._src.conn.execute(
             "SELECT observed_at, payload_json FROM raw_records "
-            "WHERE lower(kind) = 'sponsoredmessage' "
+            f"WHERE {kind_sql} "
             "AND json_extract(context_json, '$.channel_id') = ? ORDER BY id ASC",
-            (input_channel["channel_id"],),
+            (*kind_params, input_channel["channel_id"]),
         ).fetchall()
         self._clock.begin_batch()
         if not rows:
