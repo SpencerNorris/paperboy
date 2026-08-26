@@ -384,6 +384,45 @@ def test_runs_raises_on_a_genuinely_interleaved_stamped_run_id(tmp_path):
         src.runs()
 
 
+def test_runs_splits_consecutive_all_opening_passes(tmp_path):
+    # `paperboy collect @x --phases channel` writes exactly self/Resolved-
+    # Peer/ChatFull — all three opening-kind — and nothing substantive. Two
+    # or more such passes in a row leave NO non-opening row between them to
+    # end the pending cluster, so the whole run of opening rows must be cut
+    # at each REPEATED role rather than folded into one giant cluster
+    # (correctness-reviewer, round 2): three back-to-back channel-only
+    # passes must yield three runs, not one.
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        for _ in range(3):
+            st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+            st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                       {"target": "@x"})
+            st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 3), ("legacy-0002", 4, 6), ("legacy-0003", 7, 9),
+    ]
+
+
+def test_runs_splits_consecutive_resolve_full_self_passes(tmp_path):
+    # Same failure class as above, with the pre-invariant resolve/full/self
+    # ordering (see `test_runs_absorbs_resolve_before_self_at_every_
+    # boundary`): two back-to-back passes, each opening-only, must still cut
+    # at the second pass's `ResolvedPeer` (the first repeated role).
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        for _ in range(2):
+            st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                       {"target": "@x"})
+            st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+            st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 3), ("legacy-0002", 4, 6),
+    ]
+
+
 def test_runs_mixed_legacy_then_stamped(tmp_path):
     # Legacy segment(s) precede stamped runs — the migration boundary shape.
     db = tmp_path / "src.sqlite"

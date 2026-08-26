@@ -76,11 +76,12 @@ def upsert_peer(
             "seen_in_chat = CASE WHEN ? >= last_seen THEN ? ELSE seen_in_chat END, "
             "seen_in_msg  = CASE WHEN ? >= last_seen THEN ? ELSE seen_in_msg  END, "
             "source_raw_id = CASE WHEN ? >= last_seen THEN ? ELSE source_raw_id END, "
+            "first_seen = MIN(first_seen, ?), "
             "last_seen = MAX(last_seen, ?) "
             "WHERE uri=?",
             (
                 observed_at, seen_in_chat, observed_at, seen_in_msg,
-                observed_at, source_raw_id, observed_at, uri,
+                observed_at, source_raw_id, observed_at, observed_at, uri,
             ),
         )
         return uri

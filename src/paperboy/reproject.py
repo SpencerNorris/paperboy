@@ -4,6 +4,7 @@ store. Everything collector-shaped is reused; this module only wires."""
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 
@@ -18,7 +19,7 @@ from paperboy.collectors.web import WebCollector
 from paperboy.config import Settings
 from paperboy.recipes import collect_channel
 from paperboy.replay import RawReplayGateway, RawReplayWebClient, ReplayRun, ReplaySource
-from paperboy.store.db import Store
+from paperboy.store.db import Store, dumps
 from paperboy.targets import parse_target
 
 
@@ -42,7 +43,9 @@ class ReprojectSummary:
 
 def _reset_incremental_backfill_state(out_store: Store) -> None:
     """Clear `HistoryCollector`'s incremental-vs-full-sweep bookkeeping
-    (`sync_state` scopes `history`/`history_sweep`) before replaying a run.
+    before replaying a run — `sync_state('history', ...)`'s resume cursor
+    entirely, `sync_state('history_sweep', ...)`'s per-run-artifact flags
+    only (see below).
 
     Found running the R6 real-archive smoke (ADR-0005): `RawReplayGateway.
     iter_history` is scoped to ONE run's own raw_records window, so it
@@ -57,13 +60,38 @@ def _reset_incremental_backfill_state(out_store: Store) -> None:
     sweep to incremental-only (ids above the previous run's high-water
     mark) — silently dropping every one of that run's own, all-older
     messages, which is exactly the shape a real multi-session backward
-    backfill takes. Resetting before every run costs nothing here (no
-    network, no rate limit to economize on the way live incremental sync
-    does) and makes each run independently sweep its own full raw window;
+    backfill takes. `history`'s resume cursor (`offset_id`) is entirely a
+    REPLAY-run-scoped artifact too — a fresh full sweep must always restart
+    each run's own window from its newest message, never resume from
+    wherever a DIFFERENT run's window left its cursor — so that scope is
+    always cleared outright.
+
+    `history_sweep`'s `max_id_seen`/`pending_high` are NOT a replay
+    artifact, though: they are the true high-water mark of the highest
+    message id ever observed for the channel, and must keep monotonically
+    widening across replayed runs exactly as they would across live
+    sessions (a live multi-session backward backfill never resets them
+    either — only a completed sweep's own two flags reset per run). Blanket-
+    deleting the whole scope here — as an earlier revision did — collapsed
+    the final reprojected `history_sweep` down to only the LAST run's own
+    local window (found in review: a two-run backward backfill of ids
+    851..1000 then 701..850 reprojected to `max_id_seen=850`, discarding the
+    source's true 1000). Only the two per-run-artifact flags reset here; the
+    high-water mark columns are read back unchanged and carried forward —
     idempotent projection upserts make any resulting re-processing of
-    already-seen messages harmless.
+    already-seen messages harmless regardless.
     """
-    out_store.conn.execute("DELETE FROM sync_state WHERE scope IN ('history', 'history_sweep')")
+    out_store.conn.execute("DELETE FROM sync_state WHERE scope = 'history'")
+    for row in out_store.conn.execute(
+        "SELECT key, value_json FROM sync_state WHERE scope = 'history_sweep'"
+    ).fetchall():
+        value = json.loads(row["value_json"])
+        value["backfill_complete"] = False
+        value["incremental_in_progress"] = False
+        out_store.conn.execute(
+            "UPDATE sync_state SET value_json = ? WHERE scope = 'history_sweep' AND key = ?",
+            (dumps(value), row["key"]),
+        )
 
 
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
@@ -124,7 +152,21 @@ async def reproject(
         for p in run_phases:
             if p not in phases_seen:
                 phases_seen.append(p)
-        for raw_target in source.resolve_targets(run):
+        run_targets = source.resolve_targets(run)
+        if not run_targets:
+            # A run with no ResolvedPeer at all — no target to replay a
+            # collect against, so every raw row in its window is silently
+            # dropped from the reprojected DB. `replayed_any` below only
+            # catches the case where NO run anywhere resolved a target;
+            # without a per-run warning a single zero-target run in an
+            # otherwise healthy source vanishes with no signal to the
+            # operator (adversarial-reviewer, round 2).
+            log.warning(
+                "reproject: run %s (raw ids %d-%d) has no resolve records — "
+                "skipping %d raw rows",
+                run.run_id, run.lo, run.hi, run.hi - run.lo + 1,
+            )
+        for raw_target in run_targets:
             replayed_any = True
             clock = ReplayClock()
             gateway = RawReplayGateway(source, clock, run)

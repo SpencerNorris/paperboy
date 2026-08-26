@@ -186,18 +186,21 @@ real-archive re-run"):
   phase there — which also means that run's `custody_log` entry (a real,
   historical observation: "this run saw this file again, attached to this
   message") never gets replayed. On the real archive, after the segmentation
-  fix below, this narrows `media`/`custody_log` below the source's counts
-  (`media` 451→449, `custody_log` 607→599) — every row that IS present is
-  correct and complete; nothing beyond a media file's OWN raw trace
-  round-trips. (The first cut of this revision, before the segmentation fix,
-  measured a much larger gap — 451→293, 607→443 — but that number
-  conflated this residual with the distinct segmentation bug below; it did
-  not correctly isolate what #36 alone accounts for.) Deliberately not
-  attempted in this revision (fixing it properly means detecting "ran but
-  found nothing new" as distinct from "didn't run" from raw kinds alone,
-  without fabricating custody observations for runs that genuinely never
-  touched media) — tracked as
-  [#36](https://github.com/SpencerNorris/paperboy/issues/36).
+  fix below, this narrows `custody_log` below the source's count (607→599)
+  — every row that IS present is correct and complete; nothing beyond a
+  media file's OWN raw trace round-trips. (The first cut of this revision,
+  before the segmentation fix, measured a much larger gap — 607→443 — but
+  that number conflated this residual with the distinct segmentation bug
+  below; it did not correctly isolate what #36 alone accounts for.)
+  Deliberately not attempted in this revision (fixing it properly means
+  detecting "ran but found nothing new" as distinct from "didn't run" from
+  raw kinds alone, without fabricating custody observations for runs that
+  genuinely never touched media) — tracked as
+  [#36](https://github.com/SpencerNorris/paperboy/issues/36). (`media`
+  itself narrows too, 451→449, but that 2-file gap is unrelated to #36 — see
+  the DoD smoke transcript below: two files are genuinely missing from this
+  profile's local media directory on disk, so replay's own content-addressed
+  lookup correctly reports them unavailable rather than fabricating bytes.)
 - Deferred (spec §9, deliberately out of scope): an in-place `--force` mode,
   a `--verify`-only mode, incremental reproject of a single phase into an
   existing DB.
