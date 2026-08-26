@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from logging import Logger
 from typing import TYPE_CHECKING, Protocol
 
+from paperboy.clock import Clock, LiveClock
+
 if TYPE_CHECKING:
     from paperboy.config import Settings
     from paperboy.gateway import Gateway
@@ -34,6 +36,12 @@ class CollectContext:
     # at the end with a default rather than threaded through every existing
     # positional `CollectContext(...)` call site (recipes.py, every test).
     profile: str = "default"
+    # Where a projection's `observed_at` comes from (spec §5 / clock.py):
+    # the wall clock on a live collect, the raw log's original stamps on a
+    # reproject replay. Appended with a default for the same reason `profile`
+    # is — every existing positional `CollectContext(...)` construction stays
+    # valid.
+    clock: Clock = field(default_factory=LiveClock)
 
 
 @dataclass

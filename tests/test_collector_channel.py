@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 
+from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.config import load_settings
+from paperboy.recipes import collect_channel
 from paperboy.store.db import Store
 from paperboy.store.sync import get_state
 from paperboy.targets import parse_target
@@ -135,8 +137,10 @@ async def test_channel_collector_picks_the_target_not_the_first_channel(tmp_path
 
 @pytest.mark.asyncio
 async def test_channel_collector_trusts_peer_over_the_chats_vector(tmp_path):
-    # A resolution whose `peer` is not a channel must fail loudly even when a
-    # channel happens to sit in `chats` — position is never identity.
+    # A resolution whose `peer` is not a channel must not be misattributed
+    # to whatever channel happens to sit in `chats` — position is never
+    # identity. A username can legitimately resolve to a user or basic group
+    # (issue #34), so this is a clean skip, not a crash (SkipAndRecord).
     fx = _fixtures()
     fx["resolve"] = {
         "_": "contacts.resolvedPeer",
@@ -149,8 +153,29 @@ async def test_channel_collector_trusts_peer_over_the_chats_vector(tmp_path):
             gw, st, load_settings("default", {}), parse_target("@durov"),
             None, None, "stranger", logging.getLogger("t"),
         )
-        with pytest.raises(ValueError):
+        with pytest.raises(SkipAndRecord):
             await ChannelCollector().collect(ctx)
+
+
+@pytest.mark.asyncio
+async def test_non_channel_resolution_skips_cleanly_through_collect_channel(tmp_path):
+    # #34, run end-to-end: the whole run must not crash — the channel phase
+    # is recorded as a clean skip and later phases (none applicable here,
+    # since `history` needs `channel_id`) do not raise either.
+    fx = _fixtures()
+    fx["resolve"] = {
+        "_": "contacts.resolvedPeer",
+        "peer": {"_": "PeerUser", "user_id": 42},
+        "chats": fx["resolve"]["chats"], "users": [],
+    }
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            gw, st, load_settings("default", {}), parse_target("@durov"),
+            phases=["channel", "history"], log=logging.getLogger("t"),
+        )
+    channel_result = next(r for r in results if r.name == "channel")
+    assert channel_result.stopped == "skip"
 
 
 @pytest.mark.asyncio
@@ -182,7 +207,8 @@ async def test_channel_collector_rejects_resolve_full_identity_mismatch(tmp_path
 @pytest.mark.asyncio
 async def test_channel_collector_rejects_a_resolution_without_peer(tmp_path):
     # `contacts.ResolvedPeer` always carries `peer` in the wild; a response
-    # without it gives us no authoritative identity, so guessing is refused.
+    # without it gives us no authoritative identity, so guessing is refused —
+    # a clean skip (#34), not a crash.
     fx = _fixtures()
     del fx["resolve"]["peer"]
     gw = FakeGateway(fx)
@@ -191,5 +217,5 @@ async def test_channel_collector_rejects_a_resolution_without_peer(tmp_path):
             gw, st, load_settings("default", {}), parse_target("@durov"),
             None, None, "stranger", logging.getLogger("t"),
         )
-        with pytest.raises(ValueError):
+        with pytest.raises(SkipAndRecord):
             await ChannelCollector().collect(ctx)

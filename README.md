@@ -139,6 +139,7 @@ The collecting account's own record is scrubbed from exports.
 | `paperboy collect TARGET [--phases …] [--unsafe] [--profile P]` | Collect channel metadata + history. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
 | `paperboy export TARGET --format jsonl --out DIR [--profile P]` | Export to JSONL. |
+| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. |
 | `paperboy watch` / `paperboy lookup` | Phase 2 — not implemented (exit with a notice). |
 
 `TARGET` accepts `@username`, `t.me/name`, `t.me/name/123`, an invite link, or a
@@ -244,6 +245,7 @@ uv run pyright            # type-check
 - [`docs/opsec.md`](docs/opsec.md) — operator security runbook.
 - [`docs/data-model.md`](docs/data-model.md) — the database codebook (every table and column).
 - [`docs/features/collect-channel.md`](docs/features/collect-channel.md) — the core feature, with the live smoke transcript.
+- [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript.
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.
 - [`docs/superpowers/specs/2026-08-20-paperboy-design.md`](docs/superpowers/specs/2026-08-20-paperboy-design.md) — the design.
 - [`docs/adr/`](docs/adr/) — architecture decisions (library, storage, guardrails, sync).

@@ -22,6 +22,9 @@ from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
 from paperboy.recipes import collect_channel
+from paperboy.replay import ReprojectSourceError
+from paperboy.reproject import ReprojectError
+from paperboy.reproject import reproject as reproject_run
 from paperboy.targets import parse_target
 
 app = typer.Typer(
@@ -304,6 +307,76 @@ def export_cmd(
     for name, n in counts.items():
         table.add_row(f"{name}.jsonl", str(n))
     console.print(table)
+
+
+@app.command()
+def reproject(
+    profile: str = typer.Option("default", "--profile"),
+    out: str = typer.Option(
+        None, "--out",
+        help="Target DB path (default <data_dir>/<profile>/paperboy.reprojected.sqlite). "
+             "The source DB is never touched.",
+    ),
+    phases: str = typer.Option(
+        None, "--phases",
+        help="Comma-separated phase subset; default: auto-detected from the raw log.",
+    ),
+) -> None:
+    """Rebuild all projections from raw_records into a fresh DB — offline,
+    no network, no credentials. See docs/features/reproject.md."""
+    settings = _settings_with_overrides(profile)
+    out_path = Path(out) if out else profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
+    phase_list = phases.split(",") if phases else None
+
+    try:
+        source, out_store = composition.build_reproject(settings, profile, out_path)
+    except composition.ConfigError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from None
+    # Only now that the profile is validated: configure_logging mkdirs the
+    # profile dir, so doing it earlier manufactured `data/<typo>/` for a
+    # profile build_reproject was about to reject (#33 round-2 smoke case 8).
+    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    log = logging.getLogger("paperboy.cli")
+    try:
+        with source, out_store:
+            summary = asyncio.run(
+                reproject_run(source, out_store, settings, profile, phase_list, log)
+            )
+    except (ReprojectError, ReprojectSourceError) as exc:
+        console.print(f"[red]{exc}[/]")
+        out_path.unlink(missing_ok=True)  # don't leave a half-made target behind
+        raise typer.Exit(code=1) from None
+    except Exception:
+        # `build_reproject` already created + migrated `out_path` before this
+        # block runs, so ANY failure here — not just a `ReprojectError` (a
+        # corrupt/unreadable source DB raises a bare `sqlite3.DatabaseError`
+        # from `resolve_targets`, found running this smoke test) — leaves a
+        # half-migrated file at `out_path` behind unless we clean it up too.
+        # Left in place, it would make a retry against the default --out path
+        # hit "refusing to overwrite" for a file that was never actually
+        # usable. Unlike the ReprojectError branch, an unexpected failure is
+        # not translated into a clean message — the real traceback is more
+        # useful for a genuinely unanticipated error than a shim message.
+        out_path.unlink(missing_ok=True)
+        raise
+
+    for raw_target, results in summary.results.items():
+        table = Table(title=f"reproject {raw_target} -> {out_path}")
+        table.add_column("phase")
+        table.add_column("counts")
+        table.add_column("stopped")
+        for r in results:
+            table.add_row(r.name, str(r.counts), r.stopped or "-")
+        console.print(table)
+
+    diff = Table(title="row counts — source vs reprojected")
+    diff.add_column("table")
+    diff.add_column("source")
+    diff.add_column("reprojected")
+    for name, (src_n, out_n) in summary.table_counts.items():
+        diff.add_row(name, str(src_n), str(out_n))
+    console.print(diff)
 
 
 @app.command()

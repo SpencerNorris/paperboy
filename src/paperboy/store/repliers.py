@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 
-from paperboy.ids import msg_uri, peer_ref_uri, utc_now_iso
+from paperboy.ids import msg_uri, peer_ref_uri
 from paperboy.store.db import Store
 from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
@@ -50,7 +50,7 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
         # describe what happens to be in the table. `kind` is matched
         # case-insensitively — `add_raw` records the TL discriminator verbatim,
         # and both `Message` and `message` occur in practice.
-        "SELECT id, payload_json FROM raw_records "
+        "SELECT id, observed_at, payload_json FROM raw_records "
         "WHERE lower(kind) = 'message' "
         "AND json_extract(context_json, '$.channel_id') = ?",
         (channel_id,),
@@ -64,7 +64,10 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
         if not repliers or post_id is None:
             continue
 
-        observed_at = utc_now_iso()
+        # The stamp of the message OBSERVATION that carried this replier
+        # sample (D3) — projecting it costs no RPC, so "now" would make the
+        # edge unreproducible from raw alone on reproject.
+        observed_at = row["observed_at"]
         post_uri = msg_uri(channel_id, post_id)
         for peer in repliers:
             stub = _peer_stub(peer)

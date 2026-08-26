@@ -19,11 +19,11 @@ import httpx
 
 from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, utc_now_iso
+from paperboy.ids import msg_uri
 from paperboy.store.sync import set_state
 from paperboy.store.web import insert_tme_snapshot, insert_wayback_snapshot
 from paperboy.targets import Target, TargetKind
-from paperboy.web.client import WebClient
+from paperboy.web.client import WebClient, WebGetter
 from paperboy.web.tme_parser import TmePost, parse_tme_page
 from paperboy.web.wayback import cdx_timestamp_to_iso, parse_cdx_rows
 
@@ -106,7 +106,7 @@ class WebCollector:
     def __init__(
         self,
         *,
-        client: WebClient | None = None,
+        client: WebGetter | None = None,
         min_interval: float = _DEFAULT_MIN_INTERVAL_SECONDS,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
@@ -117,12 +117,12 @@ class WebCollector:
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
 
-    def _get_client(self, ctx: CollectContext) -> WebClient:
+    def _get_client(self, ctx: CollectContext) -> WebGetter:
         if self._client is None:
             self._client = WebClient(proxy=ctx.settings.proxy)
         return self._client
 
-    def _paced_get(self, client: WebClient, url: str) -> httpx.Response:
+    def _paced_get(self, client: WebGetter, url: str) -> httpx.Response:
         self._sleep(self._min_interval)
         return client.get(url)
 
@@ -139,7 +139,7 @@ class WebCollector:
         return CollectResult(name=self.name, counts=counts)
 
     def _collect_tme(
-        self, ctx: CollectContext, client: WebClient, username: str, channel_id: int | None
+        self, ctx: CollectContext, client: WebGetter, username: str, channel_id: int | None
     ) -> dict[str, int]:
         counts = {"tme_posts": 0, "deleted_recovered": 0}
         # Always start from the NEWEST posts each run (t.me/s with no
@@ -157,12 +157,13 @@ class WebCollector:
                 url += f"?before={before_cursor}"
 
             response = self._paced_get(client, url)
-            fetched_at = utc_now_iso()
+            raw_payload = {
+                "url": url, "status_code": response.status_code, "text": response.text,
+            }
+            fetched_at = ctx.clock.for_payload(raw_payload)
             ctx.store.add_raw(
-                "tme_page",
-                {"url": url, "status_code": response.status_code, "text": response.text},
-                ctx.tier,
-                {"channel_username": username},
+                "tme_page", raw_payload, ctx.tier,
+                {"channel_username": username}, observed_at=fetched_at,
             )
 
             if _is_ambiguous_failure(response.status_code):
@@ -237,7 +238,7 @@ class WebCollector:
             counts["deleted_recovered"] += 1
 
     def _collect_wayback(
-        self, ctx: CollectContext, client: WebClient, username: str
+        self, ctx: CollectContext, client: WebGetter, username: str
     ) -> dict[str, int]:
         # Bound the query: an unbounded `url=t.me/s/<name>*` CDX search on a
         # heavily-archived channel returns hundreds of thousands of rows (a
@@ -249,12 +250,13 @@ class WebCollector:
             f"&output=json&filter=statuscode:200&collapse=digest&limit={_WAYBACK_CDX_LIMIT}"
         )
         response = self._paced_get(client, url)
-        fetched_at = utc_now_iso()
+        raw_payload = {
+            "url": url, "status_code": response.status_code, "text": response.text,
+        }
+        fetched_at = ctx.clock.for_payload(raw_payload)
         ctx.store.add_raw(
-            "wayback_cdx",
-            {"url": url, "status_code": response.status_code, "text": response.text},
-            ctx.tier,
-            {"channel_username": username},
+            "wayback_cdx", raw_payload, ctx.tier,
+            {"channel_username": username}, observed_at=fetched_at,
         )
 
         if _is_ambiguous_failure(response.status_code):
