@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import profile_dir
-from paperboy.ids import utc_now_iso
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -118,7 +117,7 @@ class MediaCollector:
         content_index = self._load_content_index(ctx, channel_id)
 
         rows = ctx.store.conn.execute(
-            "SELECT uri, msg_id, media_kind, media_json FROM messages "
+            "SELECT uri, msg_id, media_kind, media_json, first_seen FROM messages "
             "WHERE channel_id=? AND media_kind IS NOT NULL AND deleted_at IS NULL "
             "ORDER BY msg_id",
             (channel_id,),
@@ -134,7 +133,10 @@ class MediaCollector:
             key = _content_key(media)
             if key is not None and key in content_index:
                 sha, path = content_index[key]
-                self._record_custody(ctx, path, sha, row["uri"])
+                # A dedup hit derives from the STORED message row, not a
+                # fresh download (D3) — its own `first_seen` is the
+                # observation, not "now".
+                self._record_custody(ctx, path, sha, row["uri"], row["first_seen"])
                 counts["duplicates"] += 1
                 continue
 
@@ -157,7 +159,8 @@ class MediaCollector:
             if existing is not None:
                 # Safety-net dedup: two distinct document/photo ids hashed to
                 # the same bytes (or `key` was None, e.g. a malformed dict).
-                self._record_custody(ctx, existing, sha, row["uri"])
+                # Same D3 rationale as the content_index hit above.
+                self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
                 counts["duplicates"] += 1
                 if key is not None:
                     content_index[key] = (sha, existing)
@@ -172,11 +175,19 @@ class MediaCollector:
                 mime_type, file_name, attributes = _document_attrs(media)
             ext = _guess_ext(kind, mime_type, file_name)
             path = media_root / sha[:2] / f"{sha}{ext}"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            # Content-addressed: an existing path is already the right bytes.
+            # Guards replay idempotency (spec §4 — reproject never re-writes a
+            # media file) and spares a live re-run a redundant write too.
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
             path_str = str(path)
 
-            downloaded_at = utc_now_iso()
+            raw_payload = {
+                "sha256": sha, "kind": kind, "size": len(data), "mime_type": mime_type,
+                "file_name": file_name, "path": path_str, "message_uri": row["uri"],
+            }
+            downloaded_at = ctx.clock.for_payload(raw_payload)
             ctx.store.conn.execute(
                 "INSERT INTO media (sha256, message_uri, kind, mime_type, size, file_name, "
                 "attributes_json, path, downloaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -186,15 +197,11 @@ class MediaCollector:
                     path_str, downloaded_at,
                 ),
             )
-            self._record_custody(ctx, path_str, sha, row["uri"])
+            self._record_custody(ctx, path_str, sha, row["uri"], downloaded_at)
             ctx.store.add_raw(
-                "MediaDownload",
-                {
-                    "sha256": sha, "kind": kind, "size": len(data), "mime_type": mime_type,
-                    "file_name": file_name, "path": path_str, "message_uri": row["uri"],
-                },
-                ctx.tier,
+                "MediaDownload", raw_payload, ctx.tier,
                 {"channel_id": channel_id, "msg_id": row["msg_id"]},
+                observed_at=downloaded_at,
             )
             counts["downloaded"] += 1
             if key is not None:
@@ -228,9 +235,11 @@ class MediaCollector:
         row = ctx.store.conn.execute("SELECT path FROM media WHERE sha256=?", (sha,)).fetchone()
         return row["path"] if row else None
 
-    def _record_custody(self, ctx: CollectContext, path: str, sha: str, message_uri: str) -> None:
+    def _record_custody(
+        self, ctx: CollectContext, path: str, sha: str, message_uri: str, recorded_at: str
+    ) -> None:
         ctx.store.conn.execute(
             "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri) "
             "VALUES (?, ?, ?, ?)",
-            (path, sha, utc_now_iso(), message_uri),
+            (path, sha, recorded_at, message_uri),
         )

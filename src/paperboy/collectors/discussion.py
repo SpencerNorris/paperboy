@@ -26,7 +26,7 @@ import json
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.history import HistoryCollector
-from paperboy.ids import channel_uri, msg_uri, peer_ref_uri, utc_now_iso
+from paperboy.ids import channel_uri, msg_uri, peer_ref_uri
 from paperboy.store.edges import add_edge_once
 from paperboy.store.events import record_run_event
 from paperboy.store.repliers import backfill_recent_repliers
@@ -183,14 +183,17 @@ class DiscussionCollector:
         channel_id = ctx.channel_id
         mirrors = self._mirror_map(ctx, group_id)
         rows = ctx.store.conn.execute(
-            "SELECT uri, msg_id, from_uri, reply_to_msg_id, reply_to_top_id, source_raw_id "
-            "FROM messages WHERE channel_id=? "
+            "SELECT uri, msg_id, from_uri, reply_to_msg_id, reply_to_top_id, source_raw_id, "
+            "first_seen FROM messages WHERE channel_id=? "
             "AND (reply_to_msg_id IS NOT NULL OR reply_to_top_id IS NOT NULL)",
             (group_id,),
         ).fetchall()
 
         for row in rows:
-            observed_at = utc_now_iso()
+            # The comment's own observation stamp (D3), not "now" — this
+            # re-scans every stored row on every run, so "now" would make the
+            # edge unreproducible from raw alone on reproject.
+            observed_at = row["first_seen"]
             if row["reply_to_msg_id"]:
                 # Every reply gets this, including a direct reply to a thread
                 # root: `replied_to` is comment → parent, with no restriction to
