@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from paperboy.store.db import Store
+from paperboy.store.db import Store, dumps
 from paperboy.store.peers import upsert_peer
 
 
@@ -253,20 +253,27 @@ def test_upsert_peer_lattice_is_order_independent_for_a_replay_sequence(tmp_path
     live collect happens to produce.
 
     Scope note: this triple is chosen so `min`'s own stamp never exceeds
-    BOTH full stamps. When it does (a `min` observation strictly newer than
-    every `full` observation of the same peer, arriving between two `full`
-    observations in processing order), the composed lattice as specified by
-    ADR-0005 §6 is provably NOT order-independent -- richness correctly
-    promotes whichever `full` observation is current at the moment the
-    later, "poisoned" `last_seen` benchmark was set, and *which* `full` that
-    is depends on arrival order, not just timestamps (`peers.last_seen` is
-    one shared column standing in for two different benchmarks: "freshest
-    observation of any kind" and "freshest full/identity observation").
-    Filed as #38 (real-world reachable via replay's payload-keyed,
-    non-chronological delivery -- see `ReplayClock`'s docstring) rather than
-    fixed here: round 3 was authorized narrow, and closing it needs a real
-    design change (a richness-scoped timestamp benchmark distinct from
-    `last_seen`), not a guard tweak.
+    the NEWEST full stamp. When it does, the composed lattice as specified
+    by ADR-0005 §6 is provably NOT order-independent, in two filed
+    families: sandwiched between two `full` observations, *identity*
+    columns diverge by arrival order (#38 -- richness promotes whichever
+    `full` is current when the later, "poisoned" `last_seen` benchmark was
+    set; `peers.last_seen` is one shared column standing in for two
+    different benchmarks); and with >=1 `full`, the `source_raw_id`
+    raw-evidence lineage pointer diverges while identity converges (#39 --
+    the early branch's provenance rule and the main upsert's richness rule
+    each move that one dual-role column). Both are real-world reachable via
+    replay's payload-keyed, non-chronological delivery (see `ReplayClock`'s
+    docstring) and filed rather than fixed here: round 3 was authorized
+    narrow, and closing them needs a real design change (a richness-scoped
+    timestamp benchmark distinct from `last_seen`, plus a decision on
+    `source_raw_id`'s dual role), not a guard tweak.
+
+    The comparison resolves `source_raw_id` to the raw record's
+    payload_json (`source_payload` below) rather than comparing the rowid
+    itself, which is not comparable across the per-permutation stores --
+    so raw-evidence lineage IS covered by this gate for every
+    configuration outside the two filed families.
     """
     t1 = "2026-01-01T00:00:00+00:00"
     t2 = "2026-01-02T00:00:00+00:00"
@@ -285,15 +292,19 @@ def test_upsert_peer_lattice_is_order_independent_for_a_replay_sequence(tmp_path
                 upsert_peer(store, obj, raw_id, t, seen_in_chat=sc, seen_in_msg=sm)
             row = store.conn.execute(
                 "SELECT username, access_hash, is_min, seen_in_chat, seen_in_msg, "
-                "first_seen, last_seen FROM peers"
+                "first_seen, last_seen, "
+                "(SELECT payload_json FROM raw_records WHERE id = peers.source_raw_id) "
+                "AS source_payload FROM peers"
             ).fetchone()
             results.append(dict(row))
 
     assert all(r == results[0] for r in results), results
     # Matches the lattice's expected outcome: the newest AND full observation
-    # wins outright, with its own provenance and the fully-widened window.
+    # wins outright, with its own provenance, its own raw record as the
+    # evidence lineage, and the fully-widened window.
     assert results[0] == {
         "username": "u3", "access_hash": 3, "is_min": 0,
         "seen_in_chat": 50, "seen_in_msg": 60,
         "first_seen": t1, "last_seen": t3,
+        "source_payload": dumps(observations["full3"][0]),
     }

@@ -105,6 +105,13 @@ Option A, with structural-marker inference for legacy rows.
    complete there. All four peer cells must be tested in BOTH stamp
    orderings — a two-invariant merge has four cells and eight ordered
    cases, and testing fewer is how round 2's regression shipped.
+   *(Residual, found by round-3 review: even the composed lattice is not
+   fully order-independent when a `min` observation is stamped newer than
+   the NEWEST `full` observation of the peer — identity columns diverge in
+   the two-full sandwich (#38), and the `source_raw_id` lineage pointer
+   diverges with ≥1 full (#39, `source_raw_id`'s dual
+   identity-source/provenance-source role). Both filed; closing them needs
+   a richness-scoped timestamp benchmark distinct from `last_seen`.)*
 
 ## Consequences
 
