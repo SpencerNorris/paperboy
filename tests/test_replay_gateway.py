@@ -280,6 +280,33 @@ def test_runs_absorbs_leading_rows_written_before_the_first_self_marker(tmp_path
     ]
 
 
+def test_runs_absorbs_resolve_before_self_at_every_boundary(tmp_path):
+    # The real archive's resolve/full-before-self ordering (see the test
+    # above) turned out to recur at EVERY historical pass boundary
+    # throughout its whole history, not just the first — a MID-log
+    # transition must attach its own opening cluster to the run it starts,
+    # not leave it behind in the run that precedes it (which silently
+    # dropped the entire final run — 3154 of 6258 raw records — in the
+    # first cut of this fix, caught before commit by re-running the smoke).
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger", {"target": "@x"})
+        st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        # Pass 2's own opening cluster, same old ordering — must land in
+        # pass 2, not stay attached to pass 1's tail.
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger", {"target": "@x"})
+        st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 4), ("legacy-0002", 5, 8),
+    ]
+    assert src.resolve_targets(src.runs()[1]) == ["@x"]
+
+
 def test_runs_mixed_legacy_then_stamped(tmp_path):
     # Legacy segment(s) precede stamped runs — the migration boundary shape.
     db = tmp_path / "src.sqlite"
