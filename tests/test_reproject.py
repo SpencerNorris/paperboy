@@ -167,8 +167,16 @@ def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkey
 # D5 (plan): equality modulo autoincrement pks and source_raw_id, compared as
 # DISTINCT row sets — replay legitimately serves one observation through two
 # paths (getHistory + getChannelDifference), duplicating byte-identical rows.
+# `raw_records.run_id` (ADR-0005) is excluded too, same spirit as `id`: it is
+# a synthetic pass-grouping identifier, not observed content. A legacy
+# (pre-migration) source's rows carry NULL run_id but replay LABELS their
+# inferred segment `legacy-0001...` when writing the target, so literal
+# run_id equality would never hold for a real archive predating this column
+# even though the replay is faithful; for a stamped source the source's own
+# run_id is threaded straight through to the target, so excluding it here
+# loses no real signal either way.
 ROUND_TRIP_EXCLUDE = {
-    "raw_records": {"id"},
+    "raw_records": {"id", "run_id"},
     "channels": {"source_raw_id"},
     "channel_snapshots": {"id", "source_raw_id"},
     "peers": {"source_raw_id"},

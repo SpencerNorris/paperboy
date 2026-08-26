@@ -66,3 +66,24 @@ def test_add_raw_defaults_to_now(tmp_path):
         store.add_raw("Message", {"_": "Message", "id": 1}, "stranger", None)
         row = store.conn.execute("SELECT observed_at FROM raw_records").fetchone()
         assert row["observed_at"].endswith("+00:00")
+
+
+def test_add_raw_stamps_the_begun_run(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        rid = store.begin_run()
+        store.add_raw("Message", {"_": "Message", "id": 1}, "stranger", None)
+        row = store.conn.execute("SELECT run_id FROM raw_records").fetchone()
+        assert row["run_id"] == rid and len(rid) == 32
+
+
+def test_add_raw_without_begin_run_leaves_null(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        store.add_raw("Message", {"_": "Message", "id": 1}, "stranger", None)
+        assert store.conn.execute(
+            "SELECT run_id FROM raw_records"
+        ).fetchone()["run_id"] is None
+
+
+def test_begin_run_accepts_injected_id(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as store:
+        assert store.begin_run("legacy-0001") == "legacy-0001"
