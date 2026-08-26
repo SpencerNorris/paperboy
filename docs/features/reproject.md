@@ -173,7 +173,9 @@ the ADR-0005 run-structure revision:
   `try/except Exception` fallback (still present, for genuinely unexpected
   failures) is no longer what handles this case.
 
-One residual, narrowed but not closed by this revision:
+One residual, narrowed but not closed by this revision (and narrowed again
+by the segmentation fix below — see "Bug found and fixed by a later
+real-archive re-run"):
 
 - **A historical run whose media phase downloaded nothing NEW leaves no raw
   trace, so its duplicate-custody observations are not reproduced.**
@@ -183,14 +185,18 @@ One residual, narrowed but not closed by this revision:
   correctly infers "media didn't run" for that specific run and skips the
   phase there — which also means that run's `custody_log` entry (a real,
   historical observation: "this run saw this file again, attached to this
-  message") never gets replayed. On the real archive (below) this narrows
-  `media`/`custody_log` below the source's counts (`media` 451→293,
-  `custody_log` 607→443) — every row that IS present is correct and
-  complete; nothing beyond a media file's OWN raw trace round-trips.
-  Deliberately not attempted in this revision (fixing it properly means
-  detecting "ran but found nothing new" as distinct from "didn't run" from
-  raw kinds alone, without fabricating custody observations for runs that
-  genuinely never touched media) — tracked as
+  message") never gets replayed. On the real archive, after the segmentation
+  fix below, this narrows `media`/`custody_log` below the source's counts
+  (`media` 451→449, `custody_log` 607→599) — every row that IS present is
+  correct and complete; nothing beyond a media file's OWN raw trace
+  round-trips. (The first cut of this revision, before the segmentation fix,
+  measured a much larger gap — 451→293, 607→443 — but that number
+  conflated this residual with the distinct segmentation bug below; it did
+  not correctly isolate what #36 alone accounts for.) Deliberately not
+  attempted in this revision (fixing it properly means detecting "ran but
+  found nothing new" as distinct from "didn't run" from raw kinds alone,
+  without fabricating custody observations for runs that genuinely never
+  touched media) — tracked as
   [#36](https://github.com/SpencerNorris/paperboy/issues/36).
 - Deferred (spec §9, deliberately out of scope): an in-place `--force` mode,
   a `--verify`-only mode, incremental reproject of a single phase into an
@@ -417,6 +423,11 @@ similar; the archive's `ResolvedPeer` for it is the only trace), so it never
 wrote a `channel: complete` event, but it IS its own genuine historical
 collect pass and correctly gets its own run.
 
+**This 6-vs-7 mismatch turned out to be a real bug, not a benign
+discrepancy** — see "A third bug found and fixed by a later real-archive
+re-run" below, which also supersedes this transcript's `media`/`custody_log`/
+`raw_records` numbers.
+
 **The ADR's headline payoff, confirmed exactly:** `channel_snapshots` (6→6),
 `web_snapshots` (362→362), and `message_metrics` (4020→4020) all now
 round-trip **exactly** — these are the three tables that collapsed under
@@ -441,12 +452,11 @@ target would produce.
 a defect; every extra row is a legitimate current-projection fact the
 original archive's older collector code didn't capture.
 
-**`media`/`custody_log`/`raw_records` are the #36 residual** (see Known
-limitations): 293/443/6104 vs the source's 451/607/6258. Every row present
-is a faithful replay; what's missing is the custody trail for media a LATER
-historical run re-observed as already-downloaded (no gateway call, so no
-raw trace for a future replay to iterate over) — deliberately not attempted
-in this revision.
+**`media`/`custody_log`/`raw_records` were attributed to the #36 residual**
+(see Known limitations) at the time: 293/443/6104 vs. the source's
+451/607/6258 — **this attribution was wrong.** The 6-vs-7 segmentation
+mismatch noted above is the dominant cause; #36 alone accounts for a much
+smaller gap. See below.
 
 ### Two bugs found and fixed by this smoke test (no-shed)
 
@@ -489,3 +499,149 @@ free under replay (no network, no rate limit to economize on), and safe
 because idempotent projection upserts make any resulting re-processing of
 already-seen messages harmless. Pinned by
 `tests/test_reproject.py::test_reproject_does_not_truncate_a_backward_multi_run_backfill`.
+
+### A third bug found and fixed by a later real-archive re-run (2026-08-26)
+
+The two bugs above were caught before the ADR-0005 revision first landed.
+Re-running the exact same command against the real archive during a later
+validation pass surfaced a third, distinct legacy-segmentation defect that
+the round-trip test battery's synthetic fixtures — and the first re-run
+above — did not happen to exercise, because it needs a *foreign* row with no
+relationship to either run on either side of it, which no hand-built
+fixture had included.
+
+**Legacy run segmentation cut an unconditional new-run boundary on ANY
+opening-kind row seen after a substantive row — including a lone, foreign
+one with no self marker anywhere near it — silently discarding everything
+after it up to the next genuine opening cluster.** Nothing in this codebase
+stops two `collect` invocations from writing to the same profile
+concurrently (no file lock exists anywhere in `src/paperboy/`), and the real
+archive turned out to contain exactly that: a single stray `ResolvedPeer`
+for `@atom8388`, landing mid-run inside what was otherwise one continuous
+156-row `MediaDownload` loop for `national_resistance_movement` (msg ids
+ascending 585→801 straight through it). The opening-cluster rule (bug #1,
+above) correctly keeps a GENUINE new pass's `ResolvedPeer`/`ChatFull`/self
+trio together — but it committed to a new-run boundary the instant it saw
+ANY opening-kind row after a substantive one, with no check for whether a
+self marker ever showed up to confirm the cluster was a genuine new pass.
+The synthetic segment this cut then had no self record at all, so replay
+failed immediately at `get_self()` (`channel: skip · no self User
+recorded`) with `history`/`media` both `phase_stop` — silently dropping all
+157 rows in that segment (156 of them genuine historical `MediaDownload`
+observations) with no error and no warning. This is exactly the mismatch
+the previous transcript's "Segmentation" note flagged (`run_events`: 6
+`channel: complete` events; `runs()`: 7 legacy segments) without yet
+diagnosing it — the 7th "run" was this orphaned fragment, not `@atom8388`'s
+own genuine pass as first assumed.
+
+Fixed by not committing to a legacy boundary until the candidate opening
+cluster is known to be COMPLETE (bounded by the next substantive row, a
+stamped row, or the log's end) and confirmed to contain its own self
+marker; a cluster with none is folded into whichever run is already open
+instead of orphaning everything after it. `ReplaySource.runs()`'s docstring
+and the inline comments in `src/paperboy/replay.py` describe the buffering
+algorithm this required. Pinned by
+`tests/test_replay_gateway.py::test_runs_does_not_split_a_run_on_a_foreign_single_row_intrusion`
+(the minimal synthetic repro) and
+`test_runs_still_cuts_a_genuine_boundary_after_a_foreign_intrusion` (a
+genuine boundary elsewhere in the same log must still cut). Also added:
+`test_runs_raises_on_a_genuinely_interleaved_stamped_run_id`, closing a
+pre-existing gap — ADR-0005's stamped-run contiguity guarantee
+(`ReprojectSourceError`) had no test coverage at all before this pass.
+
+Re-running the smoke command after the fix:
+
+```
+$ PAPERBOY_DATA_DIR=.../data uv run paperboy reproject --profile default --out /tmp/reprojected.sqlite
+▶ channel
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=543 revisions=543 tombstones=258 edges=238 · 0s
+▶ graph
+  graph invite preview skipped for LS-77p_pVyRiZDRk: replay: no ChatInvite recorded for hash 'LS-77p_pVyRiZDRk'
+✓ graph · edges=120 peers=21 raw=5 skipped=1 · 0s
+▶ web
+  web: wayback CDX returned HTTP 429 for national_resistance_movement — reporting failure, not zero
+✓ web · tme_posts=362 deleted_recovered=0 wayback_failed=429 · 0s
+▶ media
+  media: skipping msg 413: replay: media file missing for sha b006ec25...
+  media: skipping msg 414: replay: media file missing for sha 295dbde0...
+✓ media · downloaded=150 duplicates=0 unavailable=302 skipped_kind=27 skipped=2 · 5s
+▶ channel                                          [run 2 — now the MERGED legacy-0002: old legacy-0002 + old legacy-0003 (the orphan)]
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=0 revisions=0 tombstones=0 edges=0 · 0s
+▶ media
+✓ media · downloaded=299 duplicates=150 unavailable=5 skipped_kind=27 skipped=0 · 10s
+
+  reproject @national_resistance_movement -> /tmp/reprojected.sqlite
+  [2-row table, as before]
+
+▶ channel                                          [@atom8388's stray resolve, now correctly a SECOND target within run 2 rather than its own orphaned run]
+⏹ channel · skip · 0s
+  phase channel skipped: target resolved to a non-channel peer (PeerUser)
+▶ history
+⏹ history · phase_stop · 0s
+▶ media
+⏹ media · phase_stop · 0s
+
+  reproject @atom8388 -> /tmp/reprojected.sqlite
+  [clean per-run skip, same shape as before — but now correctly attributed to run 2, not a phantom run 3]
+
+▶ channel                                          [runs 3-6 (was 4-7): 'national_resistance_movement', no leading @]
+✓ channel · channels=1 peers=2 · 0s
+▶ history
+✓ history · messages=0 revisions=0 tombstones=0 edges=0 · 0s
+▶ discussion
+✓ discussion · messages=300 revisions=300 tombstones=0 edges=256 backfilled_peers=31 unmapped=6 · 0s
+[... 3 more channel/history/discussion blocks: 300, 1200, 3153 discussion messages — unchanged from before ...]
+
+  reproject national_resistance_movement -> /tmp/reprojected.sqlite
+  [4-row table, one per run]
+
+     row counts — source vs reprojected
+┌────────────────────┬────────┬─────────────┐
+│ table               │ source │ reprojected │
+├────────────────────┼────────┼─────────────┤
+│ raw_records         │ 6258   │ 6262        │
+│ channels            │ 1      │ 1           │
+│ channel_snapshots   │ 6      │ 6           │
+│ peers               │ 158    │ 160         │
+│ messages            │ 5496   │ 5496        │
+│ message_revisions   │ 5496   │ 5496        │
+│ message_metrics     │ 4020   │ 4020        │
+│ message_tombstones  │ 258    │ 258         │
+│ edges               │ 2503   │ 2522        │
+│ media               │ 451    │ 449         │
+│ custody_log         │ 607    │ 599         │
+│ web_snapshots       │ 362    │ 362         │
+└────────────────────┴────────┴─────────────┘
+```
+
+**`ReplaySource.runs()` now finds exactly 6 legacy segments, matching
+`run_events`'s 6 `channel: complete` rows exactly** — the mismatch the
+previous transcript flagged and didn't yet explain is gone. `@atom8388`'s
+stray resolve now correctly appears as a SECOND target discovered within
+the merged run 2 (`resolve_targets` returns every distinct target seen
+within a run, in capture order) rather than manufacturing a phantom run of
+its own — still a clean `channel: skip` (#34's fix), just now attributed to
+the run that actually recorded it.
+
+**`raw_records` recovers from 6104 to 6262** — slightly ABOVE the source's
+6258, which is expected and correct: the previously-orphaned 156
+`MediaDownload` rows are now replayed as part of run 2, and a few messages
+legitimately re-served via both `getHistory` and `getChannelDifference`
+within that run produce byte-identical duplicate raw rows (real signal, per
+the round-trip contract's set-comparison note above — the identity contract
+counts these DEduplicated as a set, so they don't cost `test_round_trip_
+identity` anything). **`media` recovers from 293 to 449** (2 below the
+source's 451 — the pre-existing 2-file local-disk gap round 1 already
+documented, now the ONLY remaining `media` gap). **`custody_log` recovers
+from 443 to 599** (8 below the source's 607) — this residual 8-row gap is
+what #36 alone actually accounts for; the doc's "Known limitations" section
+above is updated to the corrected number. `messages`/`message_revisions`/
+`message_metrics`/`message_tombstones`/`web_snapshots`/`channel_snapshots`
+were already exact before this fix and remain exact after it — this bug
+never touched those tables' correctness, only which run `media`/`custody_
+log`/`raw_records` rows got attributed to (or dropped from) via the wrong
+segment boundary.

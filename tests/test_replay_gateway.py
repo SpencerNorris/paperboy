@@ -11,7 +11,7 @@ import pytest
 
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
-from paperboy.replay import RawReplayGateway, ReplaySource
+from paperboy.replay import RawReplayGateway, ReplaySource, ReprojectSourceError
 from paperboy.store.db import Store
 
 CID = 100
@@ -305,6 +305,83 @@ def test_runs_absorbs_resolve_before_self_at_every_boundary(tmp_path):
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 8),
     ]
     assert src.resolve_targets(src.runs()[1]) == ["@x"]
+
+
+def test_runs_does_not_split_a_run_on_a_foreign_single_row_intrusion(tmp_path):
+    # Found running the R6 real-archive smoke a second time (ADR-0005, post
+    # revision R): the archive's `default` profile has no file lock stopping
+    # two `collect` invocations from writing to the same profile
+    # concurrently, and a lone `ResolvedPeer`/`ChatFull` from some unrelated,
+    # short-lived process can land mid-run, between two rows of the SAME
+    # legitimate run's own substantive activity (there: a `MediaDownload`
+    # loop, interrupted by a stray resolve of `@atom8388`). The OPENING-
+    # CLUSTER rule (see the absorption tests above) treated that lone row as
+    # an unconditional new-segment boundary on its own -- with no self
+    # marker anywhere near it, the synthetic segment then fails replay at
+    # `get_self()` ('no self User recorded'), silently discarding every row
+    # from the intrusion up to the NEXT genuine opening cluster (there: 157
+    # rows, 156 of them real historical `MediaDownload` observations).
+    # A cluster only cuts a new boundary once it's confirmed genuine -- i.e.
+    # it contains its own self marker before the run of opening-kind rows
+    # ends -- so a lone foreign row with no self anywhere near it folds into
+    # whichever run is already open instead of orphaning everything after it.
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:  # no begin_run: run_id stays NULL (legacy)
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                   {"target": "@target"})
+        st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
+        st.add_raw("MediaDownload", {"sha256": "a" * 64}, "stranger",
+                   {"channel_id": 5, "msg_id": 1})
+        # A foreign, short-lived process's resolve lands mid-run -- no self
+        # anywhere near it, so it is NOT a genuine new pass.
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                   {"target": "@atom8388"})
+        st.add_raw("MediaDownload", {"sha256": "b" * 64}, "stranger",
+                   {"channel_id": 5, "msg_id": 2})
+        st.add_raw("MediaDownload", {"sha256": "c" * 64}, "stranger",
+                   {"channel_id": 5, "msg_id": 3})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [("legacy-0001", 1, 7)]
+
+
+def test_runs_still_cuts_a_genuine_boundary_after_a_foreign_intrusion(tmp_path):
+    # The fix above must not swallow a REAL run boundary -- a cluster that
+    # DOES contain its own self marker still cuts, even if a foreign
+    # intrusion happened earlier in the same log.
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+        # Foreign intrusion, no self nearby -- absorbed into run 1.
+        st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
+                   {"target": "@atom8388"})
+        st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
+        # A genuine second pass: its own self marker cuts a real boundary.
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.add_raw("Message", {"_": "message", "id": 3}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
+        ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
+    ]
+
+
+def test_runs_raises_on_a_genuinely_interleaved_stamped_run_id(tmp_path):
+    # ADR-0005 point 3: "ReplaySource asserts contiguity and fails loudly if
+    # ever violated" -- previously unexercised by any test. A source whose
+    # `run_id` sequence is aaa, bbb, aaa (bbb's rows are not a contiguous
+    # rowid range) is corrupt/hand-edited; refuse to replay it silently.
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("aaa")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.begin_run("bbb")
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
+        st.begin_run("aaa")
+        st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
+    src = ReplaySource.open(db, tmp_path / "media")
+    with pytest.raises(ReprojectSourceError, match="aaa"):
+        src.runs()
 
 
 def test_runs_mixed_legacy_then_stamped(tmp_path):
