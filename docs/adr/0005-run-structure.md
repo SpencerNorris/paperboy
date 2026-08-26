@@ -5,7 +5,10 @@ smoke re-run after implementation, `docs/features/reproject.md`'s "ADR-0005
 revision" section. `channel_snapshots`/`web_snapshots`/`message_metrics` all
 round-trip exactly (the headline defect this ADR fixes); two further bugs
 surfaced by that smoke run and fixed before landing — see that section's
-"Two bugs found and fixed by this smoke test."
+"Two bugs found and fixed by this smoke test." A third, distinct legacy-
+segmentation bug in this same `runs()` algorithm was found and fixed in a
+later validation pass (still 2026-08-26) — see that doc's "A third bug found
+and fixed by a later real-archive re-run."
 
 ## Context
 
@@ -101,6 +104,20 @@ Option A, with structural-marker inference for legacy rows.
 
 - Diagnosis and evidence: issue #33 (escalation comment, 2026-08-26).
 - Related: #34 (non-channel resolution must be a `SkipAndRecord`, not a
-  crash — surfaced by the same smoke), #36 (custody residual, above).
+  crash — surfaced by the same smoke), #36 (custody residual, above — its
+  reported size was corrected downward by the fix below).
+- A third legacy-segmentation bug, found in a later validation pass over the
+  same `runs()` algorithm this decision introduced: point 4's "structural
+  marker" rule committed to a new-run boundary on ANY opening-kind row seen
+  after a substantive one, with no check that it was ever confirmed genuine
+  by a self marker — so a lone foreign row (nothing in this codebase
+  prevents two `collect` invocations racing on one profile) silently
+  orphaned every row after it into a segment with no self record, which
+  then failed replay entirely. Fixed by deferring a legacy boundary
+  decision until the candidate opening cluster is complete and confirmed to
+  contain its own self marker; a cluster with none folds into the run
+  already open instead of cutting a new one. Full diagnosis, fix, and the
+  corrected real-archive numbers: `docs/features/reproject.md`, "A third bug
+  found and fixed by a later real-archive re-run."
 - Spec: `docs/superpowers/specs/2026-08-25-reproject-design.md` §11.
 - Plan: `docs/superpowers/plans/2026-08-26-reproject.md`, revision R.

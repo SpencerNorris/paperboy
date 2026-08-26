@@ -102,14 +102,27 @@ class ReplaySource:
         an archive can predate that invariant and write resolve/full before
         self — found running the R6 real-archive smoke, where it recurred at
         EVERY pass boundary throughout the archive's history, not just its
-        first). A new legacy segment starts at the first opening-cluster row
-        seen after at least one substantive (non-opening) row — so however
-        many of the three opening records are present, and in whatever
-        order, they all land in the SAME segment as each other, and that
-        segment is the one they actually belong to rather than being split
-        off as an orphan with no self record or no resolve to replay a
-        target from (both of which would silently drop that run's data on
-        replay). Runs must be contiguous rowid ranges (one sequential
+        first).
+
+        A candidate new segment starts at the first opening-kind row seen
+        after at least one substantive (non-opening) row, but it is not
+        committed as a boundary until the whole contiguous run of
+        opening-kind rows that follows is known — i.e. until the next
+        substantive row, a stamped row, or the log's end ends it. The
+        boundary is committed only if that cluster contains its own self
+        marker (`tier='self'` `User`); otherwise the cluster is a foreign
+        single-row intrusion — nothing in this codebase stops two `collect`
+        invocations from writing to the same profile concurrently, and a
+        lone `ResolvedPeer`/`ChatFull` from an unrelated short-lived process
+        can land mid-run — and folds into whichever segment is already open
+        instead of orphaning every row after it into a self-less segment
+        that silently fails replay at `get_self()` (found on the real
+        archive: a lone stray resolve mid-`MediaDownload`-loop discarded 157
+        rows, 156 of them genuine historical `MediaDownload` observations).
+        A genuine cluster still absorbs every opening-kind row in it
+        regardless of order, so all three land in the run they actually
+        belong to rather than splitting off an orphan with no target to
+        resolve. Runs must be contiguous rowid ranges (one sequential
         process per pass); interleaving means a corrupt source and fails
         loudly."""
         run_id_expr = "run_id" if self._has_run_id else "NULL AS run_id"
@@ -119,14 +132,24 @@ class ReplaySource:
         runs: list[ReplayRun] = []
         current_id: str | None = None
         legacy_n = 0
-        # True once a substantive (non-opening-cluster) legacy row has been
-        # seen since the last legacy boundary — arms the next opening-kind
-        # row to cut a new segment. Starts True so the very first row (of
-        # either kind) opens segment 1.
-        awaiting_boundary = True
         lo: int | None = None
         hi: int | None = None
         seen_run_ids: set[str] = set()
+        # A contiguous run of legacy opening-kind rows not yet committed to
+        # a boundary decision — see the docstring above.
+        pending: list[sqlite3.Row] = []
+
+        def _is_opening(row: sqlite3.Row) -> bool:
+            k = row["k"]
+            return (
+                (row["tier"] == "self" and (k == "user" or k.endswith(".user")))
+                or k == "resolvedpeer" or k.endswith(".resolvedpeer")
+                or k == "chatfull" or k.endswith(".chatfull")
+            )
+
+        def _is_self_marker(row: sqlite3.Row) -> bool:
+            k = row["k"]
+            return row["tier"] == "self" and (k == "user" or k.endswith(".user"))
 
         def _flush() -> None:
             nonlocal lo, hi
@@ -136,44 +159,56 @@ class ReplaySource:
                 runs.append(ReplayRun(current_id, lo, hi))
                 lo = hi = None
 
-        for row in rows:
-            next_id: str
-            if row["run_id"] is not None:
-                stamped_id: str = row["run_id"]
-                boundary = stamped_id != current_id
-                next_id = stamped_id
-            else:
-                k = row["k"]
-                is_opening = (
-                    (row["tier"] == "self" and (k == "user" or k.endswith(".user")))
-                    or k == "resolvedpeer" or k.endswith(".resolvedpeer")
-                    or k == "chatfull" or k.endswith(".chatfull")
+        def _open_new_legacy(first_id: int) -> None:
+            nonlocal current_id, legacy_n, lo
+            legacy_n += 1
+            next_id = f"legacy-{legacy_n:04d}"
+            if next_id in seen_run_ids:
+                raise ReprojectSourceError(
+                    f"raw log run {next_id!r} is not contiguous — refusing to replay"
                 )
-                boundary = current_id is None or (is_opening and awaiting_boundary)
-                if is_opening:
-                    if boundary:
-                        awaiting_boundary = False
-                    # else: another member of the same opening cluster —
-                    # awaiting_boundary is already False, leave it.
-                else:
-                    awaiting_boundary = True
-                if boundary:
-                    next_id = f"legacy-{legacy_n + 1:04d}"
-                else:
-                    assert current_id is not None  # boundary is False => not the first row
-                    next_id = current_id
-            if boundary:
+            seen_run_ids.add(next_id)
+            current_id = next_id
+            lo = first_id
+
+        def _resolve_pending() -> None:
+            nonlocal hi
+            if not pending:
+                return
+            # No open segment to fold noise into (the very start of the
+            # log) — the cluster must open segment 1 regardless of whether
+            # it happens to contain a self marker.
+            genuine = current_id is None or any(_is_self_marker(r) for r in pending)
+            if genuine:
                 _flush()
-                if next_id in seen_run_ids:
-                    raise ReprojectSourceError(
-                        f"raw log run {next_id!r} is not contiguous — refusing to replay"
-                    )
-                seen_run_ids.add(next_id)
-                if row["run_id"] is None:
-                    legacy_n += 1
-                current_id = next_id
-                lo = row["id"]
+                _open_new_legacy(pending[0]["id"])
+            hi = pending[-1]["id"]
+            pending.clear()
+
+        for row in rows:
+            if row["run_id"] is not None:
+                _resolve_pending()
+                stamped_id: str = row["run_id"]
+                if stamped_id != current_id:
+                    _flush()
+                    if stamped_id in seen_run_ids:
+                        raise ReprojectSourceError(
+                            f"raw log run {stamped_id!r} is not contiguous — "
+                            "refusing to replay"
+                        )
+                    seen_run_ids.add(stamped_id)
+                    current_id = stamped_id
+                    lo = row["id"]
+                hi = row["id"]
+                continue
+            if _is_opening(row):
+                pending.append(row)
+                continue
+            _resolve_pending()
+            if current_id is None:
+                _open_new_legacy(row["id"])
             hi = row["id"]
+        _resolve_pending()
         _flush()
         return runs
 
