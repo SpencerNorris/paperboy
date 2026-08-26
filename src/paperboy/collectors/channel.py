@@ -4,6 +4,7 @@ project it, and prime `ctx` for `history` (and later Phase 2 collectors).
 
 from __future__ import annotations
 
+from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.ids import channel_uri, user_uri
 from paperboy.store.channels import upsert_channel
@@ -53,14 +54,15 @@ def _resolved_channel_id(resolved: dict) -> int:
     """The channel id `resolve()` actually resolved to, from its `peer` field.
 
     `contacts.ResolvedPeer` always carries `peer` in the wild; a channel-like
-    target resolving to anything else (a user, a basic group, a malformed
-    payload) means we have no authoritative identity — refuse rather than
-    guess from the `chats` vector.
+    target resolving to anything else (a user or a basic group — a username
+    can legitimately be either, issue #34) means we have no authoritative
+    channel identity here — skip cleanly rather than guess from the `chats`
+    vector or crash the whole run.
     """
     peer = resolved.get("peer") or {}
     channel_id = peer.get("channel_id")
     if not isinstance(channel_id, int):
-        raise ValueError(
+        raise SkipAndRecord(
             "target resolved to a non-channel peer "
             f"({peer.get('_') or 'no peer in response'})"
         )
