@@ -40,6 +40,32 @@ class ReprojectSummary:
     table_counts: dict[str, tuple[int, int]]
 
 
+def _reset_incremental_backfill_state(out_store: Store) -> None:
+    """Clear `HistoryCollector`'s incremental-vs-full-sweep bookkeeping
+    (`sync_state` scopes `history`/`history_sweep`) before replaying a run.
+
+    Found running the R6 real-archive smoke (ADR-0005): `RawReplayGateway.
+    iter_history` is scoped to ONE run's own raw_records window, so it
+    naturally runs out ("no more pages") the moment that window is
+    exhausted — a purely REPLAY artifact of the run boundary, not a
+    Telegram-side fact. `history.py` reads that natural end as "reached the
+    real end of the channel's history" and commits `backfill_complete=True`
+    for a LIVE gateway that is correct (Telegram's history can only grow
+    forward; a later session can never legitimately find OLDER messages
+    than a completed full sweep already saw). Left uncleared across REPLAYED
+    runs, that flag wrongly survives into the next run and switches its
+    sweep to incremental-only (ids above the previous run's high-water
+    mark) — silently dropping every one of that run's own, all-older
+    messages, which is exactly the shape a real multi-session backward
+    backfill takes. Resetting before every run costs nothing here (no
+    network, no rate limit to economize on the way live incremental sync
+    does) and makes each run independently sweep its own full raw window;
+    idempotent projection upserts make any resulting re-processing of
+    already-seen messages harmless.
+    """
+    out_store.conn.execute("DELETE FROM sync_state WHERE scope IN ('history', 'history_sweep')")
+
+
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     """The phase set ONE historical run executed, inferred from the raw kinds
     it left behind (spec §3: a run that never did graph reprojects without
@@ -93,6 +119,7 @@ async def reproject(
     phases_seen: list[str] = []
     replayed_any = False
     for run in runs:
+        _reset_incremental_backfill_state(out_store)
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:
             if p not in phases_seen:
