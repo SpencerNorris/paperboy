@@ -343,6 +343,19 @@ def reproject(
         console.print(f"[red]{exc}[/]")
         out_path.unlink(missing_ok=True)  # don't leave a half-made target behind
         raise typer.Exit(code=1) from None
+    except Exception:
+        # `build_reproject` already created + migrated `out_path` before this
+        # block runs, so ANY failure here — not just a `ReprojectError` (a
+        # corrupt/unreadable source DB raises a bare `sqlite3.DatabaseError`
+        # from `resolve_targets`, found running this smoke test) — leaves a
+        # half-migrated file at `out_path` behind unless we clean it up too.
+        # Left in place, it would make a retry against the default --out path
+        # hit "refusing to overwrite" for a file that was never actually
+        # usable. Unlike the ReprojectError branch, an unexpected failure is
+        # not translated into a clean message — the real traceback is more
+        # useful for a genuinely unanticipated error than a shim message.
+        out_path.unlink(missing_ok=True)
+        raise
 
     for raw_target, results in summary.results.items():
         table = Table(title=f"reproject {raw_target} -> {out_path}")

@@ -85,6 +85,23 @@ def test_cli_reproject_empty_source_exits_1(tmp_path, monkeypatch):
     assert "no resolve records" in result.output
 
 
+def test_cli_reproject_cleans_up_out_on_unexpected_source_error(tmp_path, monkeypatch):
+    # A corrupted/unreadable source DB fails deep inside
+    # `ReplaySource.resolve_targets` (a bare `sqlite3.DatabaseError`), not
+    # `ReprojectError` — found running reproject against a hand-corrupted
+    # file during DoD smoke testing. `build_reproject` already created and
+    # migrated `out_path` by this point; the CLI's cleanup must not be
+    # narrowed to only the `ReprojectError` branch, or a half-made file is
+    # left behind and a retry against the default --out spuriously hits
+    # "refusing to overwrite existing" for a file that was never usable.
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    (tmp_path / "default").mkdir(parents=True)
+    (tmp_path / "default" / "paperboy.sqlite").write_bytes(b"not a real sqlite file")
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code != 0
+    assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
+
+
 def test_cli_reproject_phases_override(tmp_path, monkeypatch):
     asyncio.run(run_full_collect(tmp_path))
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
