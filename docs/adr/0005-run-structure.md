@@ -1,6 +1,11 @@
 # ADR-0005: Record run structure in the raw log (`raw_records.run_id`)
 
-**Status:** accepted (2026-08-26)
+**Status:** accepted (2026-08-26); verified (2026-08-26) — real-archive
+smoke re-run after implementation, `docs/features/reproject.md`'s "ADR-0005
+revision" section. `channel_snapshots`/`web_snapshots`/`message_metrics` all
+round-trip exactly (the headline defect this ADR fixes); two further bugs
+surfaced by that smoke run and fixed before landing — see that section's
+"Two bugs found and fixed by this smoke test."
 
 ## Context
 

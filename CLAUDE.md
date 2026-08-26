@@ -17,7 +17,9 @@ collect`/`status`/`export`/`doctor`/`auth` work end to end against live
 Telegram (see `docs/features/collect-channel.md` for the DoD smoke
 transcript). `watch` and `lookup` are Phase 2 stubs. `paperboy reproject`
 (rebuild every projection from `raw_records`, offline, zero network/
-credentials — see `docs/features/reproject.md`) shipped on `feat/reproject`.
+credentials — see `docs/features/reproject.md`) shipped on `feat/reproject`;
+its run-structure redesign (`raw_records.run_id`, replay once per historical
+run — `docs/adr/0005-run-structure.md`) shipped on `feat/reproject-run-structure`.
 Phase 2 collectors: `discussion`/`graph`/`media`/`web` are implemented;
 `participants`/`profiles` are not started.
 
