@@ -7,8 +7,11 @@ zero-RPC join/leave service-message vector (spec §6.2, §8).
 date and `Banned.date` is the BAN date, which stays in raw. Membership facts
 are newest-observation-wins keyed `(group_id, uri)`, except that a known
 `join_date` is never blanked by a later observation that lacks one (a member
-who is later banned still joined when they joined). `inviter_id` is populated
-only for self (spec §4) — stored when present, never inferred.
+who is later banned still joined when they joined). `inviter_id` comes from
+`channelParticipantSelf`/`channelParticipantAdmin(is_self)` on the roster
+path, and from `messageActionChatJoinedByLink.inviter_id` on the
+service-message path (the link creator is itself an observed fact there,
+for an arbitrary joiner, not just self) — never otherwise inferred.
 """
 
 from __future__ import annotations
@@ -224,7 +227,15 @@ def project_join_service_messages(store: Store, group_id: int, tier: str) -> dic
     edge is evidenced `source: service_message` and the roster remains the
     authority: each fact is stamped with the MESSAGE date (when it was true),
     so a later roster observation of the same member correctly wins.
-    Idempotent — re-scans every run."""
+    Idempotent — re-scans every run, and the returned `joins`/`leaves` counts
+    (like `edges`) count only NEW facts recorded THIS call: `write_participant`
+    always upserts (it has no "was this new" signal of its own — every row is
+    re-observed on every scan), so `joins`/`leaves` are gated on
+    `add_participant_snapshot`'s `once=True` return, which is the one signal
+    that actually distinguishes a fact seen for the first time from a
+    re-scan of history already reflected in the store — this is what keeps a
+    stable channel's `run_events` (Task 8's `service_joins`/`service_leaves`)
+    from reporting the same N joins as "new" on every single run forever."""
     counts = {"joins": 0, "leaves": 0, "edges": 0}
     rows = store.conn.execute(
         "SELECT uri, msg_id, from_uri, date, action_json, source_raw_id, first_seen FROM messages "
@@ -246,11 +257,12 @@ def project_join_service_messages(store: Store, group_id: int, tier: str) -> dic
             joined.append((row["from_uri"], None))
         elif kind == "messageactionchatdeleteuser" and action.get("user_id") is not None:
             facts = ParticipantFacts(user_uri(action["user_id"]), "left", None, None, None, None)
-            if write_participant(store, group_id, facts, row["source_raw_id"], observed_at):
+            if write_participant(store, group_id, facts, row["source_raw_id"], observed_at) is None:
+                continue
+            if add_participant_snapshot(
+                store, group_id, facts, observed_at, row["source_raw_id"], once=True
+            ):
                 counts["leaves"] += 1
-                add_participant_snapshot(
-                    store, group_id, facts, observed_at, row["source_raw_id"], once=True
-                )
             continue
         else:
             continue
@@ -258,10 +270,10 @@ def project_join_service_messages(store: Store, group_id: int, tier: str) -> dic
             facts = ParticipantFacts(uri, "member", observed_at, None, None, inviter_id)
             if write_participant(store, group_id, facts, row["source_raw_id"], observed_at) is None:
                 continue
-            counts["joins"] += 1
-            add_participant_snapshot(
+            if add_participant_snapshot(
                 store, group_id, facts, observed_at, row["source_raw_id"], once=True
-            )
+            ):
+                counts["joins"] += 1
             counts["edges"] += membership_edges(
                 store, group_id, facts, observed_at, tier, row["source_raw_id"], evidence
             )
