@@ -177,14 +177,32 @@ async def test_min_interval_paces_repeat_calls_to_same_method(tmp_path):
         assert slept and slept[0] > 0
 
 
-def test_user_id_invalid_and_channel_invalid_classify_as_skip():
-    # `users.getFullUser` on a stale `inputUserFromMessage` provenance answers
-    # USER_ID_INVALID / CHANNEL_INVALID (research Part 2 §1): one user's
+def test_user_id_invalid_classifies_as_skip_globally():
+    # `users.getFullUser`/`users.getUsers` on a stale `inputUserFromMessage`
+    # provenance can answer USER_ID_INVALID (research Part 2 §1): one user's
     # enrichment is skipped, the sweep continues — never a raw crash.
-    from telethon.errors import ChannelInvalidError, UserIdInvalidError
+    # USER_ID_INVALID has no other caller in this codebase (only user-input
+    # RPCs can raise it), so — unlike CHANNEL_INVALID below — classifying it
+    # globally via `classify` is safe.
+    from telethon.errors import UserIdInvalidError
 
-    for exc in (UserIdInvalidError, ChannelInvalidError):
-        assert classify(exc(None)) == Disposition.SKIP
+    assert classify(UserIdInvalidError(None)) == Disposition.SKIP
+
+
+def test_channel_invalid_does_not_classify_as_skip_globally():
+    # CHANNEL_INVALID is deliberately NOT in `classify`'s global skip list
+    # (errors.py module docstring): `classify` has no per-method scope, and
+    # the same classification would also swallow CHANNEL_INVALID from
+    # `channels.getFullChannel`/`updates.getChannelDifference` on the
+    # collection target itself, which must surface as a real failure, not be
+    # silently skipped. The stale-`inputUserFromMessage` case (spec §5 case
+    # 2) is instead handled locally by `TelethonGateway.get_users`/
+    # `get_full_user` (see tests for those), which catch it and raise
+    # `SkipAndRecord` themselves.
+    from telethon.errors import ChannelInvalidError
+
+    with pytest.raises(ChannelInvalidError):
+        classify(ChannelInvalidError(None))
 
 
 @pytest.mark.asyncio

@@ -70,7 +70,14 @@ def participant_row(participant: dict) -> ParticipantFacts | None:
         uri = peer_ref_uri(participant.get("peer"))
         if uri is None:
             return None
-        status = "banned" if kind == "channelparticipantbanned" else "left"
+        if kind == "channelparticipantbanned":
+            # `left` is the membership truth: left=true was kicked out; left
+            # unset means RESTRICTED but still a member (schema
+            # `channelParticipantBanned` `left:flags.0?true` — research
+            # sources/mtproto-participants-users.md:238).
+            status = "banned" if participant.get("left") else "member"
+        else:
+            status = "left"
         return ParticipantFacts(uri, status, None, rank if status == "banned" else None, None, None)
     return None
 
@@ -137,12 +144,21 @@ def add_participant_snapshot(
 ) -> bool:
     """Append one membership observation. `once=True` is for producers that
     re-scan stored rows every run (service messages): the same observation
-    (same source record, same stamp) is never appended twice."""
+    (same fact, same stamp) is never appended twice.
+
+    The dedupe key is the observation's identity — `(group_id, uri,
+    observed_at, status)` — deliberately NOT `source_raw_id`: that id comes
+    from `messages.source_raw_id`, which `upsert_message`'s ON CONFLICT
+    overwrites with the newest raw id on every re-observation of the same
+    message (e.g. `HistoryCollector` re-paging the tail every run), so a
+    service message's `source_raw_id` is not stable across runs even though
+    the fact it recorded is unchanged.
+    """
     if once:
         dup = store.conn.execute(
             "SELECT 1 FROM participant_snapshots WHERE group_id=? AND uri=? AND observed_at=? "
-            "AND source_raw_id IS ? LIMIT 1",
-            (group_id, facts.uri, observed_at, source_raw_id),
+            "AND status IS ? LIMIT 1",
+            (group_id, facts.uri, observed_at, facts.status),
         ).fetchone()
         if dup is not None:
             return False

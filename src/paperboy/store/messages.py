@@ -37,7 +37,7 @@ def upsert_message(
     Always writes current state to `messages`; appends a `message_revisions`
     row iff the content hash changed since the last recorded revision
     (including the very first observation); appends a `message_metrics` row
-    iff at least one of views/forwards/replies is present on this
+    iff at least one of views/forwards/replies/reactions is present on this
     observation. Returns the message's URI.
     """
     del tier  # not yet stored per-message; carried by raw_records/edges/peers

@@ -192,9 +192,14 @@ def input_user_ref(store: Store, uri: str) -> dict | None:
         return {"user_id": user_id, "access_hash": peer["access_hash"]}
     if peer["seen_in_chat"] and peer["seen_in_msg"]:
         chan = store.conn.execute(
-            "SELECT access_hash FROM peers WHERE uri=?", (channel_uri(peer["seen_in_chat"]),)
+            "SELECT is_min, access_hash FROM peers WHERE uri=?",
+            (channel_uri(peer["seen_in_chat"]),),
         ).fetchone()
-        if chan is not None and chan["access_hash"]:
+        # A `min` channel's access_hash is only usable for photo file
+        # locations (research §8.7 / api/min) — never for building a
+        # from-message ref, so it must be checked here exactly like the
+        # user-row case above (symmetry, hardening).
+        if chan is not None and not chan["is_min"] and chan["access_hash"]:
             return {
                 "user_id": user_id,
                 "from_msg": {
