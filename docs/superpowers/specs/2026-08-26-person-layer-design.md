@@ -1,14 +1,16 @@
 # The person layer — `participants` + `profiles` collectors
 
-**Status:** design, 2026-08-26. Realizes the entity-graph thesis (CLAUDE.md §1:
+**Status:** approved 2026-08-27. Realizes the entity-graph thesis (CLAUDE.md §1:
 "architected as an entity graph so later recipes — user dossier, phone lookup,
 watchlists — are thin additions") by filling in the *people*: discovering the
 linked group's roster where the walls permit, and enriching every discovered
 peer from a `min` stub into a full person.
-**Execution:** one `single-feature-run` on `feat/person-layer`.
-**Depends on:** PR #40 (reproject) merged to `main` — §10 (reproject replay
-support) extends `RawReplayGateway`, which lands with #40. The collectors
-themselves do not depend on it; only §10 does.
+**Tracking:** issue #41 (Gate A anchor); part of the Phase-2 umbrella #13.
+**Execution:** one `single-feature-run` on `feat/person-layer`. See §14 for the
+implementing session's context.
+**Depends on:** PR #40 (reproject) — **merged to `main` (2026-08-27)**. §10
+(reproject replay support) extends `RawReplayGateway`, which #40 shipped; the
+collectors themselves do not depend on it, only §10 does.
 
 ## 1. Goal
 
@@ -27,8 +29,13 @@ without abandoning passive-by-default collection. Two collectors:
 
 Recipe slot (already committed in the 2026-08-20 design §6):
 `channel → history → discussion → **participants → profiles** → graph → web`.
-The current default set is `channel, history, discussion, graph`; the two new
-collectors slot between `discussion` and `graph`.
+Both new collectors join the **default set** (`channel, history, discussion,
+participants, profiles, graph`; `media`/`web` stay opt-in). `participants` runs
+fully by default — it is read-only and bounded. `profiles` runs its **cheap
+`getUsers` triage by default** (everyone gets basic identity), but performs the
+**expensive full enrichment** (`getFullUser`/photos/…, up to ~33 min) **only
+under `--profiles`**; without that flag a warning names the un-run enrichment so
+a plain `collect` never silently becomes a long job (§7, §7.2).
 
 ## 2. The person-vector reality (why this shape)
 
@@ -183,20 +190,31 @@ currently enforced only run-level by `doctor`).
 
 ### 6.2 Branch by what the tier permits
 
-- **Broadcast target (or no linked group):** detect-and-skip. Record
-  `participants_count` and the precise reason (`participants_hidden` /
-  `can_view_participants` false / `CHAT_ADMIN_REQUIRED`) to `run_events` and
-  `participant_snapshots`. **Zero enumeration RPC** — a walled roster is a
-  first-class stored outcome, never a silent zero.
+- **The broadcast channel's OWN subscriber roster is never enumerable (§2) —
+  skip *it*, not the collector.** Record `participants_count` and the precise
+  reason (`participants_hidden` / `can_view_participants` false /
+  `CHAT_ADMIN_REQUIRED`) to `run_events` and `participant_snapshots`, with
+  **zero enumeration RPC against the channel** — a walled roster is a
+  first-class stored outcome, never a silent zero. This is emphatically **not**
+  a skip of the whole phase: if the broadcast target has a linked discussion
+  group (the usual case), `participants` proceeds to enumerate *that group* via
+  the next bullet. A **full** phase skip happens only for a target with **no
+  linked group at all** (no comment section ⇒ no person vector, §2).
 - **Linked supergroup, un-joined (passive default):** **bulk `Recent`
   enumeration is a real vector here, not a fallback** — the §13 probe confirmed
   a *public* linked group's roster IS enumerable un-joined and non-admin
   (`getParticipants(Recent)` on NRM Chat returned `count=307` with participants,
   no join, no error). So this branch pages `Recent` to the server's depth (§6.3)
-  and unions it with: the `get_participant` **oracle** for known user_ids —
-  confirmed callable un-joined/non-admin **on the group** for arbitrary users
-  via `InputPeerUserFromMessage` (join date + status; the fallback for
-  hidden-member groups where bulk is capped) — `channelParticipantsMentions(top_msg_id)`
+  and unions it with: the `get_participant` **oracle** — confirmed callable
+  un-joined/non-admin **on the group** for arbitrary users via
+  `InputPeerUserFromMessage` (join date + status). **The oracle is bounded, not
+  a blanket per-user sweep:** in the normal enumerable case the `Recent` roster
+  already carries each member's join date, so the oracle is reserved for (i)
+  `participants_hidden`/capped groups where bulk enumeration is reduced, and
+  (ii) specific known user_ids absent from the enumerated set — and is capped by
+  the run's RPC budget, never one call per known commenter (a large group's
+  thousands of commenters would otherwise be thousands of RPCs and a flood
+  risk). Also unioned: `channelParticipantsMentions(top_msg_id)`
   per thread root, group reaction lists (`{peer_id, date, reaction}` — groups-only,
   read-only), and **join/leave service messages already in the captured history**
   (§8, zero new RPC). Only if bulk enumeration is *walled* here
@@ -242,14 +260,23 @@ and skipped, never attempted** (spec SHOULD).
 
 ## 7. `profiles` collector
 
-The universal enrichment sweep — passive, no join, no new tier.
+The universal enrichment sweep — passive, no join, no new tier. It is
+**default-on for its cheap half and flag-gated for its expensive half**: steps
+1–2 (triage) always run; steps 3–5 (**full enrichment**) run only under
+`--profiles`. When `--profiles` is absent, the collector completes the triage
+and emits a warning — *"triaged N people (basic names/handles); full enrichment
+(bios, photos, last-seen, …) not run — pass `--profiles` to enrich them (~1
+`getFullUser`/s, bounded by `--profile-budget`, default 2000/run ≈ 33 min)"* —
+as a console warning and a `run_events` row, the same "here is what you did not
+get, and how to get it" idiom as §6.4's `--join` warning.
 
-1. **Gather** every `kind='user'` peer from the store (all vectors).
+1. **Gather** every `kind='user'` peer from the store (all vectors). *(always)*
 2. **Triage** — batched `get_users(ids)` for cheap fields (names, usernames,
    verified/scam/fake/deleted/premium, `emoji_status`, `color`, stripped thumb).
-   Write to `users` + `user_snapshots`. Cheap enough to run for everyone.
-3. **Full profile** — `get_full_user` (+ `get_user_photos`, displayed gifts,
-   pinned stories, common chats) on the spec's committed priority order
+   Write to `users` + `user_snapshots`. Cheap enough to run for everyone. *(always)*
+3. **Full profile** *(only under `--profiles`)* — `get_full_user`
+   (+ `get_user_photos`, displayed gifts, pinned stories, common chats) on the
+   spec's committed priority order
    **admins → authors → commenters → others**, bounded by `profile_budget`
    (default 2000/run; at ~1 `getFullUser`/s this is ~33 min, so the triage/full
    split is a runtime necessity, not polish). Parse **both** `full_user` and its
@@ -297,16 +324,17 @@ run to the target and their own risk posture without touching code:
 
 | Knob | CLI | Default | Controls |
 |---|---|---|---|
-| Budget | `--profile-budget N` | 2000/run | how many `getFullUser` fetches one run spends (already exists on `collect`) |
+| **Enrich** | `--profiles` | off (triage-only) | the master switch for **full** enrichment (steps 3–5). Off = triage-only + the §7 warning; on = full profiles. |
+| Budget | `--profile-budget N` | 2000/run | how many `getFullUser` fetches one `--profiles` run spends |
 | Wait | `--profile-interval SECONDS` | inherits Budget's `min_interval` (1.0s) | the pace between full-profile RPCs — raise it to stay quieter / dodge flood onset, lower it (carefully) to go faster |
-| Depth | `--profile-full` / `--profile-triage-only` | full | `--profile-triage-only` runs step 2 for everyone and skips every `getFullUser` — a cheap, near-zero-risk "who's here" pass |
 | Refresh floor | `--profile-refresh-after DURATION` | off | skip re-enriching users seen more recently than this (§7.1) |
 
-Pacing is enforced through the existing `Budget` module (the one chokepoint all
-RPCs already route through), so `--profile-interval` composes with — never
-bypasses — flood-wait handling and the per-run RPC cap. `--profile-triage-only`
-exists precisely because the cheap pass is the passive-safe default an operator
-may want on a first, low-footprint look at an unfamiliar target.
+Triage-only is the *default* precisely because the cheap pass is the
+passive-safe posture for a first, low-footprint look at an unfamiliar target;
+`--profiles` is the deliberate step up to the expensive full sweep. Pacing is
+enforced through the existing `Budget` module (the one chokepoint all RPCs
+already route through), so `--profile-interval` composes with — never bypasses —
+flood-wait handling and the per-run RPC cap.
 
 ## 8. Edges
 
@@ -381,10 +409,14 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
   budget, run twice, deep-enriches a different (next-priority) slice each run and
   reaches *everyone* across runs — no user starved, no head re-enriched before
   the tail is reached; then a third run wraps to the stalest-first refresh pass.
-- **Parameterization** tests (§7.2): `--profile-triage-only` makes **zero**
-  `getFullUser` calls (assert via `FakeGateway.calls`); `--profile-interval`
-  routes through `Budget` (pacing composes with flood handling, never bypasses
-  it); `--profile-refresh-after` skips a recently-seen user.
+- **Default-set + `--profiles` gating** tests: a plain `collect` runs
+  `participants` and `profiles`-triage (both default-on) but makes **zero**
+  `getFullUser` calls and emits the §7 warning (assert via `FakeGateway.calls`
+  and a captured `run_events`/log record); `--profiles` enables the full sweep.
+- **Parameterization** tests (§7.2): `--profile-interval` routes through
+  `Budget` (pacing composes with flood handling, never bypasses it);
+  `--profile-refresh-after` skips a recently-seen user; `--profile-budget`
+  bounds the `getFullUser` count.
 - **The two empirical gates are RESOLVED** (§13, live probe 2026-08-27): tests
   assert the confirmed behavior — a public linked group's `Recent` roster
   enumerates un-joined; `get_participant` answers arbitrary group members
@@ -395,10 +427,11 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
 
 ## 12. Scope and follow-ups
 
-- **In scope:** the two collectors, 4 tables, 5 gateway methods + `_input_user`,
-  tri-state storage, the membership/invite edges, the #11 fix, reproject replay
-  support (§10), the profiles resume-to-convergence cursor (§7.1), and the
-  enrichment-pass parameters (§7.2).
+- **In scope:** the two collectors (`participants` default-on; `profiles` triage
+  default-on, full enrichment behind `--profiles` — §1/§7), 4 tables, 5 gateway
+  methods + `_input_user`, tri-state storage, the membership/invite edges, the
+  #11 fix, reproject replay support (§10), the profiles resume-to-convergence
+  cursor (§7.1), and the enrichment-pass parameters (§7.2).
 - **Out of scope (own specs):** phone `lookup` (reverse-direction, server-
   mutating, its own flag); basic-group inviter enumeration (targets are
   channel-typed); `peerSettings`/registration-month (requires the target to have
@@ -435,5 +468,34 @@ holds regardless): the server's real paging *depth* on a larger roster (NRM Chat
 at 307 is small; the 78k→12 ceiling bites only huge groups — page and record
 `enumerated / count`), and `get_participant`/`getParticipants` behavior on a
 `participants_hidden` group (the oracle is expected to survive where bulk is
-reduced to admins+bots). The throwaway probe lives at
-`scratchpad/person_layer_probe.py`; it is not part of the deliverable.
+reduced to admins+bots). The throwaway probe used to answer these is not part of
+the deliverable and does not need to be reproduced.
+
+## 14. Context for the implementing session
+
+Everything a fresh session needs that is not design content:
+
+- **Branch:** `feat/person-layer` (already exists, has this spec committed, and
+  descends from the reproject work so `clock.py`/`replay.py`/`reproject.py` and
+  migration `0003_run_id.sql` are present). Do the work here.
+- **Gate A issue:** **#41** (this feature); umbrella **#13** (Phase 2). Reference
+  #41 in the `single-feature-run`.
+- **Reproject is merged** to `main` (#40, 2026-08-27), so §10 (replay support) is
+  buildable now, not deferred. Read `docs/features/reproject.md` +
+  `docs/adr/0005-run-structure.md` before touching `replay.py`/`reproject.py`.
+- **The must-read grounding** beyond this spec: the two research docs
+  `docs/research/telegram-extraction-surface.md` and
+  `docs/research/sources/mtproto-participants-users.md` (the hard walls and the
+  `min`-merge / tri-state field rules — the §-number citations in this spec
+  point there; the actual rules are also inlined in §4.3 and §7); the reproject
+  plan `docs/superpowers/plans/2026-08-26-reproject.md` as the *format* model for
+  the implementation plan; and the existing collectors (`discussion.py` for the
+  linked-group + `--join` machinery, `history.py` for the `sync_state` resume
+  idiom, `media.py` for a store-walking collector).
+- **DoD smoke target:** the real `default` archive — `@national_resistance_movement`
+  and its linked group **NRM Chat** (307 members). Live Telegram runs must be on
+  the **main thread** (Keychain access; sandboxed workflow agents cannot reach
+  it), so the DoD live step is a human/main-thread action, not a subagent's.
+- **Process:** brainstorming is complete and this spec is approved — go straight
+  to `superpowers:writing-plans` to author the implementation plan, then execute
+  via `single-feature-run` (plan pre-approved). Do not re-open the design.
