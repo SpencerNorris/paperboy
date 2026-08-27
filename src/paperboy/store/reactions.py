@@ -31,8 +31,12 @@ def _raw_messages(store: Store, channel_id: int):
 def backfill_recent_reactions(store: Store, channel_id: int, tier: str) -> int:
     """Project every `recent_reactions` reactor into `peers` (min, with the
     message as provenance) and a `reacted_to` edge. Returns DISTINCT
-    reactors. Idempotent (`add_edge_once`; the stub's stamp is the raw
-    record's `observed_at`)."""
+    reactors — TOTAL distinct across the whole scan, not new-this-call
+    (unlike `participants.project_join_service_messages`'s `joins`/`leaves`,
+    which count only newly-observed facts): every re-run rescans every
+    reaction sample, so this returns the same count every time on an
+    unchanged channel. Idempotent (`add_edge_once`; the stub's stamp is the
+    raw record's `observed_at`)."""
     seen: set[str] = set()
     for row in _raw_messages(store, channel_id):
         payload = json.loads(row["payload_json"])
