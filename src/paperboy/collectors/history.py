@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, peer_ref_uri
+from paperboy.ids import msg_uri, peer_ref_uri, peer_stub
 from paperboy.store.edges import add_edge
 from paperboy.store.messages import mark_deleted, upsert_message
 from paperboy.store.peers import upsert_peer
@@ -25,22 +25,6 @@ from paperboy.targets import Target
 _HISTORY_PAGE_SIZE = 100
 _GET_MESSAGES_CHUNK = 200
 _CHANNEL_DIFFERENCE_LIMIT = 100
-
-
-def _author_stub(from_id: dict | None) -> dict | None:
-    """A minimal `min` peer object for a message's `from_id`, or None.
-
-    Matched case-insensitively: Telethon's `to_dict()` emits the PascalCase
-    class name (`"PeerUser"`), not the lowercase TL constructor name.
-    """
-    if from_id is None:
-        return None
-    kind = from_id.get("_", "").lower()
-    if kind == "peeruser":
-        return {"_": "User", "id": from_id["user_id"], "min": True}
-    if kind == "peerchannel":
-        return {"_": "Channel", "id": from_id["channel_id"], "min": True}
-    return None
 
 
 def _latest_revision_hash(ctx: CollectContext, uri: str) -> str | None:
@@ -209,7 +193,7 @@ class HistoryCollector:
         # too: in a linked discussion group an anonymous or channel-authored
         # comment arrives as `PeerChannel`, and those commenters are exactly
         # the people-discovery data the `discussion` phase exists to collect.
-        stub = _author_stub(m.get("from_id"))
+        stub = peer_stub(m.get("from_id"))
         if stub is not None:
             upsert_peer(
                 ctx.store, stub, raw_id, observed_at,
