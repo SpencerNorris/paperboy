@@ -15,18 +15,12 @@ from __future__ import annotations
 
 import json
 
-from paperboy.ids import msg_uri, peer_ref_uri
+from paperboy.ids import msg_uri, peer_ref_uri, peer_stub
 from paperboy.store.db import Store
 from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
 
 _COMMENTED_ON = "commented_on"
-
-# `Peer*` discriminator -> (constructor tag, id field) for a projectable stub.
-# The live capture contains both: an anonymous admin commenting as the channel
-# arrives as `PeerChannel`, not `PeerUser`. Anything else (`PeerChat`, or a
-# future discriminator) is skipped rather than guessed at.
-_PEER_STUB_KIND = {"peeruser": ("User", "user_id"), "peerchannel": ("Channel", "channel_id")}
 
 
 def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
@@ -70,7 +64,7 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
         observed_at = row["observed_at"]
         post_uri = msg_uri(channel_id, post_id)
         for peer in repliers:
-            stub = _peer_stub(peer)
+            stub = peer_stub(peer)
             if stub is None:
                 continue
             uri = peer_ref_uri(peer)
@@ -97,13 +91,3 @@ def backfill_recent_repliers(store: Store, channel_id: int, tier: str) -> int:
             )
             seen.add(uri)
     return len(seen)
-
-
-def _peer_stub(peer: dict) -> dict | None:
-    """A minimal `min` peer object for a bare `Peer*` reference, or None."""
-    mapped = _PEER_STUB_KIND.get((peer.get("_") or "").lower())
-    if mapped is None:
-        return None
-    tag, id_field = mapped
-    peer_id = peer.get(id_field)
-    return None if peer_id is None else {"_": tag, "id": peer_id, "min": True}

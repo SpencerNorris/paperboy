@@ -4,9 +4,12 @@ from paperboy.ids import (
     channel_uri,
     chat_uri,
     invite_uri,
+    iso_or_none,
     msg_uri,
+    namespaced_kind,
     parse_tme_link,
     parse_uri,
+    peer_stub,
     to_iso,
     user_uri,
     username_uri,
@@ -85,3 +88,27 @@ def test_parse_tme_link_invite():
 def test_parse_tme_link_rejects_non_telegram_urls():
     assert parse_tme_link("https://example.com/durov") is None
     assert parse_tme_link("not a url at all") is None
+
+
+def test_iso_or_none_accepts_int_str_datetime_and_none():
+    assert iso_or_none(None) is None
+    assert iso_or_none("2026-01-01T00:00:00+00:00") == "2026-01-01T00:00:00+00:00"
+    assert iso_or_none(0) == "1970-01-01T00:00:00+00:00"
+    # Telethon's to_dict() hands back aware datetimes for TL `date` fields.
+    assert iso_or_none(datetime(2026, 1, 1, tzinfo=UTC)) == "2026-01-01T00:00:00+00:00"
+
+
+def test_peer_stub_maps_peer_references_to_min_stubs():
+    assert peer_stub({"_": "PeerUser", "user_id": 5}) == {"_": "User", "id": 5, "min": True}
+    assert peer_stub({"_": "peerChannel", "channel_id": 9}) == {
+        "_": "Channel", "id": 9, "min": True,
+    }
+    assert peer_stub({"_": "PeerChat", "chat_id": 3}) is None  # basic groups: not a stub kind
+    assert peer_stub(None) is None
+    assert peer_stub({"_": "PeerUser"}) is None  # id-less reference
+
+
+def test_namespaced_kind_prefixes_bare_class_names_only():
+    assert namespaced_kind("users", {"_": "UserFull"}, "UserFull") == "users.UserFull"
+    assert namespaced_kind("users", {"_": "users.UserFull"}, "UserFull") == "users.UserFull"
+    assert namespaced_kind("users", {}, "UserFull") == "users.UserFull"
