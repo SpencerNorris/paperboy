@@ -140,6 +140,43 @@ def test_triage_after_full_keeps_about_birthday_and_enriched_at(tmp_path):
         assert json.loads(row["field_states_json"])["about"] == {"state": "present"}
 
 
+def test_triage_after_full_keeps_bot_only_surface(tmp_path):
+    # A triage-level bot_json (bare `User.bot_*` flags only) must not replace
+    # the richer bot_json built from a `UserFull` (bot_info, admin rights,
+    # ...) — the projection must not go permanently lossy just because the
+    # LAST observation of a bot happened to be triage-level (correctness
+    # review, regression for the FILTER_BOTS enumeration path).
+    with _store(tmp_path) as st:
+        bot_user = {
+            "_": "User", "id": 9, "access_hash": 111, "first_name": "Real", "bot": True,
+            "bot_chat_history": True, "bot_info_version": 3,
+        }
+        full_user = {
+            "_": "UserFull", "id": 9,
+            "bot_info": {"_": "BotInfo", "description": "does things", "commands": []},
+            "bot_broadcast_admin_rights": {"_": "ChatAdminRights", "change_info": True},
+        }
+        r1 = st.add_raw(
+            "users.UserFull", {"full_user": full_user, "users": [bot_user]}, "stranger", None
+        )
+        upsert_user(st, bot_user, r1, T1, "stranger", full_user=full_user)
+        row = _row(st)
+        bot = json.loads(row["bot_json"])
+        assert bot["bot_chat_history"] is True
+        assert bot["bot_info"]["description"] == "does things"
+        assert bot["bot_broadcast_admin_rights"]["change_info"] is True
+
+        # A later triage-only observation (no full_user) of the SAME bot.
+        r2 = st.add_raw("User", bot_user, "stranger", None)
+        upsert_user(st, bot_user, r2, T2, "stranger")
+        row = _row(st)
+        bot = json.loads(row["bot_json"])
+        assert bot["bot_chat_history"] is True  # still there
+        assert bot["bot_info"]["description"] == "does things"  # NOT wiped by triage
+        assert bot["bot_broadcast_admin_rights"]["change_info"] is True  # NOT wiped by triage
+        assert row["enriched_at"] == T1  # a triage pass never looks like an enrichment
+
+
 def test_field_states_phone_empty_string_is_the_min_wire_state():
     states = field_states({"_": "User", "id": 1, "min": True, "phone": ""})
     assert states["phone"] == {"state": "absent", "why": "min_empty_string"}

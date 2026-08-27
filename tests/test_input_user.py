@@ -99,6 +99,24 @@ def test_store_ref_case_3_unresolvable(tmp_path):
         assert input_user_ref(st, "tg:user:404") is None
 
 
+def test_store_ref_case_2_rejects_a_min_channel_access_hash(tmp_path):
+    # A channel known only as a `min` stub has an access_hash that is only
+    # usable for photo file locations (research §8.7) — never for building a
+    # from-message ref, so provenance into it must stay unresolvable exactly
+    # like the case-1 min-hash guard above (symmetry hardening).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        min_group = {
+            "_": "Channel", "id": GROUP_ID, "min": True, "access_hash": 4242, "title": "G",
+        }
+        r = st.add_raw("Channel", min_group, "stranger", None)
+        upsert_peer(st, min_group, r, T, seen_in_chat=None, seen_in_msg=None)
+
+        stub = {"_": "User", "id": 5, "min": True}
+        r2 = st.add_raw("User", stub, "stranger", None)
+        upsert_peer(st, stub, r2, T, seen_in_chat=GROUP_ID, seen_in_msg=200)
+        assert input_user_ref(st, "tg:user:5") is None
+
+
 def test_participants_filter_mapping():
     assert isinstance(_participants_filter(FILTER_RECENT), ChannelParticipantsRecent)
     assert isinstance(_participants_filter(FILTER_ADMINS), ChannelParticipantsAdmins)

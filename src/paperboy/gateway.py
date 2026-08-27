@@ -881,27 +881,48 @@ class TelethonGateway:
         return result.to_dict()
 
     async def get_users(self, refs: list[dict]) -> list[dict]:
+        from telethon.errors import ChannelInvalidError
         from telethon.tl.functions.users import GetUsersRequest
         from telethon.tl.tlobject import TLObject
 
+        from paperboy.budget import SkipAndRecord
+
         ids = [_input_user(r) for r in refs]
-        result = cast(
-            list[TLObject],
-            await self.budget.call("users.getUsers", lambda: self.client(GetUsersRequest(id=ids))),
-        )
+        try:
+            result = cast(
+                list[TLObject],
+                await self.budget.call(
+                    "users.getUsers", lambda: self.client(GetUsersRequest(id=ids))
+                ),
+            )
+        except ChannelInvalidError as exc:
+            # A stale `inputUserFromMessage` provenance (message deleted, hash
+            # rotated) answers CHANNEL_INVALID here — caught locally, not via
+            # `classify` (errors.py module docstring): that classification
+            # must not also apply to `channels.getFullChannel`/
+            # `updates.getChannelDifference` on the collection target itself.
+            raise SkipAndRecord(str(exc)) from exc
         return [u.to_dict() for u in result]
 
     async def get_full_user(self, ref: dict) -> dict:
+        from telethon.errors import ChannelInvalidError
         from telethon.tl.functions.users import GetFullUserRequest
         from telethon.tl.types.users import UserFull
 
+        from paperboy.budget import SkipAndRecord
+
         user = _input_user(ref)
-        result = cast(
-            UserFull,
-            await self.budget.call(
-                "users.getFullUser", lambda: self.client(GetFullUserRequest(id=user))
-            ),
-        )
+        try:
+            result = cast(
+                UserFull,
+                await self.budget.call(
+                    "users.getFullUser", lambda: self.client(GetFullUserRequest(id=user))
+                ),
+            )
+        except ChannelInvalidError as exc:
+            # Same stale-provenance case as `get_users` above — scoped here,
+            # not in `classify`, for the same reason.
+            raise SkipAndRecord(str(exc)) from exc
         return result.to_dict()
 
     async def get_user_photos(self, ref: dict, *, offset: int, max_id: int, limit: int) -> dict:

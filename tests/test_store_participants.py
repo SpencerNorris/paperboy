@@ -54,6 +54,13 @@ def test_participant_row_parses_every_constructor():
     })
     # ban date != join date, so it never lands in ParticipantFacts.join_date
     assert banned == ParticipantFacts("tg:channel:5", "banned", None, None, None, None)
+    restricted = participant_row({
+        "_": "ChannelParticipantBanned", "peer": {"_": "PeerUser", "user_id": 5},
+        "kicked_by": 3, "date": JOINED, "banned_rights": {}, "left": False, "rank": None,
+    })
+    # `left` unset (or explicitly False) on Banned = restricted but STILL A
+    # MEMBER, not kicked out — the single constructor carries both meanings.
+    assert restricted == ParticipantFacts("tg:user:5", "member", None, None, None, None)
     left = participant_row({"_": "ChannelParticipantLeft", "peer": {"_": "PeerUser", "user_id": 6}})
     assert left == ParticipantFacts("tg:user:6", "left", None, None, None, None)
     assert participant_row({"_": "SomethingElse", "user_id": 7}) is None
@@ -72,7 +79,8 @@ def test_upsert_writes_current_state_and_a_newer_observation_wins_keeping_join_d
         upsert_participant(
             st, GROUP_ID,
             {"_": "ChannelParticipantBanned", "peer": {"_": "PeerUser", "user_id": 1},
-             "kicked_by": 3, "date": JOINED + 86400, "banned_rights": {}, "rank": None},
+             "kicked_by": 3, "date": JOINED + 86400, "banned_rights": {}, "left": True,
+             "rank": None},
             r2, T2,
         )
         row = st.conn.execute("select * from participants where uri='tg:user:1'").fetchone()
@@ -121,6 +129,14 @@ def test_snapshots_member_rows_and_roster_accounting_row(tmp_path):
         assert add_participant_snapshot(st, GROUP_ID, facts, T1, r)
         assert add_participant_snapshot(st, GROUP_ID, facts, T1, r)  # append-only by default
         assert not add_participant_snapshot(st, GROUP_ID, facts, T1, r, once=True)
+        # `once=True` dedupes on observation identity (group_id, uri,
+        # observed_at, status), NOT on source_raw_id: a re-observed history
+        # page gives the underlying message a fresh source_raw_id every run
+        # (upsert_message's ON CONFLICT), so the same fact re-scanned with a
+        # DIFFERENT source_raw_id must still be recognized as a duplicate.
+        r_other = st.add_raw("channels.ChannelParticipants", {}, "stranger", None)
+        assert r_other != r
+        assert not add_participant_snapshot(st, GROUP_ID, facts, T1, r_other, once=True)
         add_roster_snapshot(
             st, GROUP_ID, T1, enumerated=1, true_count=307, reason=None, source_raw_id=r
         )
@@ -130,6 +146,29 @@ def test_snapshots_member_rows_and_roster_accounting_row(tmp_path):
         assert [tuple(x) for x in rows] == [
             ("tg:user:1", None, None), ("tg:user:1", None, None), (None, 1, 307),
         ]
+
+
+def test_restricted_member_without_left_still_gets_a_member_of_edge(tmp_path):
+    # A moderated group's Recent-sourced ChannelParticipantBanned for a
+    # muted/restricted (but still-present) member must not be dropped from
+    # the roster/graph: `left` unset means member, and `member_of` must fire.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        r = st.add_raw("channels.ChannelParticipants", {}, "stranger", None)
+        facts = upsert_participant(
+            st, GROUP_ID,
+            {"_": "ChannelParticipantBanned", "peer": {"_": "PeerUser", "user_id": 5},
+             "kicked_by": 3, "date": JOINED, "banned_rights": {}, "left": False, "rank": None},
+            r, T1,
+        )
+        assert facts is not None and facts.status == "member"
+        row = st.conn.execute("select status from participants where uri='tg:user:5'").fetchone()
+        assert row["status"] == "member"
+        assert membership_edges(st, GROUP_ID, facts, T1, "stranger", r, {"source": "roster"}) == 1
+        edges = {
+            (e["subject_uri"], e["predicate"], e["object_uri"])
+            for e in st.conn.execute("select subject_uri, predicate, object_uri from edges")
+        }
+        assert ("tg:user:5", "member_of", "tg:channel:77") in edges
 
 
 def test_membership_edges_only_for_member_statuses(tmp_path):

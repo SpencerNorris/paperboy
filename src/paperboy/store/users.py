@@ -292,6 +292,16 @@ def upsert_user(
         if full_user is None:
             for column in _FULL_ONLY_COLUMNS:
                 updates.pop(column, None)  # triage never blanks full-only columns
+            # `bot_json` is written by BOTH levels (`_triage_columns` folds in
+            # the bare-`User` bot_* flags; `_full_columns` adds the UserFull-
+            # only surface on top) so it isn't a full-only column above — but
+            # a triage-level `bot_json` must still never replace a richer one
+            # built from a `UserFull`: merge onto the stored bot facts.
+            if existing["bot_json"]:
+                merged_bot = json.loads(existing["bot_json"])
+                incoming_bot = json.loads(updates["bot_json"]) if updates.get("bot_json") else {}
+                merged_bot.update(incoming_bot)
+                updates["bot_json"] = dumps(merged_bot)
         updates["is_min"] = int(incoming_min)
         updates["tier"] = tier
         updates["source_raw_id"] = source_raw_id
