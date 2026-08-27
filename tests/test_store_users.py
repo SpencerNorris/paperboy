@@ -100,6 +100,55 @@ def test_min_never_clobbers_a_full_row_but_widens_the_window(tmp_path):
         assert (row["first_seen"], row["last_seen"]) == (T1, T2)
 
 
+def test_min_status_applied_to_column_is_reflected_in_field_states(tmp_path):
+    """Blocking regression: the min branch's status_kind/status_value write
+    must be matched by a field_states update, or the row contradicts itself
+    (a column reading 'present' while field_states says 'absent' — the exact
+    false negative D2's tri-state map exists to prevent). The existing
+    min-status test never exercises this because its cached status is not
+    empty, so the min branch's status write never fires there."""
+    with _store(tmp_path) as st:
+        full = _full_user_obj(status={"_": "UserStatusEmpty"})
+        r1 = st.add_raw("User", full, "stranger", None)
+        upsert_user(st, full, r1, T1, "stranger")
+        assert json.loads(_row(st)["field_states_json"])["status"] == {"state": "absent"}
+        mn = {
+            "_": "User", "id": 9, "min": True,
+            "status": {"_": "UserStatusRecently", "by_me": None},
+        }
+        r2 = st.add_raw("User", mn, "stranger", None)
+        upsert_user(st, mn, r2, T2, "stranger")
+        row = _row(st)
+        assert row["status_kind"] == "recently"
+        states = json.loads(row["field_states_json"])
+        assert states["status"] == {
+            "state": "present", "granularity": "coarse", "coarse_cause": "target_privacy",
+        }
+
+
+def test_min_photo_applied_to_column_is_reflected_in_field_states(tmp_path):
+    """Blocking regression: same as above, for the min branch's
+    `apply_min_photo` photo_ref write."""
+    with _store(tmp_path) as st:
+        full = _full_user_obj(photo=None)
+        r1 = st.add_raw("User", full, "stranger", None)
+        upsert_user(st, full, r1, T1, "stranger")
+        assert _row(st)["photo_ref"] is None
+        assert json.loads(_row(st)["field_states_json"])["photo"] == {"state": "absent"}
+        mn = {
+            "_": "User", "id": 9, "min": True, "apply_min_photo": True,
+            "photo": {"_": "UserProfilePhoto", "photo_id": 3, "dc_id": 2, "has_video": False,
+                      "personal": None, "stripped_thumb": None},
+        }
+        r2 = st.add_raw("User", mn, "stranger", None)
+        upsert_user(st, mn, r2, T2, "stranger")
+        row = _row(st)
+        assert row["photo_ref"] is not None
+        assert json.loads(row["photo_ref"])["photo_id"] == 3
+        states = json.loads(row["field_states_json"])
+        assert states["photo"] == {"state": "present"}
+
+
 def test_min_first_then_full_applies_even_when_the_full_is_older(tmp_path):
     # Richness beats recency (ADR-0005 §6's min<-full cell, applied here too).
     with _store(tmp_path) as st:

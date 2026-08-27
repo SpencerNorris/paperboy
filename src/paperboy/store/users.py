@@ -194,7 +194,7 @@ def _triage_columns(user: dict) -> dict:
     if user.get("bot"):
         bot = {
             k: v for k, v in user.items()
-            if k.startswith("bot_") and v not in (None, False, "", [])
+            if k.startswith("bot_") and v is not None and v is not False and v != "" and v != []
         }
     flags = {k: user[k] for k in _TARGET_FLAG_KEYS if user.get(k)}
     restriction = user.get("restriction_reason") or None
@@ -231,7 +231,7 @@ def _full_columns(user: dict, full_user: dict, bot_json: str | None) -> dict:
         bot = json.loads(bot_json) if bot_json else {}
         bot.update({
             k: v for k, v in full_user.items()
-            if k.startswith("bot_") and v not in (None, False, "", [])
+            if k.startswith("bot_") and v is not None and v is not False and v != "" and v != []
         })
         cols["bot_json"] = dumps(bot) if bot else None
     return cols
@@ -277,15 +277,32 @@ def upsert_user(
 
     newer = observed_at >= existing["last_seen"]
     updates: dict = {}
-    if incoming_min and not existing["is_min"]:
+    took_min_branch = incoming_min and not existing["is_min"]
+    if took_min_branch:
         # research §8.7: a min object never clobbers a full row's identity.
         # Status applies only if the cached status is empty; photo only with
         # `apply_min_photo`. Both still gated on recency.
+        applied: set[str] = set()
         if newer and existing["status_kind"] in (None, "empty") and cols["status_kind"]:
             updates["status_kind"] = cols["status_kind"]
             updates["status_value"] = cols["status_value"]
+            applied.add("status")
         if newer and user.get("apply_min_photo") and cols["photo_ref"]:
             updates["photo_ref"] = cols["photo_ref"]
+            applied.add("photo")
+        if applied:
+            # D2: `field_states` must never contradict the columns it
+            # describes — a column this branch just wrote to `present`/
+            # `hidden_from_you` can't be left recorded `absent`. Merge in
+            # ONLY the keys this branch actually applied; every other key
+            # (phone, about, ...) is untouched by a min observation and
+            # must keep whatever the stored row already said.
+            merged_states = merge_field_states(
+                json.loads(existing["field_states_json"] or "{}"),
+                {key: states[key] for key in applied},
+                full=False,
+            )
+            updates["field_states_json"] = dumps(merged_states)
     elif newer or (existing["is_min"] and not incoming_min):
         # full<-full and min<-min on recency; min<-full always (richness).
         updates.update(cols)
@@ -309,7 +326,15 @@ def upsert_user(
             json.loads(existing["field_states_json"] or "{}"), states, full=full_user is not None
         )
         updates["field_states_json"] = dumps(merged)
-    if full_user is not None:
+    if full_user is not None and not took_min_branch:
+        # `enriched_at` must move only when the full-level columns (about,
+        # birthday, ...) were actually applied — i.e. the branch above did
+        # `updates.update(cols)`. The min branch never applies them (it only
+        # ever writes status_kind/status_value/photo_ref), so a row must not
+        # be stamped "enriched" while carrying none of the enrichment
+        # (a `getFullUser` response is not documented to return a `min`
+        # `User`, so this guard is defensive rather than reachable today —
+        # but D3's `enriched_at IS NULL` first pass depends on it holding).
         updates["enriched_at"] = max(existing["enriched_at"] or "", observed_at)
     updates["first_seen"] = min(existing["first_seen"], observed_at)
     updates["last_seen"] = max(existing["last_seen"], observed_at)
