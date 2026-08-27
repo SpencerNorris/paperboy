@@ -37,6 +37,7 @@ class FakePeerFlood(Exception):
 def _skip_error_classes() -> tuple[type[Exception], ...]:
     from telethon.errors import (
         BroadcastForbiddenError,
+        ChannelInvalidError,
         ChannelPrivateError,
         ChannelsTooMuchError,
         ChatAdminRequiredError,
@@ -49,6 +50,7 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         PremiumAccountRequiredError,
         UserBannedInChannelError,
         UserChannelsTooMuchError,
+        UserIdInvalidError,
         UsersTooMuchError,
     )
 
@@ -81,6 +83,12 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         UserChannelsTooMuchError,
         UsersTooMuchError,
         UserBannedInChannelError,
+        # `users.getFullUser`/`users.getUsers` on an `inputUserFromMessage`
+        # whose provenance went stale (message deleted, hash rotated) answer
+        # USER_ID_INVALID / CHANNEL_INVALID: skip that one user, the profiles
+        # sweep continues (person layer, spec §5 case 2).
+        UserIdInvalidError,
+        ChannelInvalidError,
     )
 
 

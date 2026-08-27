@@ -38,7 +38,7 @@ class Check:
     severity: Severity
 
 
-def _session_age_days(authorizations: dict) -> float | None:
+def session_age_days(authorizations: dict) -> float | None:
     for auth in authorizations.get("authorizations", []):
         if not auth.get("current"):
             continue
@@ -53,6 +53,12 @@ def _session_age_days(authorizations: dict) -> float | None:
     return None
 
 
+# Back-compat alias: this was private (`_session_age_days`) before the
+# `participants` collector's per-phase session-age gate (plan D10) needed it
+# as public API too. Existing tests still reference the old name.
+_session_age_days = session_age_days
+
+
 def _check_proxy(settings: Settings) -> Check:
     if not settings.require_proxy:
         return Check("proxy", True, "require_proxy is disabled", "fail")
@@ -62,7 +68,7 @@ def _check_proxy(settings: Settings) -> Check:
 
 
 def _check_session_age(authorizations: dict, settings: Settings) -> Check:
-    age = _session_age_days(authorizations)
+    age = session_age_days(authorizations)
     if age is None:
         return Check("session_age", False, "no current session found", "fail")
     if age < settings.min_session_age_days:

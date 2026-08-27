@@ -1,6 +1,7 @@
 import pytest
 
 from paperboy.budget import SkipAndRecord
+from paperboy.gateway import FILTER_RECENT
 from tests.fakes import FakeGateway
 
 
@@ -180,3 +181,82 @@ async def test_iter_history_instrumentation_is_per_call_not_per_message():
         pass
     assert empty_gw.calls.count("iter_history") == 1
     assert len(empty_gw.history_targets) == 1
+
+
+@pytest.mark.asyncio
+async def test_fake_person_layer_methods_record_calls_and_default_benignly():
+    gw = FakeGateway({})
+    ic = {"channel_id": 77, "access_hash": 1}
+    page = await gw.get_participants(ic, FILTER_RECENT, 0, 200)
+    assert page == {
+        "_": "ChannelParticipants", "count": 0, "participants": [], "chats": [], "users": [],
+    }
+    assert await gw.get_participant(ic, {"user_id": 5, "access_hash": 1}) is None
+    users = await gw.get_users([{"user_id": 5, "access_hash": 1}, {"user_id": 6, "access_hash": 1}])
+    assert users == [{"_": "UserEmpty", "id": 5}, {"_": "UserEmpty", "id": 6}]
+    with pytest.raises(SkipAndRecord):
+        await gw.get_full_user({"user_id": 5, "access_hash": 1})
+    photos = await gw.get_user_photos(
+        {"user_id": 5, "access_hash": 1}, offset=0, max_id=0, limit=100
+    )
+    assert photos == {"_": "Photos", "photos": [], "users": []}
+    assert await gw.download_user_photo({"id": 9}) is None
+    reactions = await gw.get_message_reactions_list(ic, 10, offset=None, limit=100)
+    assert reactions["reactions"] == [] and reactions["next_offset"] is None
+    with pytest.raises(SkipAndRecord):
+        await gw.get_privacy("phone")
+    assert gw.calls == [
+        "get_participants", "get_participant", "get_users", "get_full_user", "get_user_photos",
+        "download_user_photo", "get_message_reactions_list", "get_privacy",
+    ]
+    assert gw.participants_calls == [(77, "channelParticipantsRecent", 0)]
+    assert gw.participant_calls == [(77, 5)]
+    assert gw.users_calls == [[5, 6]]
+    assert gw.full_user_calls == [5] and gw.user_photos_calls == [5] and gw.avatar_calls == [9]
+    assert gw.reactions_calls == [(77, 10, None)]
+
+
+@pytest.mark.asyncio
+async def test_fake_participants_pages_are_consumed_in_order_then_empty():
+    p1 = {
+        "_": "ChannelParticipants", "count": 3,
+        "participants": [{"_": "ChannelParticipant", "user_id": 1}], "chats": [], "users": [],
+    }
+    p2 = {
+        "_": "ChannelParticipants", "count": 3,
+        "participants": [{"_": "ChannelParticipant", "user_id": 2}], "chats": [], "users": [],
+    }
+    gw = FakeGateway({"participants": {77: {"channelParticipantsRecent": [p1, p2]}}})
+    ic = {"channel_id": 77, "access_hash": 1}
+    assert await gw.get_participants(ic, FILTER_RECENT, 0, 200) is p1
+    assert await gw.get_participants(ic, FILTER_RECENT, 1, 200) is p2
+    assert (await gw.get_participants(ic, FILTER_RECENT, 2, 200))["participants"] == []
+    # a different channel has its own page sequence
+    other = await gw.get_participants({"channel_id": 78, "access_hash": 1}, FILTER_RECENT, 0, 200)
+    assert other["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_exception_fixtures_raise_for_walls_and_batches():
+    wall = SkipAndRecord("CHAT_ADMIN_REQUIRED")
+    ok_participant = {"_": "ChannelParticipant", "participant": {}, "users": []}
+    gw = FakeGateway({
+        "participants": {77: {"channelParticipantsRecent": wall}},
+        "participant": {77: {5: wall, 6: ok_participant}},
+        "users": {5: {"_": "User", "id": 5}, 6: SkipAndRecord("MSG_ID_INVALID")},
+        "full_channel_by_id": {77: {"full_chat": {"id": 77}}},
+        "full_channel": {"full_chat": {"id": 5}},
+    })
+    ic = {"channel_id": 77, "access_hash": 1}
+    with pytest.raises(SkipAndRecord):
+        await gw.get_participants(ic, FILTER_RECENT, 0, 200)
+    with pytest.raises(SkipAndRecord):
+        await gw.get_participant(ic, {"user_id": 5, "access_hash": 1})
+    six = await gw.get_participant(ic, {"user_id": 6, "access_hash": 1})
+    assert six is not None and six["_"] == "ChannelParticipant"
+    with pytest.raises(SkipAndRecord):  # one bad ref fails the whole vector, like the real RPC
+        await gw.get_users([{"user_id": 5, "access_hash": 1}, {"user_id": 6, "access_hash": 1}])
+    assert (await gw.get_users([{"user_id": 5, "access_hash": 1}]))[0]["id"] == 5
+    assert (await gw.get_full_channel(ic))["full_chat"]["id"] == 77
+    other_full = await gw.get_full_channel({"channel_id": 5, "access_hash": 1})
+    assert other_full["full_chat"]["id"] == 5

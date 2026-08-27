@@ -175,3 +175,13 @@ async def test_min_interval_paces_repeat_calls_to_same_method(tmp_path):
         # out the per-method minimum interval before proceeding.
         await b.call("m", ok)
         assert slept and slept[0] > 0
+
+
+def test_user_id_invalid_and_channel_invalid_classify_as_skip():
+    # `users.getFullUser` on a stale `inputUserFromMessage` provenance answers
+    # USER_ID_INVALID / CHANNEL_INVALID (research Part 2 §1): one user's
+    # enrichment is skipped, the sweep continues — never a raw crash.
+    from telethon.errors import ChannelInvalidError, UserIdInvalidError
+
+    for exc in (UserIdInvalidError, ChannelInvalidError):
+        assert classify(exc(None)) == Disposition.SKIP
