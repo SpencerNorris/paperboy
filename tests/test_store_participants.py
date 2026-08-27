@@ -239,8 +239,16 @@ def test_join_service_messages_project_membership_and_invite_edges(tmp_path):
         ).fetchone()
         assert snap["observed_at"] == "2025-01-01T00:01:00+00:00"
 
-        # idempotent: a re-run adds nothing
+        # idempotent: a re-run adds nothing — including `joins`/`leaves`, not
+        # just `edges` (regression: `write_participant` always upserts and
+        # returns non-None, so a naive `joins += 1`/`leaves += 1` gated only on
+        # that would recount every historical join/leave as "new" on EVERY
+        # scan; a caller accumulating these into `run_events` would then
+        # misreport N "new" service_joins on every future `collect` run
+        # against an unchanged channel, forever). The gate must be the
+        # `add_participant_snapshot(once=True)` result, the one signal that
+        # actually distinguishes "seen for the first time" from a re-scan.
         again = project_join_service_messages(st, GROUP_ID, "stranger")
-        assert again["edges"] == 0
+        assert again == {"joins": 0, "leaves": 0, "edges": 0}
         assert st.conn.execute("select count(*) from participant_snapshots").fetchone()[0] == 5
         assert st.conn.execute("select count(*) from edges").fetchone()[0] == 7
