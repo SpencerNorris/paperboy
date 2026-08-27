@@ -255,6 +255,50 @@ The universal enrichment sweep — passive, no join, no new tier.
 `photo` only with `apply_min_photo`; `status` if cached is min/empty). Full
 profile state lands in `users`/`user_snapshots`, keeping `peers` untouched.
 
+### 7.1 Resume to convergence — enrich *everyone*, across runs
+
+`profile_budget` caps the **expensive** `getFullUser` fetch per run, not the
+population; the cheap batched `getUsers` triage (step 2) always covers everyone.
+So a group larger than the budget is fully triaged in one run but only its
+top-priority slice is deep-enriched. To converge on the whole group over
+repeated runs rather than re-enriching the same high-priority head every time,
+`profiles` keeps a **resume cursor** (like `history`'s `offset_id`), in
+`sync_state('profiles', <channel_id>)`:
+
+- Each run spends its `getFullUser` budget on users **not yet fully enriched**,
+  in the §7 priority order, then advances the cursor past them.
+- When every discovered user has been fully enriched once, the cursor wraps to a
+  **refresh** pass — re-enriching the **stalest** users first (oldest
+  `users.last_seen` among fully-enriched), so profile drift (a renamed account,
+  a new photo, a changed bio) is picked up as a fresh `user_snapshots` row
+  without ever starving newly-discovered users of their first enrichment. A
+  configurable **staleness floor** (`--profile-refresh-after`, default off)
+  suppresses re-enriching anyone seen more recently than that, so a
+  never-ending watch loop does not burn budget re-fetching unchanged profiles.
+
+Convergence is therefore: run repeatedly (or once with a raised budget) and
+every discovered user gets a full profile; keep running and they stay fresh.
+Because enrichment writes to append-only `user_snapshots`, re-enrichment is
+always safe (a new observation, never a clobber) and reproject-faithful.
+
+### 7.2 Parameterizing the enrichment pass
+
+Every knob is a `Settings` field with a CLI override, so an operator tunes the
+run to the target and their own risk posture without touching code:
+
+| Knob | CLI | Default | Controls |
+|---|---|---|---|
+| Budget | `--profile-budget N` | 2000/run | how many `getFullUser` fetches one run spends (already exists on `collect`) |
+| Wait | `--profile-interval SECONDS` | inherits Budget's `min_interval` (1.0s) | the pace between full-profile RPCs — raise it to stay quieter / dodge flood onset, lower it (carefully) to go faster |
+| Depth | `--profile-full` / `--profile-triage-only` | full | `--profile-triage-only` runs step 2 for everyone and skips every `getFullUser` — a cheap, near-zero-risk "who's here" pass |
+| Refresh floor | `--profile-refresh-after DURATION` | off | skip re-enriching users seen more recently than this (§7.1) |
+
+Pacing is enforced through the existing `Budget` module (the one chokepoint all
+RPCs already route through), so `--profile-interval` composes with — never
+bypasses — flood-wait handling and the per-run RPC cap. `--profile-triage-only`
+exists precisely because the cheap pass is the passive-safe default an operator
+may want on a first, low-footprint look at an unfamiliar target.
+
 ## 8. Edges
 
 Predicates (reusing the reserved vocabulary, all via `add_edge_once` — set-like
@@ -324,6 +368,14 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
 - **Roster accounting** test — `enumerated / true_count` recorded; the §6.4
   warning fires on shortfall.
 - **`invited_by`/`added_by`** projection from service-message fixtures.
+- **Resume-to-convergence** test (§7.1): a discovered population larger than the
+  budget, run twice, deep-enriches a different (next-priority) slice each run and
+  reaches *everyone* across runs — no user starved, no head re-enriched before
+  the tail is reached; then a third run wraps to the stalest-first refresh pass.
+- **Parameterization** tests (§7.2): `--profile-triage-only` makes **zero**
+  `getFullUser` calls (assert via `FakeGateway.calls`); `--profile-interval`
+  routes through `Budget` (pacing composes with flood handling, never bypasses
+  it); `--profile-refresh-after` skips a recently-seen user.
 - **The two empirical probes are the FIRST implementation step** (§13), run live
   from the collecting account on the main thread; their answers are recorded
   back into this spec and shape the un-joined branch's asserted behavior.
@@ -333,7 +385,8 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
 
 - **In scope:** the two collectors, 4 tables, 5 gateway methods + `_input_user`,
   tri-state storage, the membership/invite edges, the #11 fix, reproject replay
-  support (§10).
+  support (§10), the profiles resume-to-convergence cursor (§7.1), and the
+  enrichment-pass parameters (§7.2).
 - **Out of scope (own specs):** phone `lookup` (reverse-direction, server-
   mutating, its own flag); basic-group inviter enumeration (targets are
   channel-typed); `peerSettings`/registration-month (requires the target to have
