@@ -104,3 +104,18 @@ def test_content_hash_includes_media():
     a = content_hash("hello", None)
     b = content_hash("hello", '{"_": "messageMediaPhoto"}')
     assert a != b
+
+
+def test_metrics_row_is_written_when_only_reactions_are_present(tmp_path):
+    # Group messages carry no `views`/`forwards`; before this fix their
+    # reactions never reached `message_metrics` at all (found building the
+    # reaction-candidate query in the person layer, no-shed).
+    with Store.open(tmp_path / "p.sqlite") as st:
+        m = {"_": "Message", "id": 1, "message": "m", "date": 1767322445,
+             "reactions": {
+                 "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 2}],
+             }}
+        rid = st.add_raw("Message", m, "stranger", {"channel_id": 77})
+        upsert_message(st, 77, m, rid, "2026-01-01T00:00:00+00:00", "stranger")
+        row = st.conn.execute("select views, reactions_json from message_metrics").fetchone()
+        assert row is not None and row["views"] is None and '"count": 2' in row["reactions_json"]

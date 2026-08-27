@@ -126,7 +126,7 @@ def upsert_message(
     replies = replies_obj.get("replies") if isinstance(replies_obj, dict) else None
     reactions = msg.get("reactions")
     reactions_json = dumps(reactions) if reactions else None
-    if views is not None or forwards is not None or replies is not None:
+    if views is not None or forwards is not None or replies is not None or reactions:
         store.conn.execute(
             "INSERT INTO message_metrics "
             "(message_uri, observed_at, views, forwards, replies, reactions_json) "
