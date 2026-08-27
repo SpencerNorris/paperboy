@@ -16,10 +16,14 @@ from paperboy.store.peers import upsert_peer
 
 
 def backfill_message_referenced_peers(store: Store, channel_id: int) -> int:
-    """Returns the number of DISTINCT peers upserted. Idempotent: the min
-    stub's stamp is the message's `first_seen`, so a re-run re-asserts the
-    same provenance and a fuller, newer row is never touched (`upsert_peer`'s
-    full<-min cell)."""
+    """Returns the number of DISTINCT peers upserted — TOTAL distinct across
+    the whole scan, not new-this-call (unlike
+    `participants.project_join_service_messages`'s `joins`/`leaves`, which
+    count only newly-observed facts): every re-run rescans every referenced
+    message, so this returns the same count every time on an unchanged
+    channel. Idempotent: the min stub's stamp is the message's `first_seen`,
+    so a re-run re-asserts the same provenance and a fuller, newer row is
+    never touched (`upsert_peer`'s full<-min cell)."""
     rows = store.conn.execute(
         "SELECT msg_id, fwd_json, entities_json, source_raw_id, first_seen FROM messages "
         "WHERE channel_id=? AND (fwd_json IS NOT NULL OR entities_json IS NOT NULL)",

@@ -237,6 +237,22 @@ async def test_fake_participants_pages_are_consumed_in_order_then_empty():
 
 
 @pytest.mark.asyncio
+async def test_fake_participants_walled_after_one_page_terminates_not_crashes():
+    # A roster that's walled after its only recorded page is a legal fixture
+    # shape (`list[dict | BaseException]` whose last element is the
+    # exception) — the collector's loop must still terminate on an empty
+    # page past the end, not crash trying to read `.count` off the wall.
+    wall = SkipAndRecord("CHAT_ADMIN_REQUIRED")
+    gw = FakeGateway({"participants": {5: {"channelParticipantsRecent": [wall]}}})
+    ic = {"channel_id": 5, "access_hash": 1}
+    with pytest.raises(SkipAndRecord):
+        await gw.get_participants(ic, FILTER_RECENT, 0, 200)
+    page = await gw.get_participants(ic, FILTER_RECENT, 1, 200)
+    assert page["participants"] == []
+    assert page["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_fake_exception_fixtures_raise_for_walls_and_batches():
     wall = SkipAndRecord("CHAT_ADMIN_REQUIRED")
     ok_participant = {"_": "ChannelParticipant", "participant": {}, "users": []}

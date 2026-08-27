@@ -369,8 +369,13 @@ class FakeGateway:
             return empty
         if prior >= len(pages):
             # Past the recorded pages: an empty page ends the collector's loop
-            # (never repeat the last page — that would spin forever).
-            return {**empty, "count": pages[-1].get("count", 0)}
+            # (never repeat the last page — that would spin forever). The
+            # last recorded page may itself be a BaseException (e.g. the
+            # walled-roster fixture shape `[page1, SkipAndRecord(...)]`) —
+            # that's not a dict, so it carries no `count` to echo.
+            last = pages[-1]
+            last_count = last.get("count", 0) if isinstance(last, dict) else 0
+            return {**empty, "count": last_count}
         page = pages[prior]
         self._raise_if_exc(page)
         return page
