@@ -188,14 +188,23 @@ currently enforced only run-level by `doctor`).
   `can_view_participants` false / `CHAT_ADMIN_REQUIRED`) to `run_events` and
   `participant_snapshots`. **Zero enumeration RPC** — a walled roster is a
   first-class stored outcome, never a silent zero.
-- **Linked supergroup, un-joined (passive default):** the free vectors only —
-  `channelParticipantsMentions(top_msg_id)` per thread root (sanctioned
-  non-participant commenters), the `get_participant` oracle for user_ids we
-  already know (join date + status, even in hidden groups), group reaction lists
-  (`{peer_id, date, reaction}` — groups-only, read-only), and **join/leave
-  service messages already in the captured history** (§8, zero new RPC). Bulk
-  `Recent` enumeration is attempted; on `CHAT_ADMIN_REQUIRED`/`CHANNEL_PRIVATE`
-  it is a recorded skip that triggers the §6.4 warning.
+- **Linked supergroup, un-joined (passive default):** **bulk `Recent`
+  enumeration is a real vector here, not a fallback** — the §13 probe confirmed
+  a *public* linked group's roster IS enumerable un-joined and non-admin
+  (`getParticipants(Recent)` on NRM Chat returned `count=307` with participants,
+  no join, no error). So this branch pages `Recent` to the server's depth (§6.3)
+  and unions it with: the `get_participant` **oracle** for known user_ids —
+  confirmed callable un-joined/non-admin **on the group** for arbitrary users
+  via `InputPeerUserFromMessage` (join date + status; the fallback for
+  hidden-member groups where bulk is capped) — `channelParticipantsMentions(top_msg_id)`
+  per thread root, group reaction lists (`{peer_id, date, reaction}` — groups-only,
+  read-only), and **join/leave service messages already in the captured history**
+  (§8, zero new RPC). Only if bulk enumeration is *walled* here
+  (`CHAT_ADMIN_REQUIRED`/`CHANNEL_PRIVATE` — a private or `join_to_send` group)
+  is it a recorded skip that triggers the §6.4 warning. Note the roster (current
+  members) and the discussion-discovered commenters are **different
+  populations** — the probe's arbitrary commenter was `UserNotParticipant` (left
+  the group) — which is exactly why both collectors are needed.
 - **`--join` given:** join the linked group (the one write; audited in
   `run_events` as `active: True`, logged as a warning — the existing
   `discussion._join_or_skip` machinery), then `channelParticipantsRecent` ∪
@@ -376,9 +385,12 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
   `getFullUser` calls (assert via `FakeGateway.calls`); `--profile-interval`
   routes through `Budget` (pacing composes with flood handling, never bypasses
   it); `--profile-refresh-after` skips a recently-seen user.
-- **The two empirical probes are the FIRST implementation step** (§13), run live
-  from the collecting account on the main thread; their answers are recorded
-  back into this spec and shape the un-joined branch's asserted behavior.
+- **The two empirical gates are RESOLVED** (§13, live probe 2026-08-27): tests
+  assert the confirmed behavior — a public linked group's `Recent` roster
+  enumerates un-joined; `get_participant` answers arbitrary group members
+  un-joined/non-admin but is `ChatAdminRequiredError` for an arbitrary user on
+  the broadcast channel. Fixtures encode both the success and the
+  `ChatAdminRequiredError`/`UserNotParticipantError` shapes.
 - **DoD smoke** against the real archive's linked discussion group.
 
 ## 12. Scope and follow-ups
@@ -396,16 +408,32 @@ fast-follow (the raw is captured regardless — only replay *serving* is missing
   and recipes over `users` + `participants` + `edges` + snapshots, not
   collectors, which is why they follow the person layer.
 
-## 13. The two empirical gates
+## 13. The two empirical gates — RESOLVED (2026-08-27, live probe)
 
-Both need a live RPC from the collecting account and cannot be answered from
-docs; the collector structure above is correct under *either* outcome, and these
-run **first** in implementation, updating this spec with the answers:
+Both were answered by a read-only probe against the real `default` archive
+(`@national_resistance_movement`, a broadcast channel, and its linked group
+*NRM Chat*, 307 members). No join, no writes. Answers, now folded into §6.2:
 
-1. **`channels.getParticipant` on a broadcast channel as a non-admin** — does the
-   per-user oracle survive where bulk enumeration is walled? (The single
-   highest-value unknown; research §7.)
-2. **`channels.getParticipants` `Recent` on a *public* supergroup, un-joined** —
-   does the roster require `--join`, or is a public group's roster readable
-   without joining? Determines whether the un-joined branch (§6.2) yields a real
-   roster or only the free vectors.
+1. **`channels.getParticipant` on a broadcast non-admin** — the oracle's home is
+   the **linked group**, not the channel. On the group it works un-joined /
+   non-admin for **arbitrary** users (built via `InputPeerUserFromMessage`),
+   returning a definitive per-user answer (`ChannelParticipant` with join date,
+   or a clean `UserNotParticipantError`). On the **broadcast channel** it works
+   for **self** only; an arbitrary user is `ChatAdminRequiredError`. So the
+   oracle is a genuine un-joined capability for group members (and the fallback
+   where a group's bulk roster is capped/hidden), but it cannot enumerate the
+   broadcast channel's own subscribers — consistent with the §2 wall.
+2. **`channels.getParticipants` `Recent` un-joined** — **works** on a public
+   linked group: NRM Chat returned `ChannelParticipants(count=307, …)` with no
+   join and no error. So the passive branch enumerates the roster directly;
+   `--join` is the escalation only for a group that *walls* it (private /
+   `join_to_send`), and `count` (307) is the true-total denominator for §6.3
+   accounting.
+
+**Two refinements left to verify in implementation** (not gates — the design
+holds regardless): the server's real paging *depth* on a larger roster (NRM Chat
+at 307 is small; the 78k→12 ceiling bites only huge groups — page and record
+`enumerated / count`), and `get_participant`/`getParticipants` behavior on a
+`participants_hidden` group (the oracle is expected to survive where bulk is
+reduced to admins+bots). The throwaway probe lives at
+`scratchpad/person_layer_probe.py`; it is not part of the deliverable.
