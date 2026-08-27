@@ -9,10 +9,24 @@ right precedence for free by passing CLI overrides as kwargs.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_DURATION_RE = re.compile(r"^(\d+)([dhms]?)$")
+_DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "": 1}
+
+
+def parse_duration(text: str) -> int:
+    """`7d` / `12h` / `30m` / `45s` / bare seconds → seconds. Used by the
+    `--profile-refresh-after` CLI flag (spec §7.2)."""
+    match = _DURATION_RE.match(text.strip())
+    if match is None:
+        raise ValueError(f"not a duration: {text!r} (expected e.g. 7d, 12h, 30m, 45s)")
+    value, unit = match.groups()
+    return int(value) * _DURATION_UNITS[unit]
 
 # Repo-relative by default so collected data lands in `./data/` next to the
 # code, not somewhere on the filesystem you have to hunt for. `./data` is
@@ -59,6 +73,17 @@ class Settings(BaseSettings):
     catchup_page_budget: int = Field(default=1000, ge=1)
     allow_join: bool = False
     allow_phone_lookup: bool = False
+    # --unsafe: skip the doctor preflight AND the per-phase session-age gate
+    # on roster enumeration (spec §6.1). Env `PAPERBOY_UNSAFE` is the same
+    # operator override.
+    unsafe: bool = False
+    # Person layer (spec §7.2). `profile_budget` above bounds getFullUser
+    # fetches per run; these parameterize the rest of the enrichment pass.
+    enrich_profiles: bool = False
+    profile_interval: float | None = Field(default=None, ge=0)
+    profile_refresh_after: int | None = Field(default=None, ge=0)  # seconds
+    participant_oracle_budget: int = Field(default=100, ge=0)
+    participant_reactions_budget: int = Field(default=200, ge=0)
 
     @field_validator("data_dir", mode="after")
     @classmethod

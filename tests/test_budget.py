@@ -185,3 +185,56 @@ def test_user_id_invalid_and_channel_invalid_classify_as_skip():
 
     for exc in (UserIdInvalidError, ChannelInvalidError):
         assert classify(exc(None)) == Disposition.SKIP
+
+
+@pytest.mark.asyncio
+async def test_per_method_interval_paces_only_that_method(tmp_path):
+    class Clock:
+        t = 1000.0
+
+        def time(self):
+            return self.t
+
+    clock = Clock()
+    slept: list[float] = []
+    s = load_settings("default", {})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        b = Budget(
+            s, st, clock=clock, sleeper=lambda x: slept.append(x), min_interval=1.0,
+            method_intervals={"users.getFullUser": 2.5},
+        )
+
+        async def ok():
+            return 1
+
+        await b.call("users.getFullUser", ok)
+        clock.t += 0.5
+        await b.call("users.getFullUser", ok)  # 0.5s since last -> sleep 2.0 (the METHOD interval)
+        await b.call("messages.getHistory", ok)  # first call of that method: no sleep
+        clock.t += 0.2
+        await b.call("messages.getHistory", ok)  # default 1.0 interval -> sleep 0.8
+        assert slept == [2.0, pytest.approx(0.8)]
+
+
+@pytest.mark.asyncio
+async def test_per_method_interval_composes_with_flood_handling(tmp_path):
+    # `--profile-interval` never bypasses flood handling: a short FLOOD_WAIT on
+    # a paced method is still recorded and slept, then retried once.
+    s = load_settings("default", {})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        slept: list[float] = []
+        b = Budget(
+            s, st, sleeper=lambda x: slept.append(x),
+            method_intervals={"users.getFullUser": 2.0},
+        )
+        calls = {"n": 0}
+
+        async def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FakeFlood(3)
+            return "ok"
+
+        assert await b.call("users.getFullUser", flaky) == "ok"
+        assert 3 in slept
+        assert st.conn.execute("select count(*) from flood_log").fetchone()[0] == 1
