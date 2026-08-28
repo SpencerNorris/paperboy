@@ -252,3 +252,11 @@ def test_join_service_messages_project_membership_and_invite_edges(tmp_path):
         assert again == {"joins": 0, "leaves": 0, "edges": 0}
         assert st.conn.execute("select count(*) from participant_snapshots").fetchone()[0] == 5
         assert st.conn.execute("select count(*) from edges").fetchone()[0] == 7
+
+
+def test_restricted_but_present_member_keeps_its_rank():
+    facts = participant_row({
+        "_": "ChannelParticipantBanned", "peer": {"_": "PeerUser", "user_id": 1}, "kicked_by": 3,
+        "date": JOINED, "banned_rights": {}, "left": None, "rank": "Moderator",
+    })
+    assert facts == ParticipantFacts("tg:user:1", "member", None, "Moderator", None, None)

@@ -62,3 +62,20 @@ def test_backfill_is_idempotent_and_never_clobbers_a_full_row(tmp_path):
         assert (row["username"], row["is_min"]) == ("real", 0)
         assert row["seen_in_msg"] is None  # the older min reference does not move newer provenance
         assert st.conn.execute("select count(*) from peers").fetchone()[0] == 1
+
+
+def test_backfill_never_replaces_an_existing_provenance(tmp_path):
+    # An authorship context always resolves; a forward-header context only
+    # if the user has not restricted forwards. Fill-only, never replace.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        stub = {"_": "User", "id": 7, "min": True}
+        rid = st.add_raw("User", stub, "stranger", None)
+        # they AUTHORED msg 500 — the strong context
+        upsert_peer(st, stub, rid, T1, seen_in_chat=CHANNEL_ID, seen_in_msg=500)
+        _seed(st, {
+            "_": "Message", "id": 100, "message": "fwd", "date": 1767322445,
+            "fwd_from": {"_": "MessageFwdHeader", "from_id": {"_": "PeerUser", "user_id": 7}},
+        })
+        assert backfill_message_referenced_peers(st, CHANNEL_ID) == 0
+        row = st.conn.execute("select seen_in_msg from peers where uri='tg:user:7'").fetchone()
+        assert row["seen_in_msg"] == 500

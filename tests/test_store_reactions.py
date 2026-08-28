@@ -76,3 +76,32 @@ def test_reacted_message_ids_newest_first_and_fetched_set(tmp_path):
             "stranger", {"channel_id": GROUP_ID, "msg_id": 12, "offset": ""},
         )
         assert fetched_reaction_lists(st, GROUP_ID) == {12}
+
+
+def test_recent_reactions_never_replace_an_existing_provenance(tmp_path):
+    # A reaction is not a documented inputPeerFromMessage context; the edge is
+    # still recorded, but a provenance the store already holds is kept.
+    from paperboy.store.peers import upsert_peer
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        stub = {"_": "User", "id": 5, "min": True}
+        rid = st.add_raw("User", stub, "stranger", None)
+        upsert_peer(
+            st, stub, rid, "2025-12-31T00:00:00+00:00", seen_in_chat=GROUP_ID, seen_in_msg=9
+        )
+        _raw_message(st, 10, {
+            "_": "MessageReactions",
+            "results": [
+                {"_": "ReactionCount", "count": 1,
+                 "reaction": {"_": "ReactionEmoji", "emoticon": "x"}},
+            ],
+            "recent_reactions": [
+                {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 5},
+                 "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "x"}},
+            ],
+        })
+        assert backfill_recent_reactions(st, GROUP_ID, "stranger") == 1  # the edge is new
+        row = st.conn.execute("select seen_in_msg from peers where uri='tg:user:5'").fetchone()
+        assert row["seen_in_msg"] == 9
+        edges = st.conn.execute("select count(*) from edges where predicate='reacted_to'")
+        assert edges.fetchone()[0] == 1

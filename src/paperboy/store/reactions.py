@@ -15,6 +15,7 @@ from paperboy.ids import iso_or_none, msg_uri, peer_ref_uri, peer_stub
 from paperboy.store.db import Store
 from paperboy.store.edges import add_edge_once
 from paperboy.store.peers import upsert_peer
+from paperboy.store.sync import is_self
 
 REACTED_TO = "reacted_to"
 
@@ -48,11 +49,21 @@ def backfill_recent_reactions(store: Store, channel_id: int, tier: str) -> int:
             uri = peer_ref_uri(reaction.get("peer_id"))
             if stub is None or uri is None:
                 continue
-            if upsert_peer(
-                store, stub, row["id"], row["observed_at"],
-                seen_in_chat=channel_id, seen_in_msg=msg_id,
-            ) is None:
-                continue  # the collecting account reacting (#12)
+            known = store.conn.execute(
+                "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
+            ).fetchone()
+            if known is None or known["seen_in_chat"] is None or known["seen_in_msg"] is None:
+                # Fill-only provenance: a reaction is not a documented
+                # `inputPeerFromMessage` context (research §8.7 lists author,
+                # forward header and mention), so it never replaces one that
+                # is.
+                if upsert_peer(
+                    store, stub, row["id"], row["observed_at"],
+                    seen_in_chat=channel_id, seen_in_msg=msg_id,
+                ) is None:
+                    continue  # the collecting account reacting (#12)
+            elif is_self(store, uri):
+                continue
             if add_edge_once(
                 store, uri, REACTED_TO, msg_uri(channel_id, msg_id), row["observed_at"], tier,
                 row["id"],
