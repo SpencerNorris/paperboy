@@ -30,14 +30,13 @@ def _raw_messages(store: Store, channel_id: int):
 
 def backfill_recent_reactions(store: Store, channel_id: int, tier: str) -> int:
     """Project every `recent_reactions` reactor into `peers` (min, with the
-    message as provenance) and a `reacted_to` edge. Returns DISTINCT
-    reactors — TOTAL distinct across the whole scan, not new-this-call
-    (unlike `participants.project_join_service_messages`'s `joins`/`leaves`,
-    which count only newly-observed facts): every re-run rescans every
-    reaction sample, so this returns the same count every time on an
-    unchanged channel. Idempotent (`add_edge_once`; the stub's stamp is the
+    message as provenance) and a `reacted_to` edge. Returns the number of
+    reactors whose edge was NEW in THIS call (new-this-call, like
+    `message_peers.backfill_message_referenced_peers` and
+    `participants.project_join_service_messages`): a re-run over an unchanged
+    channel returns 0. Idempotent (`add_edge_once`; the stub's stamp is the
     raw record's `observed_at`)."""
-    seen: set[str] = set()
+    new: set[str] = set()
     for row in _raw_messages(store, channel_id):
         payload = json.loads(row["payload_json"])
         sample = (payload.get("reactions") or {}).get("recent_reactions") or []
@@ -54,14 +53,14 @@ def backfill_recent_reactions(store: Store, channel_id: int, tier: str) -> int:
                 seen_in_chat=channel_id, seen_in_msg=msg_id,
             ) is None:
                 continue  # the collecting account reacting (#12)
-            add_edge_once(
+            if add_edge_once(
                 store, uri, REACTED_TO, msg_uri(channel_id, msg_id), row["observed_at"], tier,
                 row["id"],
                 {"source": "recent_reactions", "reaction": reaction.get("reaction"),
                  "date": iso_or_none(reaction.get("date"))},
-            )
-            seen.add(uri)
-    return len(seen)
+            ):
+                new.add(uri)
+    return len(new)
 
 
 def reacted_message_ids(store: Store, channel_id: int) -> list[int]:

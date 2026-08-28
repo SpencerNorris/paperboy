@@ -39,7 +39,7 @@ def test_recent_reactions_project_min_peers_and_reacted_to_edges(tmp_path):
         })
         _raw_message(st, 11, None)
         assert backfill_recent_reactions(st, GROUP_ID, "stranger") == 2
-        assert backfill_recent_reactions(st, GROUP_ID, "stranger") == 2  # idempotent
+        assert backfill_recent_reactions(st, GROUP_ID, "stranger") == 0  # idempotent: nothing NEW
         peer = st.conn.execute(
             "select is_min, seen_in_chat, seen_in_msg from peers where uri='tg:user:5'"
         ).fetchone()

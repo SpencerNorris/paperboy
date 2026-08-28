@@ -53,11 +53,6 @@ def session_age_days(authorizations: dict) -> float | None:
     return None
 
 
-# Back-compat alias: this was private (`_session_age_days`) before the
-# `participants` collector's per-phase session-age gate (plan D10) needed it
-# as public API too. Existing tests still reference the old name.
-_session_age_days = session_age_days
-
 
 def _check_proxy(settings: Settings) -> Check:
     if not settings.require_proxy:
