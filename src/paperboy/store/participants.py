@@ -81,7 +81,9 @@ def participant_row(participant: dict) -> ParticipantFacts | None:
             status = "banned" if participant.get("left") else "member"
         else:
             status = "left"
-        return ParticipantFacts(uri, status, None, rank if status == "banned" else None, None, None)
+        # `rank` rides on `channelParticipantBanned` for restricted-but-present
+        # members too (it is on the wire either way); `Left` has no rank field.
+        return ParticipantFacts(uri, status, None, rank, None, None)
     return None
 
 

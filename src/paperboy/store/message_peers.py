@@ -16,7 +16,9 @@ from paperboy.store.peers import upsert_peer
 
 
 def backfill_message_referenced_peers(store: Store, channel_id: int) -> int:
-    """Returns the number of peers that were NEW to the store in THIS call
+    """Fill-only: a peer that already carries a provenance is left untouched
+    (an authorship context beats a referenced-in one). Returns the number of
+    peers that were NEW to the store in THIS call
     (the same new-this-call semantics as `participants.
     project_join_service_messages` and `reactions.backfill_recent_reactions`,
     so a collector's `counts` never mixes "N new" with "the same N as last
@@ -44,9 +46,17 @@ def backfill_message_referenced_peers(store: Store, channel_id: int) -> int:
                         stubs.append({"_": "User", "id": user_id, "min": True})
         for stub in stubs:
             uri = user_uri(stub["id"]) if stub["_"] == "User" else channel_uri(stub["id"])
-            existed = store.conn.execute(
-                "SELECT 1 FROM peers WHERE uri=?", (uri,)
-            ).fetchone() is not None
+            known = store.conn.execute(
+                "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
+            ).fetchone()
+            existed = known is not None
+            if existed and known["seen_in_chat"] is not None and known["seen_in_msg"] is not None:
+                # A referenced-in context (forward header, mention) is the WEAKER
+                # `inputPeerFromMessage` context — it resolves only if the user
+                # has not restricted forwards (research §8.7) — so it must never
+                # replace a provenance the store already holds (an authorship
+                # context always resolves). Fill-only.
+                continue
             written = upsert_peer(
                 store, stub, row["source_raw_id"], row["first_seen"],
                 seen_in_chat=channel_id, seen_in_msg=row["msg_id"],

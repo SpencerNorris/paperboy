@@ -211,18 +211,18 @@ def test_triage_after_full_keeps_bot_only_surface(tmp_path):
         upsert_user(st, bot_user, r1, T1, "stranger", full_user=full_user)
         row = _row(st)
         bot = json.loads(row["bot_json"])
-        assert bot["bot_chat_history"] is True
-        assert bot["bot_info"]["description"] == "does things"
-        assert bot["bot_broadcast_admin_rights"]["change_info"] is True
+        assert bot["user"]["bot_chat_history"] is True
+        assert bot["full"]["bot_info"]["description"] == "does things"
+        assert bot["full"]["bot_broadcast_admin_rights"]["change_info"] is True
 
         # A later triage-only observation (no full_user) of the SAME bot.
         r2 = st.add_raw("User", bot_user, "stranger", None)
         upsert_user(st, bot_user, r2, T2, "stranger")
         row = _row(st)
         bot = json.loads(row["bot_json"])
-        assert bot["bot_chat_history"] is True  # still there
-        assert bot["bot_info"]["description"] == "does things"  # NOT wiped by triage
-        assert bot["bot_broadcast_admin_rights"]["change_info"] is True  # NOT wiped by triage
+        assert bot["user"]["bot_chat_history"] is True  # still there
+        assert bot["full"]["bot_info"]["description"] == "does things"  # NOT wiped by triage
+        assert bot["full"]["bot_broadcast_admin_rights"]["change_info"] is True  # NOT wiped
         assert row["enriched_at"] == T1  # a triage pass never looks like an enrichment
 
 
@@ -365,17 +365,19 @@ def test_self_rel_bot_facts_never_reach_bot_json(tmp_path):
         r = st.add_raw("User", bot_user, "stranger", None)
         upsert_user(st, bot_user, r, T1, "stranger")
         bot = json.loads(_row(st, "tg:user:55")["bot_json"])
-        assert "bot_can_edit" not in bot
-        assert bot["bot_info_version"] == 0 and bot["bot_active_users"] == 0
+        assert "bot_can_edit" not in bot["user"] and "full" not in bot
+        assert bot["user"]["bot_info_version"] == 0 and bot["user"]["bot_active_users"] == 0
         r2 = st.add_raw(
             "users.UserFull", {"full_user": full, "users": [bot_user]}, "stranger", None
         )
         upsert_user(st, bot_user, r2, T2, "stranger", full_user=full)
         bot = json.loads(_row(st, "tg:user:55")["bot_json"])
-        assert "bot_can_edit" not in bot and "bot_can_manage_emoji_status" not in bot
-        assert bot["bot_info"]["description"] == "d" and bot["bot_manager_id"] == 7
-        # the column and the snapshot bundle agree on what a target fact is
-        assert set(bot) <= set(target_user_facts(bot_user)) | set(target_full_facts(full))
+        assert "bot_can_edit" not in bot["user"]
+        assert "bot_can_manage_emoji_status" not in bot["full"]
+        assert bot["full"]["bot_info"]["description"] == "d" and bot["full"]["bot_manager_id"] == 7
+        # each level and the snapshot bundle agree on what a target fact is
+        assert set(bot["user"]) <= set(target_user_facts(bot_user))
+        assert set(bot["full"]) <= set(target_full_facts(full))
 
 
 def test_enriched_at_moves_only_with_the_full_columns(tmp_path):
@@ -473,3 +475,98 @@ def test_min_branch_moves_source_raw_id_with_the_columns_it_applies(tmp_path):
         r3 = st.add_raw("User", mn2, "stranger", None)
         upsert_user(st, mn2, r3, T3, "stranger")
         assert _row(st)["source_raw_id"] == r2  # nothing applied: lineage stays
+
+
+def test_avatar_converges_regardless_of_arrival_order(tmp_path):
+    """Correctness finding: both levels observe the avatar, so it belongs to
+    exactly one lattice at a time — triage-owned until the first enrichment,
+    enrichment-owned after — or replay order (which is run order, not stamp
+    order) would change the projection."""
+    triage_user = _full_user_obj()  # a visible photo (77) at triage level
+    hidden = {"_": "UserFull", "id": 9, "profile_photo": None,
+              "fallback_photo": {"_": "Photo", "id": 3}}
+    absent = {"_": "UserFull", "id": 9, "profile_photo": None}
+    for label, full in (("hidden", hidden), ("absent", absent)):
+        outcomes = []
+        for order in ("triage_first", "full_first"):
+            with Store.open(tmp_path / f"{label}-{order}.sqlite") as st:
+                r = st.add_raw("User", triage_user, "stranger", None)
+                steps = [("triage", T3), ("full", T1)]
+                if order == "full_first":
+                    steps.reverse()
+                for kind, stamp in steps:
+                    if kind == "triage":
+                        upsert_user(st, triage_user, r, stamp, "stranger")
+                    else:
+                        upsert_user(st, triage_user, r, stamp, "stranger", full_user=full)
+                row = _row(st)
+                outcomes.append((
+                    row["photo_ref"], json.loads(row["field_states_json"])["photo"],
+                    row["enriched_at"], row["last_seen"],
+                ))
+        assert outcomes[0] == outcomes[1], label
+        assert outcomes[0][0] is None  # the full level's verdict, not the avatar seen at triage
+        assert outcomes[0][1]["state"] == ("hidden_from_you" if label == "hidden" else "absent")
+
+
+def test_photo_empty_is_never_a_photo(tmp_path):
+    with _store(tmp_path) as st:
+        user = _full_user_obj(photo=None)
+        full = {"_": "UserFull", "id": 9, "profile_photo": {"_": "PhotoEmpty", "id": 0},
+                "fallback_photo": {"_": "PhotoEmpty", "id": 0}}
+        r = st.add_raw("users.UserFull", {"full_user": full, "users": [user]}, "stranger", None)
+        upsert_user(st, user, r, T1, "stranger", full_user=full)
+        row = _row(st)
+        assert row["photo_ref"] is None
+        assert json.loads(row["field_states_json"])["photo"] == {"state": "absent"}
+    empty_fallback = {"_": "UserFull", "id": 1, "fallback_photo": {"_": "PhotoEmpty", "id": 0}}
+    assert field_states({"_": "User", "id": 1}, empty_fallback)["photo"] == {"state": "absent"}
+
+
+def test_full_user_must_describe_the_user(tmp_path):
+    with _store(tmp_path) as st:
+        with pytest.raises(ValueError):
+            upsert_user(
+                st, _full_user_obj(), 1, T1, "stranger",
+                full_user={"_": "UserFull", "id": 10, "about": "someone else"},
+            )
+        assert _row(st) is None
+
+
+def test_bot_json_is_level_keyed_and_each_level_replaces_itself(tmp_path):
+    with _store(tmp_path) as st:
+        bot_user = {"_": "User", "id": 9, "access_hash": 1, "first_name": "B", "bot": True,
+                    "bot_attach_menu": True, "bot_info_version": 3}
+        full = {"_": "UserFull", "id": 9, "bot_info": {"_": "BotInfo", "description": "d"}}
+        r = st.add_raw("User", bot_user, "stranger", None)
+        upsert_user(st, bot_user, r, T1, "stranger", full_user=full)
+        assert json.loads(_row(st)["bot_json"]) == {
+            "user": {"bot_attach_menu": True, "bot_info_version": 3},
+            "full": {"bot_info": {"_": "BotInfo", "description": "d"}},
+        }
+        # the target clears its attach menu: the USER level is replaced
+        # (no stale flag lingers), the FULL level is untouched
+        r2 = st.add_raw("User", bot_user, "stranger", None)
+        cleared = {**bot_user, "bot_attach_menu": None, "bot_info_version": 4}
+        upsert_user(st, cleared, r2, T2, "stranger")
+        assert json.loads(_row(st)["bot_json"]) == {
+            "user": {"bot_info_version": 4},
+            "full": {"bot_info": {"_": "BotInfo", "description": "d"}},
+        }
+
+
+def test_triage_columns_never_read_a_fact_about_us(tmp_path):
+    """The chokepoint claim is structural: every triage column comes from the
+    filtered facts, so a self/relationship key can never reach a column."""
+    with _store(tmp_path) as st:
+        user = _full_user_obj(contact=True, mutual_contact=True, close_friend=True, is_self=None,
+                              stories_hidden=True, attach_menu_enabled=True)
+        r = st.add_raw("User", user, "stranger", None)
+        upsert_user(st, user, r, T1, "stranger")
+        row = dict(_row(st))
+        blob = json.dumps({k: v for k, v in row.items() if k != "uri"})
+        self_keys = (
+            "contact", "mutual_contact", "close_friend", "stories_hidden", "attach_menu_enabled",
+        )
+        for key in self_keys:
+            assert key not in blob, key
