@@ -20,7 +20,18 @@ Merge rules follow research §8.7 for `min` objects (a min observation never
 clobbers full identity; status only if the cached status is empty; photo only
 with `apply_min_photo`) and ADR-0005 §6's composed richness ∘ recency lattice
 for full ones, done in Python rather than one giant CASE statement so the
-cells stay readable.
+cells stay readable. Two independent recency benchmarks apply: the TRIAGE
+lattice (identity, status, the bare-`User` avatar, the triage bot flags) is
+judged against `last_seen`; the ENRICHMENT lattice (`about`, `birthday`, the
+full-level avatar truth, the `UserFull` bot surface, the full-level field
+states) is judged against `enriched_at` — so `enriched_at` moves exactly when
+those columns do, never alone, and an out-of-order full observation can
+neither clobber a newer enrichment nor be lost behind a newer triage.
+
+Facts about US (`contact`, `bot_can_edit`, `blocked`, `common_chats_count`,
+...) are stripped at ONE chokepoint — `target_user_facts` /
+`target_full_facts` — and every column, including `bot_json`, is derived
+from those filtered dicts, so the guardrail has a single enforcement point.
 """
 
 from __future__ import annotations
@@ -31,8 +42,6 @@ import json
 from paperboy.ids import iso_or_none, primary_username, user_uri
 from paperboy.store.db import Store, dumps
 from paperboy.store.sync import is_self
-
-FIELD_STATE_KEYS = ("phone", "photo", "status", "about", "birthday", "forwards", "stories")
 
 # `User` flags that are facts about the TARGET (kept in `users.flags_json`).
 _TARGET_FLAG_KEYS = (
@@ -62,7 +71,9 @@ _STATUS_KINDS = {
     "userstatuslastmonth": "last_month", "userstatusempty": "empty",
 }
 _COARSE_STATUS = {"recently", "last_week", "last_month"}
-_FULL_ONLY_COLUMNS = ("about", "birthday")
+# Field-state keys only a `UserFull` can observe — plus `photo`, which only a
+# `UserFull` can DISAMBIGUATE — governed by the enrichment benchmark.
+_FULL_STATE_KEYS = ("photo", "about", "birthday", "forwards", "stories")
 
 
 def _kind(obj: dict | None) -> str:
@@ -151,22 +162,32 @@ def field_states(user: dict, full_user: dict | None = None) -> dict[str, dict]:
 
 
 def merge_field_states(existing: dict, incoming: dict, *, full: bool) -> dict:
-    """Newest observation wins per key it can observe — except that a
-    triage-level `absent` (no disambiguating capability) never overwrites a
-    stored `hidden_from_you` proof; only a newer FULL observation revises it."""
+    """Newest observation wins per key it can observe — except that a stored
+    `hidden_from_you` proof is never revised by a TRIAGE-level observation
+    (`full=False`), whatever it says: a bare `User` cannot disambiguate, and
+    for a hidden photo it even shows the public fallback decoy as an ordinary
+    avatar. Only a FULL observation (`full=True`) revises a proof."""
     merged = dict(existing)
     for key, state in incoming.items():
-        if (
-            not full
-            and state.get("state") == "absent"
-            and merged.get(key, {}).get("state") == "hidden_from_you"
-        ):
+        if not full and merged.get(key, {}).get("state") == "hidden_from_you":
             continue
         merged[key] = state
     return merged
 
 
-def _triage_columns(user: dict) -> dict:
+def _bot_facts(facts: dict) -> dict:
+    """The bot-only surface of an ALREADY-FILTERED facts dict — the one place
+    `bot_*` keys are selected, downstream of the SELF/REL exclusion, so
+    `bot_can_edit` (we own it) / `bot_can_manage_emoji_status` (we allowed
+    it) can never leak into `users.bot_json`."""
+    return {k: v for k, v in facts.items() if k.startswith("bot_")}
+
+
+def _triage_columns(user: dict) -> tuple[dict, dict]:
+    """Columns a bare `User` can populate, plus the triage-level bot facts —
+    both derived from `target_user_facts(user)`, the chokepoint that strips
+    facts-about-us (research §2a/§2b, spec §4.3)."""
+    facts = target_user_facts(user)
     status = user.get("status") or {}
     status_kind = _STATUS_KINDS.get(_kind(status))
     if status_kind == "online":
@@ -190,15 +211,9 @@ def _triage_columns(user: dict) -> dict:
         {k: e.get(k) for k in ("username", "editable", "active")}
         for e in (user.get("usernames") or [])
     ]
-    bot = {}
-    if user.get("bot"):
-        bot = {
-            k: v for k, v in user.items()
-            if k.startswith("bot_") and v is not None and v is not False and v != "" and v != []
-        }
     flags = {k: user[k] for k in _TARGET_FLAG_KEYS if user.get(k)}
     restriction = user.get("restriction_reason") or None
-    return {
+    columns = {
         "id": user["id"],
         "access_hash": user.get("access_hash"),
         "username": primary_username(user),
@@ -212,29 +227,35 @@ def _triage_columns(user: dict) -> dict:
         "status_value": status_value,
         "photo_ref": photo_ref,
         "restriction_json": dumps(restriction) if restriction else None,
-        "bot_json": dumps(bot) if bot else None,
         "flags_json": dumps(flags) if flags else None,
     }
+    return columns, (_bot_facts(facts) if facts.get("bot") else {})
 
 
-def _full_columns(user: dict, full_user: dict, bot_json: str | None) -> dict:
-    birthday = full_user.get("birthday") or None
-    cols = {
-        "about": full_user.get("about") or None,
+def _full_columns(full_user: dict) -> tuple[dict, dict]:
+    """Columns only a `UserFull` can populate, plus the full-level bot surface
+    (bot_info, bot_group/broadcast_admin_rights, bot_verification,
+    bot_manager_id, ...) — derived from `target_full_facts(full_user)`. The
+    full level is the truth about the avatar: the target's real
+    `profile_photo`, or nothing — never the fallback decoy that `user.photo`
+    shows a privacy-excluded viewer, and never a personal photo of ours."""
+    facts = target_full_facts(full_user)
+    birthday = facts.get("birthday")
+    profile_photo = facts.get("profile_photo")
+    columns = {
+        "about": facts.get("about"),
         "birthday": (
             dumps({k: birthday.get(k) for k in ("day", "month", "year")}) if birthday else None
         ),
+        "photo_ref": (
+            dumps({
+                "photo_id": profile_photo.get("id"), "dc_id": profile_photo.get("dc_id"),
+                "has_video": bool(profile_photo.get("video_sizes")), "stripped_thumb": None,
+            })
+            if profile_photo else None
+        ),
     }
-    if user.get("bot"):
-        # `UserFull` carries the rest of the bot-only surface (bot_info,
-        # bot_group_admin_rights, bot_verification, bot_manager_id, ...).
-        bot = json.loads(bot_json) if bot_json else {}
-        bot.update({
-            k: v for k, v in full_user.items()
-            if k.startswith("bot_") and v is not None and v is not False and v != "" and v != []
-        })
-        cols["bot_json"] = dumps(bot) if bot else None
-    return cols
+    return columns, _bot_facts(facts)
 
 
 def upsert_user(
@@ -248,8 +269,20 @@ def upsert_user(
 ) -> str | None:
     """Project one `User` (plus its `UserFull`, when this observation came
     from `users.getFullUser`) into `users`; returns the URI, or `None` for the
-    collecting account (never a subject, #12). `enriched_at` moves only when
-    `full_user` is given, so a triage pass never looks like an enrichment."""
+    collecting account (never a subject, #12).
+
+    Two lattices, two benchmarks (module docstring): (i) the TRIAGE lattice
+    — identity/status/avatar/bot-flag columns from the bare `User` — moves on
+    `last_seen` recency composed with min/full richness (ADR-0005 §6,
+    research §8.7); (ii) the ENRICHMENT lattice — `about`, `birthday`, the
+    full-level avatar truth, the `UserFull` bot surface, the full-level field
+    states — moves iff this full observation is at least as new as the last
+    one applied (`enriched_at`), and `enriched_at` moves WITH those columns,
+    never alone. A triage pass therefore never looks like an enrichment, an
+    older full observation never overwrites a newer one, and a full
+    observation older than the row's `last_seen` still enriches a row that
+    was never enriched.
+    """
     kind = _kind(user)
     if not kind.startswith("user") or kind == "userempty":
         raise ValueError(f"not a User object: {user.get('_')!r}")
@@ -257,17 +290,30 @@ def upsert_user(
     if is_self(store, uri):
         return None
     incoming_min = bool(user.get("min"))
-    cols = _triage_columns(user)
+    triage, triage_bot = _triage_columns(user)
+    triage_states = field_states(user)
+    full_cols: dict | None = None
+    full_bot: dict = {}
+    full_states: dict = {}
     if full_user is not None:
-        cols.update(_full_columns(user, full_user, cols["bot_json"]))
-    states = field_states(user, full_user)
+        full_cols, full_bot = _full_columns(full_user)
+        observed = field_states(user, full_user)
+        full_states = {key: observed[key] for key in _FULL_STATE_KEYS}
 
     existing = store.conn.execute("SELECT * FROM users WHERE uri=?", (uri,)).fetchone()
     if existing is None:
+        cols = dict(triage)
+        states = dict(triage_states)
+        bot = dict(triage_bot)
+        if full_cols is not None:
+            cols.update(full_cols)
+            states.update(full_states)
+            bot.update(full_bot)
         cols.update({
             "uri": uri, "tier": tier, "is_min": int(incoming_min),
+            "bot_json": dumps(bot) if bot else None,
             "field_states_json": dumps(states),
-            "enriched_at": observed_at if full_user is not None else None,
+            "enriched_at": observed_at if full_cols is not None else None,
             "source_raw_id": source_raw_id, "first_seen": observed_at, "last_seen": observed_at,
         })
         names = ", ".join(cols)
@@ -275,67 +321,55 @@ def upsert_user(
         store.conn.execute(f"INSERT INTO users ({names}) VALUES ({marks})", tuple(cols.values()))
         return uri
 
-    newer = observed_at >= existing["last_seen"]
     updates: dict = {}
-    took_min_branch = incoming_min and not existing["is_min"]
-    if took_min_branch:
-        # research §8.7: a min object never clobbers a full row's identity.
-        # Status applies only if the cached status is empty; photo only with
-        # `apply_min_photo`. Both still gated on recency.
-        applied: set[str] = set()
-        if newer and existing["status_kind"] in (None, "empty") and cols["status_kind"]:
-            updates["status_kind"] = cols["status_kind"]
-            updates["status_value"] = cols["status_value"]
-            applied.add("status")
-        if newer and user.get("apply_min_photo") and cols["photo_ref"]:
-            updates["photo_ref"] = cols["photo_ref"]
-            applied.add("photo")
+    states = json.loads(existing["field_states_json"] or "{}")
+    bot = json.loads(existing["bot_json"]) if existing["bot_json"] else {}
+    photo_hidden = states.get("photo", {}).get("state") == "hidden_from_you"
+
+    # (i) The triage lattice — benchmark `last_seen`, composed with richness.
+    newer = observed_at >= existing["last_seen"]
+    if incoming_min and not existing["is_min"]:
+        # research §8.7: a min object never clobbers a full row's identity;
+        # status only if the cached status is empty, photo only with
+        # `apply_min_photo` — both recency-gated, both mirrored in
+        # `field_states` (D2: the map never contradicts the columns).
+        applied: dict = {}
+        if newer and existing["status_kind"] in (None, "empty") and triage["status_kind"]:
+            updates["status_kind"] = triage["status_kind"]
+            updates["status_value"] = triage["status_value"]
+            applied["status"] = triage_states["status"]
+        if newer and user.get("apply_min_photo") and triage["photo_ref"] and not photo_hidden:
+            updates["photo_ref"] = triage["photo_ref"]
+            applied["photo"] = triage_states["photo"]
         if applied:
-            # D2: `field_states` must never contradict the columns it
-            # describes — a column this branch just wrote to `present`/
-            # `hidden_from_you` can't be left recorded `absent`. Merge in
-            # ONLY the keys this branch actually applied; every other key
-            # (phone, about, ...) is untouched by a min observation and
-            # must keep whatever the stored row already said.
-            merged_states = merge_field_states(
-                json.loads(existing["field_states_json"] or "{}"),
-                {key: states[key] for key in applied},
-                full=False,
-            )
-            updates["field_states_json"] = dumps(merged_states)
+            states = merge_field_states(states, applied, full=False)
+            updates["source_raw_id"] = source_raw_id  # lineage follows the applied columns
     elif newer or (existing["is_min"] and not incoming_min):
         # full<-full and min<-min on recency; min<-full always (richness).
-        updates.update(cols)
-        if full_user is None:
-            for column in _FULL_ONLY_COLUMNS:
-                updates.pop(column, None)  # triage never blanks full-only columns
-            # `bot_json` is written by BOTH levels (`_triage_columns` folds in
-            # the bare-`User` bot_* flags; `_full_columns` adds the UserFull-
-            # only surface on top) so it isn't a full-only column above — but
-            # a triage-level `bot_json` must still never replace a richer one
-            # built from a `UserFull`: merge onto the stored bot facts.
-            if existing["bot_json"]:
-                merged_bot = json.loads(existing["bot_json"])
-                incoming_bot = json.loads(updates["bot_json"]) if updates.get("bot_json") else {}
-                merged_bot.update(incoming_bot)
-                updates["bot_json"] = dumps(merged_bot)
+        updates.update(triage)
+        if photo_hidden:
+            # The proof stands until a FULL observation revises it — and the
+            # avatar a bare `User` shows a privacy-excluded viewer IS the
+            # fallback decoy: never record it as the target's photo.
+            updates.pop("photo_ref")
+        bot.update(triage_bot)
+        states = merge_field_states(states, triage_states, full=False)
         updates["is_min"] = int(incoming_min)
         updates["tier"] = tier
         updates["source_raw_id"] = source_raw_id
-        merged = merge_field_states(
-            json.loads(existing["field_states_json"] or "{}"), states, full=full_user is not None
-        )
-        updates["field_states_json"] = dumps(merged)
-    if full_user is not None and not took_min_branch:
-        # `enriched_at` must move only when the full-level columns (about,
-        # birthday, ...) were actually applied — i.e. the branch above did
-        # `updates.update(cols)`. The min branch never applies them (it only
-        # ever writes status_kind/status_value/photo_ref), so a row must not
-        # be stamped "enriched" while carrying none of the enrichment
-        # (a `getFullUser` response is not documented to return a `min`
-        # `User`, so this guard is defensive rather than reachable today —
-        # but D3's `enriched_at IS NULL` first pass depends on it holding).
-        updates["enriched_at"] = max(existing["enriched_at"] or "", observed_at)
+
+    # (ii) The enrichment lattice — benchmark `enriched_at`.
+    if full_cols is not None and (
+        existing["enriched_at"] is None or observed_at >= existing["enriched_at"]
+    ):
+        updates.update(full_cols)
+        bot.update(full_bot)
+        states = merge_field_states(states, full_states, full=True)
+        updates["enriched_at"] = observed_at
+        updates["source_raw_id"] = source_raw_id
+
+    updates["bot_json"] = dumps(bot) if bot else None
+    updates["field_states_json"] = dumps(states)
     updates["first_seen"] = min(existing["first_seen"], observed_at)
     updates["last_seen"] = max(existing["last_seen"], observed_at)
     assignments = ", ".join(f"{column} = ?" for column in updates)

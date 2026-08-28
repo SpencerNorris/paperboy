@@ -54,8 +54,8 @@ def test_backfill_is_idempotent_and_never_clobbers_a_full_row(tmp_path):
             "_": "Message", "id": 2, "message": "x", "date": 1767322445,
             "fwd_from": {"_": "MessageFwdHeader", "from_id": {"_": "PeerUser", "user_id": 42}},
         })
-        assert backfill_message_referenced_peers(st, CHANNEL_ID) == 1
-        assert backfill_message_referenced_peers(st, CHANNEL_ID) == 1
+        assert backfill_message_referenced_peers(st, CHANNEL_ID) == 0  # peer 42 already existed
+        assert backfill_message_referenced_peers(st, CHANNEL_ID) == 0  # new-this-call: nothing new
         row = st.conn.execute(
             "select username, is_min, seen_in_msg from peers where uri='tg:user:42'"
         ).fetchone()

@@ -10,26 +10,26 @@ from __future__ import annotations
 
 import json
 
-from paperboy.ids import peer_stub
+from paperboy.ids import channel_uri, peer_stub, user_uri
 from paperboy.store.db import Store
 from paperboy.store.peers import upsert_peer
 
 
 def backfill_message_referenced_peers(store: Store, channel_id: int) -> int:
-    """Returns the number of DISTINCT peers upserted — TOTAL distinct across
-    the whole scan, not new-this-call (unlike
-    `participants.project_join_service_messages`'s `joins`/`leaves`, which
-    count only newly-observed facts): every re-run rescans every referenced
-    message, so this returns the same count every time on an unchanged
-    channel. Idempotent: the min stub's stamp is the message's `first_seen`,
-    so a re-run re-asserts the same provenance and a fuller, newer row is
-    never touched (`upsert_peer`'s full<-min cell)."""
+    """Returns the number of peers that were NEW to the store in THIS call
+    (the same new-this-call semantics as `participants.
+    project_join_service_messages` and `reactions.backfill_recent_reactions`,
+    so a collector's `counts` never mixes "N new" with "the same N as last
+    run"): a re-run over an unchanged channel returns 0. Idempotent: the min
+    stub's stamp is the message's `first_seen`, so a re-run re-asserts the
+    same provenance and a fuller, newer row is never touched (`upsert_peer`'s
+    full<-min cell)."""
     rows = store.conn.execute(
         "SELECT msg_id, fwd_json, entities_json, source_raw_id, first_seen FROM messages "
         "WHERE channel_id=? AND (fwd_json IS NOT NULL OR entities_json IS NOT NULL)",
         (channel_id,),
     ).fetchall()
-    seen: set[str] = set()
+    new: set[str] = set()
     for row in rows:
         stubs: list[dict] = []
         if row["fwd_json"]:
@@ -43,10 +43,14 @@ def backfill_message_referenced_peers(store: Store, channel_id: int) -> int:
                     if user_id is not None:
                         stubs.append({"_": "User", "id": user_id, "min": True})
         for stub in stubs:
-            uri = upsert_peer(
+            uri = user_uri(stub["id"]) if stub["_"] == "User" else channel_uri(stub["id"])
+            existed = store.conn.execute(
+                "SELECT 1 FROM peers WHERE uri=?", (uri,)
+            ).fetchone() is not None
+            written = upsert_peer(
                 store, stub, row["source_raw_id"], row["first_seen"],
                 seen_in_chat=channel_id, seen_in_msg=row["msg_id"],
             )
-            if uri is not None:
-                seen.add(uri)
-    return len(seen)
+            if written is not None and not existed:
+                new.add(written)
+    return len(new)
