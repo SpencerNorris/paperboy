@@ -35,6 +35,7 @@ from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.posture import record_privacy_posture
 from paperboy.config import profile_dir
+from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import namespaced_kind
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
@@ -210,15 +211,17 @@ class ProfilesCollector:
     def _project_triaged(self, ctx: CollectContext, user: dict, counts: dict[str, int]) -> None:
         kind = (user.get("_") or "").lower()
         if kind not in ("user", "userempty"):
-            # A non-success that must still be accounted for (`gathered ==
-            # triaged + empty + skipped + unresolvable`). `ReplayUnknownUser`
-            # is the expected replay placeholder for an id the original run
-            # never got an answer for (reproject D4.1's analogue — the
-            # original counted it `skipped` too) and is never written to raw:
-            # it is not an observation. Anything else IS something the
-            # gateway returned — record it raw and say so.
+            # A non-success that must still be accounted for: in a triage-only
+            # run `gathered == triaged + empty + skipped + unresolvable`
+            # (`counts["skipped"]` also accumulates enrichment/photo/avatar
+            # skips under --profiles, so the identity is triage-only).
+            # `REPLAY_UNKNOWN_USER_KIND` is the seam's placeholder for an id
+            # the original run never got an answer for (reproject D4.1's
+            # analogue — the original counted it `skipped` too) and is never
+            # written to raw: it is not an observation. Anything else IS
+            # something the gateway returned — record it raw and say so.
             counts["skipped"] += 1
-            if kind == "replayunknownuser":
+            if kind == REPLAY_UNKNOWN_USER_KIND.lower():
                 return
             ctx.log.warning(
                 "profiles: unexpected getUsers result %r for id %s — skipped",
@@ -363,7 +366,10 @@ class ProfilesCollector:
                 # THE attempt chokepoint (plan D3 as amended): the rotation
                 # key advances here, before any outcome is known, so no arm
                 # below — present or future — can spend a slot without
-                # moving this user behind everyone not yet attempted.
+                # moving this user behind everyone not yet attempted. Every
+                # attempt stamp is `clock.now()` (a scheduling decision, not
+                # an observation): monotonic within a run live and on replay,
+                # where a payload's own stamp could be far older.
                 record_profile_attempt(ctx.store, uri, ctx.clock.now(), "attempted")
                 try:
                     full = await ctx.gateway.get_full_user(ref)
@@ -393,7 +399,7 @@ class ProfilesCollector:
                     # raw but not projectable — counted, never guessed at.
                     counts["skipped"] += 1
                     record_profile_attempt(
-                        ctx.store, uri, observed_at, "malformed",
+                        ctx.store, uri, ctx.clock.now(), "malformed",
                         "subject missing from users vector",
                     )
                     continue
@@ -406,7 +412,7 @@ class ProfilesCollector:
                     # guessed at, never a crashed run.
                     counts["skipped"] += 1
                     record_profile_attempt(
-                        ctx.store, uri, observed_at, "malformed",
+                        ctx.store, uri, ctx.clock.now(), "malformed",
                         "non-User subject or missing/mismatched full_user",
                     )
                     continue
@@ -425,10 +431,10 @@ class ProfilesCollector:
                     ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts,
                     full_user=full_user,
                 ) is None:
-                    record_profile_attempt(ctx.store, uri, observed_at, "not_projected")
+                    record_profile_attempt(ctx.store, uri, ctx.clock.now(), "not_projected")
                     continue
                 counts["refreshed" if enriched_at is not None else "enriched"] += 1
-                record_profile_attempt(ctx.store, uri, observed_at, "enriched")
+                record_profile_attempt(ctx.store, uri, ctx.clock.now(), "enriched")
                 await self._photos(ctx, uri, user_id, ref, counts)
         except PhaseStop as stop:
             self._record_summary(ctx, counts, pass_=pass_)
@@ -443,20 +449,23 @@ class ProfilesCollector:
     def _enrichment_candidates(self, ctx: CollectContext) -> list[tuple[str, int, str | None]]:
         """Every discovered user, in spend order (spec §7/§7.1), keyed on the
         ROTATION key `profile_attempts.attempted_at` (plan D3 as amended) —
-        not on `users.enriched_at`, which moves only on success and would pin
-        a permanently-failing user to the head of every run:
+        `users.enriched_at` plays no part in the ORDER: it moves only on
+        success, so any ordering that partitions on it pins a permanently-
+        failing user to the head of the queue (found twice: first in the
+        refresh pass, then — with `enriched_at IS NOT NULL` still the leading
+        term — for a user never enriched at all, which starved the refresh
+        pass once every fresh candidate was used up).
 
-        1. never enriched, never attempted — admins → authors → commenters →
-           others OF THIS TARGET (the rank arms are scoped to `ctx.channel_id`
-           and its linked group; a sibling target sharing this profile DB
-           ranks as "other", never pre-empting this target's own people),
-           then `uri` for determinism (replay must make the same choices);
-        2. never enriched, attempted before — least recently attempted first,
-           so a failed fetch is retried only after every fresh candidate has
-           had its turn;
-        3. enriched — the refresh wrap, least recently attempted first (every
-           successful enrichment is also an attempt, so with no failures this
-           is exactly "stalest enrichment first").
+        1. never attempted — admins → authors → commenters → others OF THIS
+           TARGET (the rank arms are scoped to `ctx.channel_id` and its
+           linked group; a sibling target sharing this profile DB ranks as
+           "other", never pre-empting this target's own people), then `uri`
+           for determinism (replay must make the same choices);
+        2. everyone else strictly least-recently-attempted first, enriched or
+           not — so a user whose fetch keeps failing costs exactly one slot
+           per lap and can never block the refresh wrap, and with no failures
+           the wrap is exactly "stalest enrichment first" (every successful
+           enrichment is also an attempt).
 
         A user with no `users` row yet (its triage batch failed) still gets a
         turn: `getFullUser` triages as a side effect."""
@@ -481,8 +490,7 @@ class ProfilesCollector:
               LEFT JOIN users u ON u.uri = p.uri
               LEFT JOIN profile_attempts a ON a.uri = p.uri
             WHERE p.kind = 'user'
-            ORDER BY (u.enriched_at IS NOT NULL),
-                     (a.attempted_at IS NOT NULL),
+            ORDER BY (a.attempted_at IS NOT NULL),
                      COALESCE(a.attempted_at, u.enriched_at),
                      rank, p.uri
             """,
