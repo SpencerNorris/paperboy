@@ -65,6 +65,34 @@ def test_cli_reproject_writes_fresh_db_and_prints_diff(tmp_path, monkeypatch):
     assert "channels" in result.output and "messages" in result.output
 
 
+def test_cli_reproject_source_predating_person_layer_reports_zero_not_crash(tmp_path, monkeypatch):
+    # A real archive captured before migration 0004_people.sql existed has no
+    # `users`/`participants`/... tables at all — `ReplaySource` is strictly
+    # read-only and never migrates the source (same rationale as its own
+    # `_has_run_id` check for `raw_records.run_id`), so the row-count summary
+    # must read those as 0 rather than crash with "no such table" (found
+    # running the Leg 4 DoD smoke against the real archive).
+    db = asyncio.run(run_full_collect(tmp_path))
+    conn = sqlite3.connect(db)
+    for table in ("users", "user_snapshots", "user_photos", "participants",
+                  "participant_snapshots", "profile_attempts"):
+        conn.execute(f"DROP TABLE {table}")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert "users" in result.output
+    out_db = tmp_path / "default" / "paperboy.reprojected.sqlite"
+    assert out_db.exists()
+    # the reprojected DB is freshly migrated, so IT has the table (0 rows —
+    # nothing in this source's raw ever recorded a person-layer observation).
+    rep = sqlite3.connect(out_db)
+    assert rep.execute("select count(*) from users").fetchone()[0] == 0
+    rep.close()
+
+
 def test_cli_reproject_refuses_existing_out(tmp_path, monkeypatch):
     asyncio.run(run_full_collect(tmp_path))
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
