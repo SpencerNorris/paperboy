@@ -123,7 +123,11 @@ class _Roster:
     true_count: int | None
     stamp: str
     source_raw_id: int | None
-    chan: dict | None  # the group's `Channel` object (its `left` flag drives --join)
+    # The group's stored boolean flags (`store.channels.channel_flags`): for
+    # the linked group, from this run's preflight `ChatFull`; for a megagroup
+    # TARGET, from the `channel` phase's own row. `left` is what `--join`
+    # reads — `False` means we are already a member and nothing is written.
+    flags: dict
 
 
 class ParticipantsCollector:
@@ -154,6 +158,8 @@ class ParticipantsCollector:
             )
         run_stamp: str = chan["last_seen"]
         target_is_group = chan["kind"] != "broadcast"
+        target_flags: dict = {}
+        target_wall: str | None = None
 
         if not target_is_group:
             # §6.2: the broadcast channel's OWN subscriber roster is never
@@ -162,28 +168,46 @@ class ParticipantsCollector:
                 ctx, ctx.channel_id, _REASON_BROADCAST, chan["participants_count"], run_stamp,
                 counts,
             )
-        linked = linked_group(ctx)
-        if isinstance(linked, str):
-            if not target_is_group:
-                # No comment section => no person vector at all (§2): the one
-                # case that is a FULL phase skip.
-                return CollectResult(
-                    name=self.name, counts=counts,
-                    stopped=f"{linked} — no person vector (a broadcast channel's subscribers "
-                            "are never enumerable)",
+        else:
+            # §6.1: a megagroup TARGET can be just as structurally walled
+            # (hidden participants) as a broadcast peer — evaluated here,
+            # zero-RPC and on the SAME side of the session gate as the
+            # broadcast check above, rather than after it. Both are zero-RPC
+            # facts derived from already-stored flags, so a gate-refused run
+            # must record either one identically — previously the megagroup
+            # check ran only after the gate, so a hidden megagroup target
+            # stored no `RosterWalled` row on a gate-refused run while a
+            # broadcast target did (round-3 review).
+            target_flags = json.loads(chan["flags_json"] or "{}")
+            target_wall = _roster_wall_reason(target_flags)
+            if target_wall is not None:
+                self._record_walled(
+                    ctx, ctx.channel_id, target_wall, chan["participants_count"], run_stamp,
+                    counts,
                 )
-            ctx.log.info("participants: %s", linked)
+        linked = linked_group(ctx, self.name)
 
         # Zero-RPC vectors first — they read only the store, so they run even
-        # when the session gate below refuses enumeration. The TARGET's own
-        # id is swept unconditionally (its posts still carry a free
-        # `recent_reactions` sample even when the target is a broadcast whose
-        # subscriber roster and RPC-based reaction-list vector are both
-        # walled) — only the RPC-based roster/oracle/reaction vectors below
-        # stay GROUP-only.
+        # when the phase stops right below (a broadcast with no linked
+        # discussion group still carries a free `recent_reactions` sample on
+        # its own posts) or when the session gate further down refuses
+        # enumeration. The TARGET's own id is swept unconditionally — only
+        # the RPC-based roster/oracle/reaction vectors stay GROUP-only.
         zero_rpc_ids = [ctx.channel_id] + ([] if isinstance(linked, str) else [linked[0]])
         for group_id in zero_rpc_ids:
             self._zero_rpc_vectors(ctx, group_id, counts)
+
+        if isinstance(linked, str):
+            if not target_is_group:
+                # No comment section => no enumerable roster (§2): the one
+                # case that is a FULL phase skip — but the zero-RPC sweep
+                # above has already run, so the free vectors are not lost.
+                return CollectResult(
+                    name=self.name, counts=counts,
+                    stopped=f"{linked} — no enumerable roster (a broadcast channel's "
+                            "subscribers are never enumerable); zero-RPC vectors still swept",
+                )
+            ctx.log.info("participants: %s", linked)
 
         # The gate comes BEFORE the first RPC against any group (spec §6.1) —
         # including the linked group's preflight getFullChannel.
@@ -202,24 +226,17 @@ class ParticipantsCollector:
 
         rosters: list[_Roster] = []
         stopped: list[str] = []
-        if target_is_group:
-            target_flags = json.loads(chan["flags_json"] or "{}")
-            target_wall = _roster_wall_reason(target_flags)
-            if target_wall is not None:
-                # §6.1/§6.2: a megagroup TARGET can be just as structurally
-                # walled (hidden participants) as a broadcast — recorded with
-                # zero enumeration RPC exactly like the linked group's own
-                # preflight wall, rather than discovering it the expensive
-                # way via a `CHAT_ADMIN_REQUIRED` on the first page.
-                self._record_walled(
-                    ctx, ctx.channel_id, target_wall, chan["participants_count"], run_stamp,
-                    counts,
-                )
-            else:
-                rosters.append(_Roster(
-                    ctx.channel_id, ctx.input_channel,
-                    chan["participants_count"], run_stamp, chan["source_raw_id"], None,
-                ))
+        if target_is_group and target_wall is None:
+            # `target_flags` already carries whatever `left` the `channel`
+            # phase observed — pass it through so `_maybe_join` can see
+            # known membership for the TARGET exactly as it does for the
+            # linked group, instead of re-joining a group we already know
+            # we are in on every run (round-3 review). The wall itself (if
+            # any) was already recorded above, before the session gate.
+            rosters.append(_Roster(
+                ctx.channel_id, ctx.input_channel,
+                chan["participants_count"], run_stamp, chan["source_raw_id"], target_flags,
+            ))
         if not isinstance(linked, str):
             group_id, input_channel, needs_join = linked
             proceed = True
@@ -240,8 +257,19 @@ class ParticipantsCollector:
                 if roster is not None:
                     rosters.append(roster)
 
+        # `participant_oracle_budget`/`participant_reactions_budget` are
+        # documented as per-RUN caps (config.py, plan D8), not per-roster —
+        # a target with a linked group produces TWO rosters, so a budget read
+        # fresh inside `_oracle`/`_reactions` for each one could spend up to
+        # 2x the documented ceiling. One dict, decremented as each roster
+        # spends it, keeps the whole run under the documented cap
+        # (round-3 review).
+        budgets = {
+            "oracle": ctx.settings.participant_oracle_budget,
+            "reactions": ctx.settings.participant_reactions_budget,
+        }
         for roster in rosters:
-            reason = await self._enumerate(ctx, roster, counts)
+            reason = await self._enumerate(ctx, roster, counts, budgets)
             if reason:
                 stopped.append(reason)
         return CollectResult(name=self.name, counts=counts, stopped="; ".join(stopped) or None)
@@ -302,7 +330,22 @@ class ParticipantsCollector:
         self._project_users_vector(
             ctx, full, raw_id, observed_at, counts, METHOD_GET_FULL_CHANNEL,
         )
-        flags = channel_flags(full_chat, chan or {})
+        if chan is None:
+            # `broadcast`/`megagroup` live on the `Channel` object, not on
+            # `ChannelFull` — with no Channel to read, `_roster_wall_reason`
+            # cannot see them, so falling through with an incomplete flag set
+            # (the old `chan or {}`) could enumerate a BROADCAST it just
+            # never recognised as one. That breaks this module's headline
+            # zero-enumeration-RPC guarantee, so treat it as an audited
+            # preflight failure instead — the same way an unreadable
+            # preflight is recorded above — rather than a silent fall-through
+            # (round-3 review).
+            self._record_walled(
+                ctx, group_id, "preflight: no Channel object in the chats vector",
+                full_chat.get("participants_count"), observed_at, counts,
+            )
+            return None
+        flags = channel_flags(full_chat, chan)
         wall = _roster_wall_reason(flags)
         if wall is not None:
             self._record_walled(
@@ -311,7 +354,7 @@ class ParticipantsCollector:
             return None
         return _Roster(
             group_id, input_channel, full_chat.get("participants_count"), observed_at, raw_id,
-            chan,
+            flags,
         )
 
     async def _session_gate(self, ctx: CollectContext) -> str | None:
@@ -378,12 +421,14 @@ class ParticipantsCollector:
     # ---- enumeration ----------------------------------------------------------------
 
     async def _enumerate(
-        self, ctx: CollectContext, roster: _Roster, counts: dict[str, int]
+        self, ctx: CollectContext, roster: _Roster, counts: dict[str, int], budgets: dict[str, int]
     ) -> str | None:
         """Page `Recent` (plus `Admins`/`Bots` once joined), record
         `enumerated / true_count`, then run the bounded vectors. Returns the
         §6.4 shortfall warning when the roster came back walled or partial
-        and we are not a member — the phase's `stopped` reason."""
+        and we are not a member — the phase's `stopped` reason. `budgets` is
+        the RUN-level oracle/reactions spend, shared and decremented across
+        every roster `_enumerate` is called for."""
         group_id = roster.group_id
         counts["rosters"] += 1
         joined = await self._maybe_join(ctx, roster)
@@ -444,8 +489,8 @@ class ParticipantsCollector:
             walled is not None or (true_count is not None and roster_enumerated < true_count)
         )
         if partial:
-            await self._oracle(ctx, roster, enumerated, counts)
-        await self._reactions(ctx, roster, counts)
+            await self._oracle(ctx, roster, enumerated, counts, budgets)
+        await self._reactions(ctx, roster, counts, budgets)
         # A positive oracle answer adds the SAME kind of confirmed-member row
         # (`participants`, `member_of`) as a roster page, so it counts
         # toward the RUN's total too — deliberately NOT toward
@@ -473,8 +518,8 @@ class ParticipantsCollector:
         flag (plan D11)."""
         if not ctx.settings.allow_join:
             return False
-        if roster.chan is not None and roster.chan.get("left") is False:
-            return True  # already a member: nothing to write
+        if roster.flags.get("left") is False:
+            return True  # already a member (per the stored flags): nothing to write
         skip = await join_or_skip(ctx, self.name, roster.group_id, roster.input_channel)
         if skip is not None:
             ctx.log.warning("participants: %s", skip)
@@ -579,15 +624,18 @@ class ParticipantsCollector:
             )
 
     async def _oracle(
-        self, ctx: CollectContext, roster: _Roster, enumerated: set[str], counts: dict[str, int]
+        self, ctx: CollectContext, roster: _Roster, enumerated: set[str], counts: dict[str, int],
+        budgets: dict[str, int],
     ) -> None:
         """`channels.getParticipant` for users REFERENCED in the group (message
         authors, provenance) that a partial/walled roster did not cover and
         that have no answer yet — bounded by `participant_oracle_budget`
-        (plan D9), never one call per known commenter. Confirmed un-joined /
-        non-admin on the group (spec §13); a `USER_NOT_PARTICIPANT` answer is a
-        definitive negative and is stored as such."""
-        budget = ctx.settings.participant_oracle_budget
+        (plan D9), never one call per known commenter, and shared across every
+        roster in `budgets["oracle"]` so a target+linked-group run cannot
+        spend the RUN-level cap twice over (round-3 review). Confirmed
+        un-joined / non-admin on the group (spec §13); a `USER_NOT_PARTICIPANT`
+        answer is a definitive negative and is stored as such."""
+        budget = budgets["oracle"]
         if budget <= 0:
             return
         group_id = roster.group_id
@@ -621,6 +669,7 @@ class ParticipantsCollector:
             if len(candidates) >= budget:
                 break
         for uri, ref in candidates:
+            budgets["oracle"] -= 1
             try:
                 answer = await ctx.gateway.get_participant(roster.input_channel, ref)
             except SkipAndRecord as exc:
@@ -661,21 +710,25 @@ class ParticipantsCollector:
             )
 
     async def _reactions(
-        self, ctx: CollectContext, roster: _Roster, counts: dict[str, int]
+        self, ctx: CollectContext, roster: _Roster, counts: dict[str, int], budgets: dict[str, int]
     ) -> None:
         """`messages.getMessageReactionsList` on reacted GROUP messages —
         newest first, bounded by `participant_reactions_budget`, resumable
         (the done-set is derived from the raw log). Reactors get a
         `reacted_to` edge, a `users` row (the response's `users` vector) and
         a `peers` row with the message as provenance. The first wall
-        (`BROADCAST_FORBIDDEN` / `CHAT_ADMIN_REQUIRED`) ends the vector."""
-        budget = ctx.settings.participant_reactions_budget
+        (`BROADCAST_FORBIDDEN` / `CHAT_ADMIN_REQUIRED`) ends the vector.
+        Shared across every roster in `budgets["reactions"]` so a
+        target+linked-group run cannot spend the RUN-level cap twice over
+        (round-3 review)."""
+        budget = budgets["reactions"]
         if budget <= 0:
             return
         group_id = roster.group_id
         done = fetched_reaction_lists(ctx.store, group_id)
         candidates = [m for m in reacted_message_ids(ctx.store, group_id) if m not in done][:budget]
         for msg_id in candidates:
+            budgets["reactions"] -= 1
             offset: str | None = None
             for _ in range(_REACTIONS_MAX_PAGES):
                 try:
@@ -730,8 +783,21 @@ class ParticipantsCollector:
                 if not offset:
                     break
             else:
+                # A truncated reactor list is a partial observation, exactly
+                # the case `add_roster_snapshot` exists to make un-silent for
+                # rosters — record it the same way here, and count it as a
+                # skip, or the shortfall is invisible in the store AND (via
+                # `fetched_reaction_lists`, keyed on message id alone)
+                # permanently un-revisited on every future run (round-3
+                # review).
                 ctx.log.warning(
                     "participants: reaction list for group %s message %s exceeded %d pages "
                     "without ending — stopping this message",
                     group_id, msg_id, _REACTIONS_MAX_PAGES,
                 )
+                record_run_event(
+                    ctx.store, ctx.channel_id, self.name, "warning",
+                    {"code": "reaction_list_truncated", "group_id": group_id, "msg_id": msg_id,
+                     "pages": _REACTIONS_MAX_PAGES},
+                )
+                counts["skipped"] += 1

@@ -39,7 +39,7 @@ def _ctx(st, gw, settings=None, tier="stranger"):
 
 def _seed_channel(
     st: Store, *, linked: int | None = GROUP_ID, kind: str = "broadcast",
-    linked_flags: dict | None = None,
+    linked_flags: dict | None = None, target_flags: dict | None = None,
 ) -> None:
     raw_id = st.add_raw(
         "ChatFull", {"_": "ChatFull", "full_chat": {"id": CHANNEL_ID}}, "stranger",
@@ -47,6 +47,7 @@ def _seed_channel(
     )
     chan = {"_": "Channel", "id": CHANNEL_ID, "access_hash": 9, "title": "C", "username": "c"}
     chan["broadcast" if kind == "broadcast" else "megagroup"] = True
+    chan.update(target_flags or {})
     upsert_channel(
         st, {"_": "channelFull", "id": CHANNEL_ID, "pts": 1, "linked_chat_id": linked,
              "participants_count": 10},
@@ -911,6 +912,43 @@ async def test_broadcast_targets_own_recent_reactions_sample_is_swept(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_broadcast_with_no_linked_group_still_sweeps_its_own_recent_reactions(tmp_path):
+    """Round-3 review (blocking): a BROADCAST target with NO linked discussion
+    group — the single most common paperboy target — must still sweep its
+    own zero-RPC `recent_reactions` sample before the phase reports its full
+    skip. The previous fix moved the sweep above the `if isinstance(linked,
+    str):` block textually but the `return` for the no-comment-section case
+    was still ABOVE it, so `zero_rpc_ids` was never reached on this exact
+    path; the existing `test_broadcast_targets_own_recent_reactions_sample_is_swept`
+    never caught it because `_seed_channel`'s default `linked=GROUP_ID`
+    skipped the `return` branch entirely."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+        "recent_reactions": [
+            {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 51},
+             "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "👍"}},
+        ],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, linked=None)  # broadcast target, no linked discussion group
+        post = {"_": "Message", "id": 900, "message": "post", "date": 1767322000,
+                "peer_id": {"_": "PeerChannel", "channel_id": CHANNEL_ID}, "reactions": reacted}
+        raw_id = st.add_raw("Message", post, "stranger", {"channel_id": CHANNEL_ID}, observed_at=T0)
+        upsert_message(st, CHANNEL_ID, post, raw_id, T0, "stranger")
+        gw = _gw()
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.counts["reactors"] == 1
+        assert ("tg:user:51", "reacted_to", "tg:msg:5/900") in {
+            (e["subject_uri"], e["predicate"], e["object_uri"])
+            for e in st.conn.execute("select subject_uri, predicate, object_uri from edges")
+        }
+        # the phase still reports its full skip — the fix does not change
+        # that, it only ensures the free vectors ran first.
+        assert res.stopped is not None and "zero-RPC vectors still swept" in res.stopped
+        assert gw.calls.count("get_full_channel") == 0  # still zero-RPC
+
+
+@pytest.mark.asyncio
 async def test_reaction_list_pagination_is_hard_capped_against_a_repeating_offset(tmp_path):
     """Unlike `_page` (three independent stop conditions: empty page, short
     page, no-new-members), a reaction list's only natural stop is a falsy
@@ -931,6 +969,16 @@ async def test_reaction_list_pagination_is_hard_capped_against_a_repeating_offse
         res = await ParticipantsCollector().collect(_ctx(st, gw))
         assert res.counts["reaction_lists"] == 50  # capped (`_REACTIONS_MAX_PAGES`), not 60
         assert res.stopped is None
+        # Round-3 review: a truncated reactor list is a partial observation —
+        # recorded, counted, and NOT treated as done by the next run.
+        from paperboy.store.reactions import fetched_reaction_lists
+
+        assert res.counts["skipped"] == 1
+        truncated = json.loads(st.conn.execute(
+            "select detail_json from run_events where kind='warning' order by id desc limit 1"
+        ).fetchone()[0])
+        assert (truncated["code"], truncated["msg_id"]) == ("reaction_list_truncated", 401)
+        assert fetched_reaction_lists(st, GROUP_ID) == set()
 
 
 @pytest.mark.asyncio
@@ -976,3 +1024,110 @@ async def test_user_snapshot_method_matches_the_producing_rpc(tmp_path):
         }
         assert methods["tg:user:2"] == "channels.getParticipants"
         assert methods["tg:user:21"] == "channels.getParticipant"
+
+
+@pytest.mark.asyncio
+async def test_join_flag_never_rejoins_a_megagroup_target_already_a_member(tmp_path):
+    """Round-3 review (blocking): the TARGET's roster carried no membership
+    flags, so `--join` on a megagroup target we already belong to issued an
+    active `channels.joinChannel` on EVERY run."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, linked=None, kind="megagroup", target_flags={"left": False})
+        gw = FakeGateway({
+            "participants": {
+                CHANNEL_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]},
+            },
+            "join": {"_": "Updates", "updates": []},
+        })
+        for _ in range(2):
+            await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert "join_channel" not in gw.calls
+        joins = st.conn.execute("select count(*) from run_events where kind='join'")
+        assert joins.fetchone()[0] == 0
+        # known membership still unlocks the member-only filters
+        assert [c[1] for c in gw.participants_calls[:3]] == [
+            "channelParticipantsRecent", "channelParticipantsAdmins", "channelParticipantsBots",
+        ]
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st, linked=None, kind="megagroup", target_flags={"left": True})
+        gw = FakeGateway({
+            "participants": {
+                CHANNEL_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]},
+            },
+            "join": {"_": "Updates", "updates": []},
+        })
+        await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 1  # a group we have left IS joined, once
+        joins = st.conn.execute("select count(*) from run_events where kind='join'")
+        assert joins.fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_level_budgets_are_shared_across_rosters(tmp_path):
+    """Round-3 review: `participant_reactions_budget` is a per-RUN cap; a
+    megagroup target with a linked group has TWO rosters and must not spend
+    it twice."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    def _list(uid: int) -> dict:
+        return {"_": "MessageReactionsList", "count": 1, "chats": [], "next_offset": None,
+                "users": [_user(uid)],
+                "reactions": [{
+                    "_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": uid},
+                    "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "x"},
+                }]}
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, kind="megagroup", target_flags={"left": False})
+        for mid in (701, 702):
+            post = {"_": "Message", "id": mid, "message": "p", "date": 1767322000,
+                    "peer_id": {"_": "PeerChannel", "channel_id": CHANNEL_ID}, "reactions": reacted}
+            rid = st.add_raw(
+                "Message", post, "stranger", {"channel_id": CHANNEL_ID}, observed_at=T0
+            )
+            upsert_message(st, CHANNEL_ID, post, rid, T0, "stranger")
+        _seed_group_comment(st, 801, 2, reactions=reacted)
+        _seed_group_comment(st, 802, 3, reactions=reacted)
+        gw = FakeGateway({
+            "full_channel_by_id": {GROUP_ID: _group_full(left=False)},
+            "participants": {
+                CHANNEL_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]},
+                GROUP_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]},
+            },
+            "reactions": {CHANNEL_ID: {701: _list(31), 702: _list(32)},
+                          GROUP_ID: {801: _list(33), 802: _list(34)}},
+        })
+        res = await ParticipantsCollector().collect(
+            _ctx(st, gw, _settings(participant_reactions_budget=3))
+        )
+        assert res.counts["rosters"] == 2
+        assert len(gw.reactions_calls) == 3  # 2 on the target + 1 on the group, never 4
+        assert [c[0] for c in gw.reactions_calls] == [CHANNEL_ID, CHANNEL_ID, GROUP_ID]
+
+
+@pytest.mark.asyncio
+async def test_preflight_without_a_channel_object_is_walled_not_enumerated(tmp_path):
+    """Round-3 review: `broadcast`/`megagroup` live on the `Channel` object;
+    with no Channel in the chats vector the wall check could not see them,
+    so a broadcast could have been paged. Now an audited preflight wall."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        no_channel = {**_group_full(), "chats": []}
+        gw = _gw([_page(_member(2))], full_channel_by_id={GROUP_ID: no_channel})
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.participants_calls == []
+        walled = [json.loads(r[0]) for r in st.conn.execute(
+            "select payload_json from raw_records where kind='RosterWalled' order by id")]
+        assert walled[-1]["group_id"] == GROUP_ID and "no Channel object" in walled[-1]["reason"]
+        assert res.counts["walled"] == 2  # the broadcast target + the unreadable group
+
+
+@pytest.mark.asyncio
+async def test_no_access_hash_reason_names_the_running_phase(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        st.conn.execute("update peers set access_hash=NULL where uri='tg:channel:77'")
+        res = await ParticipantsCollector().collect(_ctx(st, _gw()))
+        assert res.stopped is not None
+        assert "participants group 77: no access hash known" in res.stopped
+        assert "discussion group" not in res.stopped
