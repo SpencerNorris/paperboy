@@ -560,6 +560,7 @@ async def test_avatar_unavailable_is_logged_not_silently_dropped(tmp_path, caplo
                 _ctx(st, gw, _settings(tmp_path, enrich_profiles=True))
             )
         assert res.counts["photos"] == 1 and res.counts["avatars"] == 0
+        assert res.counts["unavailable"] == 1  # round-3 review: was invisible in counts
         assert any(
             "avatar" in r.getMessage() and "701" in r.getMessage()
             and "unavailable" in r.getMessage()
@@ -616,6 +617,175 @@ async def test_full_user_skip_is_counted_spends_budget_and_continues(tmp_path):
         )
         assert gw.full_user_calls == [1, 2]  # the failed attempt still spent budget
         assert res.counts["skipped"] == 1 and res.counts["enriched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_same_run_triage_skip_does_not_starve_lower_priority_users(tmp_path):
+    # Round-3 review (blocking finding #1): a peer whose stale
+    # (seen_in_chat, seen_in_msg) provenance fails `users.getUsers` fails
+    # `users.getFullUser` identically (both raise on the same
+    # ChannelInvalidError-shaped condition). Before this fix, `_enrich`
+    # re-spent budget confirming what `_triage` already proved unusable THIS
+    # SAME run — with the stale ref at the head of the priority order
+    # (admin, rank 0) and a tight budget, it consumed the entire budget every
+    # run forever and no one else was ever enriched.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)  # 1 admin(rank0), 2 author(rank1), 3 commenter(rank2), 4/5 others
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=1)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = FakeGateway({
+                "users": {
+                    1: SkipAndRecord("MSG_ID_INVALID"),  # stale provenance: fails triage too
+                    2: _user(2), 3: _user(3), 4: _user(4), 5: _user(5),
+                },
+                "full_user": {2: _full(2), 3: _full(3), 4: _full(4), 5: _full(5)},
+            })
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        # user 1's stale ref is proven unusable by triage every run and NEVER
+        # spent on getFullUser — the single-slot budget lands on a real,
+        # healthy candidate each run instead of being wasted.
+        assert seen == [[2], [3], [4]]
+        assert st.conn.execute(
+            "select count(*) from users where enriched_at is not null"
+        ).fetchone()[0] == 3
+        assert st.conn.execute(
+            "select count(*) from users where uri='tg:user:1'"
+        ).fetchone()[0] == 0  # never triages successfully — no `users` row at all
+
+
+@pytest.mark.asyncio
+async def test_previously_failed_enrich_only_sorts_after_never_attempted(tmp_path):
+    # Round-3 review (blocking finding #1, second half): a ref that fails
+    # ONLY `getFullUser` (triage succeeds, so it is never in this run's
+    # triage-skip set) must not consume every run's budget forever just
+    # because it is always highest-ranked. A durable `ProfileFetchSkipped`
+    # raw record, read back by `_enrichment_candidates`, sorts it behind a
+    # never-attempted candidate on the next run.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=1)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = _enrich_gw()  # triage succeeds for everyone
+            gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")  # admin always fails
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        # Run 1: the admin (rank 0) is tried first, as always, and fails —
+        # recorded as a durable skip. Run 2: that prior failure now sorts the
+        # admin behind every never-attempted candidate, so the author (a
+        # real, healthy user) gets the single slot instead of the admin
+        # failing again. Run 3: same reasoning reaches the commenter.
+        assert seen == [[1], [2], [3]]
+        assert st.conn.execute(
+            "select count(*) from raw_records where kind='ProfileFetchSkipped'"
+        ).fetchone()[0] == 1  # the admin is never retried once healthier candidates remain
+        assert st.conn.execute(
+            "select enriched_at from users where uri='tg:user:1'"
+        ).fetchone()[0] is None
+        assert st.conn.execute(
+            "select count(*) from users where enriched_at is not null"
+        ).fetchone()[0] == 2  # 2 and 3 eventually enriched despite the permanently-stuck admin
+
+
+@pytest.mark.asyncio
+async def test_admin_of_unrelated_group_does_not_outrank_this_targets_author(tmp_path):
+    # Round-3 review (blocking finding #2): the profile DB is per-profile,
+    # not per-target — an admin/creator of a group entirely UNRELATED to this
+    # target (neither `ctx.channel_id` nor its linked group) must not rank 0
+    # ("admin") for this target's sweep and pre-empt this target's own
+    # message author.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1, msg=1)
+        _seed_stub(st, 2, msg=2)
+        rid = st.add_raw("channels.ChannelParticipants", {}, "stranger", None)
+        unrelated_group_id = 999
+        facts = ParticipantFacts("tg:user:1", "admin", None, None, None, None)
+        write_participant(st, unrelated_group_id, facts, rid, T0)
+        post = {"_": "Message", "id": 900, "message": "post", "date": 1767322445,
+                "from_id": {"_": "PeerUser", "user_id": 2}}
+        post_raw = st.add_raw("Message", post, "stranger", {"channel_id": CHANNEL_ID})
+        upsert_message(st, CHANNEL_ID, post, post_raw, T0, "stranger")
+        gw = _enrich_gw(ids=(1, 2))
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=1))
+        )
+        assert gw.full_user_calls == [2]  # this target's own author, never the sibling's admin
+        assert res.counts["enriched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_full_user_users_vector_userempty_subject_is_skipped_not_crashed(tmp_path):
+    # Round-3 review (minor finding): `users.UserFull.users` is a
+    # `Vector<User>` whose union includes `userEmpty` — the id-only lookup
+    # can match one, and without checking its `_` kind this reached
+    # `upsert_user`'s `raise ValueError("not a User object: ...")`, which
+    # `recipes.py` does not catch, crashing the whole run.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {
+            "_": "UserFull",
+            "full_user": {"_": "UserFull", "id": 1, "about": "bio 1"},
+            "chats": [], "users": [{"_": "UserEmpty", "id": 1}],
+        }
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True))
+        )
+        assert res.counts["skipped"] == 1 and res.counts["enriched"] == 0
+        assert st.conn.execute(
+            "select enriched_at from users where uri='tg:user:1'"
+        ).fetchone()[0] is None
+
+
+@pytest.mark.asyncio
+async def test_phase_stop_during_privacy_posture_still_reports_backfill_counts(tmp_path):
+    # Round-3 review (minor finding): `record_privacy_posture` sat OUTSIDE the
+    # `try/except PhaseStop` — `account.getPrivacy` is a budgeted RPC that can
+    # raise `PhaseStop` (FLOOD_WAIT above threshold), which would discard the
+    # backfill work already done this run and skip the convergence summary.
+    class _PostureStopGateway(FakeGateway):
+        async def get_privacy(self, key: str) -> dict:
+            raise PhaseStop("FLOOD_WAIT_OF_300_SECONDS")
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        m = {"_": "Message", "id": 300, "message": "fwd", "date": 1767322445,
+             "fwd_from": {"_": "MessageFwdHeader", "from_id": {"_": "PeerUser", "user_id": 42}}}
+        raw_id = st.add_raw("Message", m, "stranger", {"channel_id": CHANNEL_ID})
+        upsert_message(st, CHANNEL_ID, m, raw_id, T0, "stranger")
+        gw = _PostureStopGateway({"users": {}})
+        with pytest.raises(PhaseStop) as excinfo:
+            await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path)))
+        assert excinfo.value.counts["backfilled_peers"] == 1
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["pass"] == "triage_only"
+
+
+@pytest.mark.asyncio
+async def test_full_user_chats_vector_empty_or_forbidden_does_not_null_known_peer(tmp_path):
+    # Round-3 review (minor finding): `Vector<Chat>` also legally carries
+    # `ChatEmpty`/`ChatForbidden` (id + title only, no `access_hash`, no
+    # `min`) — upserting one as a full observation would null out a known
+    # peer's identity columns under `upsert_peer`'s recency rule.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        chat_raw = st.add_raw(
+            "Message", {"_": "Message", "id": 55}, "stranger", {"channel_id": GROUP_ID}
+        )
+        upsert_peer(
+            st, {"_": "Chat", "id": 88, "access_hash": 7, "title": "Fan Chat"}, chat_raw, T0,
+            seen_in_chat=GROUP_ID, seen_in_msg=55,
+        )
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {**_full(1), "chats": [{"_": "ChatEmpty", "id": 88}]}
+        await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, enrich_profiles=True)))
+        row = st.conn.execute("select title, access_hash from peers where id=88").fetchone()
+        assert row["title"] == "Fan Chat" and row["access_hash"] == 7
 
 
 @pytest.mark.asyncio
