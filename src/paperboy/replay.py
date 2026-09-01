@@ -22,6 +22,7 @@ import httpx
 
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
+from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
@@ -295,6 +296,18 @@ class ReplaySource:
             for cid in channel_ids
         )
 
+    def has_context_value(self, run: ReplayRun, key: str, value: object) -> bool:
+        """Whether any raw record in `run` carries `value` under context
+        `key` (e.g. `method` = `users.getUsers`) — for phase detection of
+        kinds that are NOT distinctive on their own (a `User` record is also
+        the self marker). The path is a bound parameter, like every other
+        query in this module."""
+        return self.conn.execute(
+            "SELECT 1 FROM raw_records WHERE json_extract(context_json, ?) = ? "
+            "AND id BETWEEN ? AND ? LIMIT 1",
+            (f"$.{key}", value, run.lo, run.hi),
+        ).fetchone() is not None
+
 
 class RawReplayGateway:
     """`Gateway` served from a raw log, scoped to ONE historical `ReplayRun`
@@ -482,8 +495,18 @@ class RawReplayGateway:
         raise SkipAndRecord("replay: doctor state is not recorded; reproject never runs doctor")
 
     async def get_privacy(self, key: str) -> dict:
-        del key
-        raise SkipAndRecord("replay: doctor state is not recorded; reproject never runs doctor")
+        # `profiles`/`participants` record the account's own posture once per
+        # run (spec §4.3, `posture.py`) — that IS a recorded observation
+        # (unlike `doctor`'s own reads, which are never recorded).
+        row = self._latest(
+            ("account.privacyrules", "privacyrules"),
+            "json_extract(context_json, '$.key') = ?", (key,),
+        )
+        if row is None:
+            raise SkipAndRecord(
+                "replay: privacy posture not recorded for this run; reproject never runs doctor"
+            )
+        return self._serve(row)
 
     async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
         row = self._latest(
@@ -564,42 +587,111 @@ class RawReplayGateway:
             messages.append(json.loads(row["payload_json"]))
         return {"_": "SponsoredMessages", "messages": messages}
 
-    # Person-layer replay methods (`participants`/`profiles`, spec §10) —
-    # deliberately UNIMPLEMENTED here. This leg (person-layer plan Tasks
-    # 1-5) only grows the `Gateway` Protocol so `TelethonGateway`/
-    # `FakeGateway` can serve these seven methods; the replay-side
-    # implementation (7 replay methods + `get_privacy` serving + phase
-    # detection, plan Task 10) is a later leg. `reproject.py`'s current
-    # collector list never calls these — `ParticipantsCollector`/
-    # `ProfilesCollector` are not wired into it until that same later leg —
-    # so a stub that fails loudly if ever reached (rather than one that
-    # silently returns an empty result) is the honest placeholder: it keeps
-    # `RawReplayGateway` a structural `Gateway` for pyright without
-    # pretending replay support exists yet.
+    # Person-layer replay methods (`participants`/`profiles`, spec §10),
+    # served by the raw kinds/contexts those two collectors record (plan D1).
+
     async def get_participants(
         self, input_channel: dict, filter: dict, offset: int, limit: int, hash_: int = 0
     ) -> dict:
-        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+        del limit, hash_
+        row = self._latest(
+            ("channels.channelparticipants", "channels.channelparticipantsnotmodified"),
+            "json_extract(context_json, '$.channel_id') = ? "
+            "AND json_extract(context_json, '$.filter') = ? "
+            "AND json_extract(context_json, '$.offset') = ?",
+            (input_channel["channel_id"], filter.get("_"), offset),
+        )
+        if row is None:
+            raise SkipAndRecord(
+                f"replay: no {filter.get('_')} page at offset {offset} recorded for "
+                f"channel {input_channel['channel_id']}"
+            )
+        return self._serve(row)
 
     async def get_participant(self, input_channel: dict, participant: dict) -> dict | None:
-        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+        row = self._latest(
+            ("channels.channelparticipant", "usernotparticipant"),
+            "json_extract(context_json, '$.channel_id') = ? "
+            "AND json_extract(context_json, '$.user_id') = ?",
+            (input_channel["channel_id"], participant["user_id"]),
+        )
+        if row is None:
+            raise SkipAndRecord(
+                f"replay: no getParticipant answer recorded for user {participant['user_id']}"
+            )
+        payload = self._serve(row)
+        # The definitive negative was stored as a synthetic record (plan D4);
+        # served so the clock has its stamp, then returned as the None it was.
+        return None if (payload.get("_") or "").lower() == "usernotparticipant" else payload
 
     async def get_users(self, refs: list[dict]) -> list[dict]:
-        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+        self._clock.begin_batch()
+        out: list[dict] = []
+        for ref in refs:
+            row = self._latest(
+                ("user", "userempty"),
+                "json_extract(context_json, '$.method') = 'users.getUsers' "
+                "AND json_extract(context_json, '$.user_id') = ?",
+                (ref["user_id"],),
+            )
+            if row is None:
+                # D4.1's analogue: a placeholder the collector ignores — never
+                # a synthetic UserEmpty, which would fabricate a "deleted
+                # account" observation the original run never made.
+                out.append({"_": REPLAY_UNKNOWN_USER_KIND, "id": ref["user_id"]})
+                continue
+            self._clock.serve_json(row["observed_at"], row["payload_json"])
+            out.append(json.loads(row["payload_json"]))
+        return out
 
     async def get_full_user(self, ref: dict) -> dict:
-        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+        row = self._latest(("users.userfull",),
+                           "json_extract(context_json, '$.user_id') = ?", (ref["user_id"],))
+        if row is None:
+            raise SkipAndRecord(f"replay: no UserFull recorded for user {ref['user_id']}")
+        return self._serve(row)
 
     async def get_user_photos(self, ref: dict, *, offset: int, max_id: int, limit: int) -> dict:
-        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+        del offset, max_id, limit
+        row = self._latest(("photos.photos", "photos.photosslice"),
+                           "json_extract(context_json, '$.user_id') = ?", (ref["user_id"],))
+        if row is None:
+            raise SkipAndRecord(f"replay: no photo history recorded for user {ref['user_id']}")
+        return self._serve(row)
 
     async def download_user_photo(self, photo: dict) -> bytes | None:
-        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+        row = self._latest(("avatardownload",),
+                           "json_extract(context_json, '$.photo_id') = ?", (photo["id"],))
+        if row is None:
+            return None
+        payload = json.loads(row["payload_json"])
+        sha = payload["sha256"]
+        path = Path(payload["path"])
+        if not path.exists():  # noqa: ASYNC240 — same rationale as download_media
+            path = self._src.media_root / sha[:2] / f"{sha}.jpg"
+        if not path.exists():
+            raise SkipAndRecord(f"replay: avatar file missing for sha {sha}")
+        data = path.read_bytes()
+        self._clock.begin_batch()
+        self._clock.serve_json(row["observed_at"], row["payload_json"])
+        return data
 
     async def get_message_reactions_list(
         self, input_channel: dict, msg_id: int, *, offset: str | None, limit: int
     ) -> dict:
-        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+        del limit
+        row = self._latest(
+            ("messages.messagereactionslist",),
+            "json_extract(context_json, '$.channel_id') = ? "
+            "AND json_extract(context_json, '$.msg_id') = ? "
+            "AND json_extract(context_json, '$.offset') = ?",
+            (input_channel["channel_id"], msg_id, offset or ""),
+        )
+        if row is None:
+            raise SkipAndRecord(
+                f"replay: no reaction list recorded for message {msg_id} at offset {offset!r}"
+            )
+        return self._serve(row)
 
 
 class RawReplayWebClient:
