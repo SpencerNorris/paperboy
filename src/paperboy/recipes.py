@@ -4,14 +4,18 @@ Runs `channel` (which populates `CollectContext.input_channel`/`channel_id`/
 `tier` for everything after it), then `history` (backfill, immediately
 followed by one `pts` catch-up so the channel's sync state is current as of
 *now*, not as of whenever backfill started — both folded into one `history`
-CollectResult), then `graph` (similar-channel recommendations, entity-derived
+CollectResult), then `discussion` (linked-group comment threads), then
+`participants` (roster membership) and `profiles` (cheap `getUsers` triage
+of every discovered person, full `getFullUser` enrichment only under
+`--profiles`), then `graph` (similar-channel recommendations, entity-derived
 mentions, invite-link previews, sponsored-message provenance — consumes
 `history`'s stored messages / `channel`'s context). `media` (download +
 content-address every stored message's media) and `web` (`t.me/s/` + Wayback
 CDX capture over plain HTTP — no `Gateway`/`Budget`, a different trust
 boundary) are OPT-IN — off by default, on via `collect_channel(..., media=True
-/ web=True)` or by naming them in `phases`. `graph` runs by default; all of
-`graph`/`media`/`web` run after `history` so they have messages to walk.
+/ web=True)` or by naming them in `phases`. `discussion`/`participants`/
+`profiles`/`graph` all run by default; every phase after `channel` runs
+after `history` so it has messages to walk.
 `SkipAndRecord` and `PhaseStop` are each recorded and that phase's result is
 marked stopped, but later phases still run; `HardStop` is recorded and the
 whole run ends there (spec §8). A `run_events` row is written for every phase.
@@ -31,6 +35,8 @@ from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
+from paperboy.collectors.participants import ParticipantsCollector
+from paperboy.collectors.profiles import ProfilesCollector
 from paperboy.collectors.web import WebCollector
 from paperboy.progress import Progress
 from paperboy.store.events import record_run_event
@@ -46,12 +52,14 @@ if TYPE_CHECKING:
 
 def _default_collectors(*, include_media: bool, include_web: bool) -> list[Collector]:
     # The default set is all-MTProto and cheap-ish: channel + history + graph.
-    # `media` (heavy downloads) and `web` (external HTTP to t.me/archive.org —
-    # a different trust boundary than the authenticated MTProto session) are
-    # OPT-IN (--media / --web, or named in --phases), so a plain `collect`
-    # stays Telegram-only: metadata + history + graph.
+    # `participants` (roster) and `profiles` (cheap `getUsers` triage; full
+    # enrichment only under `--profiles`) are default-on too: read-only and
+    # bounded. `media` (heavy downloads) and `web` (external HTTP to
+    # t.me/archive.org — a different trust boundary than the authenticated
+    # MTProto session) are OPT-IN (--media / --web, or named in --phases).
     collectors: list[Collector] = [
         ChannelCollector(), HistoryCollector(), DiscussionCollector(),
+        ParticipantsCollector(), ProfilesCollector(),
         GraphCollector(),
     ]
     if include_web:
