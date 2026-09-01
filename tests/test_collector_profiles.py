@@ -952,3 +952,73 @@ async def test_phase_stop_mid_bisection_keeps_responses_already_received(tmp_pat
             "select count(*) from raw_records where kind='User' "
             "and json_extract(context_json, '$.method')='users.getUsers'"
         ).fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_never_enriched_permanent_failure_never_blocks_the_refresh_pass(tmp_path):
+    """Round-5 review (blocking): with `enriched_at IS NOT NULL` as the leading
+    sort term, a user that fails forever and was NEVER enriched sat at the head
+    of every run once fresh candidates ran out (`[[1],[1],[1]...]` from run
+    6). The rotation key is `attempted_at` alone: one wasted slot per lap."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=1)
+        seen: list[list[int]] = []
+        for _ in range(10):
+            gw = _enrich_gw()
+            gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        assert seen == [[1], [2], [3], [4], [5], [1], [2], [3], [4], [5]]
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None
+        assert summary["pass"] == "refresh" and summary["enriched_this_run"] == 1
+        assert summary["fully_enriched"] == 4
+        assert st.conn.execute(
+            "select outcome from profile_attempts where uri='tg:user:1'"
+        ).fetchone()[0] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_refresh_pass_still_runs_when_failing_users_exceed_the_budget(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=2)
+        seen: list[list[int]] = []
+        for _ in range(8):
+            gw = _enrich_gw()
+            gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")
+            gw._fx["full_user"][2] = SkipAndRecord("USER_ID_INVALID")
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        assert seen == [[1, 2], [3, 4], [5, 1], [2, 3], [4, 5], [1, 2], [3, 4], [5, 1]]
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None
+        assert summary["pass"] == "refresh" and summary["enriched_this_run"] == 1
+        assert summary["fully_enriched"] == 3
+
+
+@pytest.mark.asyncio
+async def test_collecting_account_subject_is_not_projected_and_advances_the_rotation(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)  # user 1's peers row exists BEFORE self is known
+        set_state(st, "account", "self", {"uri": "tg:user:1", "id": 1})
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=1)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = _enrich_gw()
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        assert seen == [[1], [2], [3]]
+        assert st.conn.execute(
+            "select outcome from profile_attempts where uri='tg:user:1'"
+        ).fetchone()[0] == "not_projected"
+        assert st.conn.execute(
+            "select count(*) from users where uri='tg:user:1'"
+        ).fetchone()[0] == 0
+
+
+def test_replay_placeholder_name_is_shared_with_the_gateway_seam():
+    from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
+
+    assert REPLAY_UNKNOWN_USER_KIND == "ReplayUnknownUser"
