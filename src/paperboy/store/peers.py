@@ -169,6 +169,32 @@ def upsert_peer(
     return uri
 
 
+def upsert_full_peer(store: Store, obj: dict, source_raw_id: int, observed_at: str) -> str | None:
+    """`upsert_peer` for a FULL object returned by a profile/roster RPC. A full
+    observation carrying no provenance of its own would — correctly, by the
+    recency rule — overwrite the stub's `seen_in_chat`/`seen_in_msg` with
+    NULLs, losing the only path back to `inputUserFromMessage`. Pass the
+    stored provenance through instead.
+
+    The URI must be derived exactly the way `upsert_peer` itself derives it —
+    via `classify_peer` — not re-hand-rolled: a `Chat`/`ChatForbidden`/
+    `ChatEmpty` object (a legal member of `users.UserFull.chats`, a
+    `Vector<Chat>`) classifies as `chat`, not `channel`; a hand-rolled
+    `user_uri(...) if kind.startswith("user") else channel_uri(...)` branch
+    reads/writes the wrong peer row for one (round-2 review; shared by
+    `profiles` and `participants`, Task 8).
+    """
+    _, uri, _ = classify_peer(obj)
+    row = store.conn.execute(
+        "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
+    ).fetchone()
+    return upsert_peer(
+        store, obj, source_raw_id, observed_at,
+        seen_in_chat=row["seen_in_chat"] if row else None,
+        seen_in_msg=row["seen_in_msg"] if row else None,
+    )
+
+
 def input_user_ref(store: Store, uri: str) -> dict | None:
     """The store side of spec §5's `_input_user` builder: the dict the gateway
     turns into an `InputUser`/`InputPeerUser`.

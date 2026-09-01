@@ -87,13 +87,54 @@ def reacted_message_ids(store: Store, channel_id: int) -> list[int]:
     return sorted(ids, reverse=True)
 
 
-def fetched_reaction_lists(store: Store, channel_id: int) -> set[int]:
-    """Message ids whose full reactor list was already fetched (any run) —
-    derived from the raw log so repeated runs converge instead of re-spending."""
+def reaction_resume_offsets(store: Store, channel_id: int) -> dict[int, str]:
+    """For each message whose reactor list is NOT yet complete, the
+    `next_offset` of its most recently recorded page — the point a later run
+    should resume from instead of restarting at page 1. Lets a list truncated
+    by the per-message page cap CONVERGE across runs (each run advances a
+    further cap's worth of pages) rather than re-walking the same head
+    forever. A message with no recorded page, or whose latest page ended the
+    list (falsy `next_offset`), is absent from the map."""
     rows = store.conn.execute(
-        "SELECT DISTINCT json_extract(context_json, '$.msg_id') AS m FROM raw_records "
+        "SELECT json_extract(context_json, '$.msg_id') AS m, payload_json FROM raw_records "
         "WHERE lower(kind) LIKE '%messagereactionslist' "
-        "AND json_extract(context_json, '$.channel_id') = ?",
+        "AND json_extract(context_json, '$.channel_id') = ? "
+        "ORDER BY id",
         (channel_id,),
     ).fetchall()
-    return {int(r["m"]) for r in rows if r["m"] is not None}
+    last: dict[int, str | None] = {}
+    for row in rows:
+        if row["m"] is None:
+            continue
+        last[int(row["m"])] = json.loads(row["payload_json"]).get("next_offset")
+    return {mid: off for mid, off in last.items() if off}
+
+
+def fetched_reaction_lists(store: Store, channel_id: int) -> set[int]:
+    """Message ids whose full reactor list was already fetched — derived from
+    the raw log so repeated runs converge instead of re-spending.
+
+    A message counts as done only when its MOST RECENTLY recorded page ended
+    the list (a falsy `next_offset`). A message interrupted mid-list — a
+    `HardStop`, or the participants collector's hard per-message page cap —
+    is deliberately NOT done, so a later run revisits it instead of silently
+    treating a partial reactor list as complete forever (round-3 review). The
+    resumed fetch restarts from page 1 rather than the interrupted offset —
+    every write along the way is idempotent, so re-walking pages already
+    seen is wasted RPC, not a correctness risk."""
+    rows = store.conn.execute(
+        "SELECT json_extract(context_json, '$.msg_id') AS m, payload_json FROM raw_records "
+        "WHERE lower(kind) LIKE '%messagereactionslist' "
+        "AND json_extract(context_json, '$.channel_id') = ? "
+        "ORDER BY id",
+        (channel_id,),
+    ).fetchall()
+    # Iterate in raw-log (insertion) order so the last assignment per msg_id
+    # wins — that is always this message's most recently recorded page.
+    last_offset: dict[int, str | None] = {}
+    for row in rows:
+        if row["m"] is None:
+            continue
+        payload = json.loads(row["payload_json"])
+        last_offset[int(row["m"])] = payload.get("next_offset")
+    return {mid for mid, offset in last_offset.items() if not offset}
