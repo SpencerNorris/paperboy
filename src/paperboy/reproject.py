@@ -15,6 +15,8 @@ from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
+from paperboy.collectors.participants import ParticipantsCollector
+from paperboy.collectors.profiles import ProfilesCollector
 from paperboy.collectors.web import WebCollector
 from paperboy.config import Settings
 from paperboy.recipes import collect_channel
@@ -31,6 +33,7 @@ REPROJECT_TABLES = (
     "raw_records", "channels", "channel_snapshots", "peers", "messages",
     "message_revisions", "message_metrics", "message_tombstones", "edges",
     "media", "custody_log", "web_snapshots",
+    "users", "user_snapshots", "user_photos", "participants", "participant_snapshots",
 )
 
 
@@ -107,6 +110,14 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     if linked and source.has_context_channel(run, linked):
         phases.append("discussion")
     if source.has_kind(
+        run, "channels.channelparticipants", "channels.channelparticipant", "rosterwalled",
+        "usernotparticipant", "messages.messagereactionslist",
+    ):
+        phases.append("participants")
+    if source.has_context_value(run, "method", "users.getUsers") \
+            or source.has_kind(run, "users.userfull"):
+        phases.append("profiles")
+    if source.has_kind(
         run, "chats", "chatsslice", "chatinvite", "chatinvitealready",
         "chatinvitepeek", "sponsoredmessage",
     ):
@@ -138,16 +149,32 @@ async def reproject(
     runs = source.runs()
     if not runs:
         raise ReprojectError("source raw log is empty — nothing to reproject")
-    # allow_join=True so a source whose original run used --join replays its
-    # discussion sweep; RawReplayGateway.join_channel is a synthetic no-op
-    # (D4.3) — nothing is joined, nothing leaves this machine.
-    replay_settings = settings.model_copy(update={"allow_join": True})
 
     results: dict[str, list[CollectResult]] = {}
     phases_seen: list[str] = []
     replayed_any = False
     for run in runs:
         _reset_incremental_backfill_state(out_store)
+        # Per-run replay settings (plan D6): allow_join=True so a source whose
+        # original run used --join replays its discussion sweep
+        # (RawReplayGateway.join_channel is a synthetic no-op, D4.3 — nothing
+        # is joined, nothing leaves this machine); unsafe=True because the
+        # session-age gate has no RPC to protect on replay; enrich_profiles
+        # follows THIS run's own raw (a --profiles original replays its
+        # UserFull records, a triage-only original replays triage-only,
+        # warning included); and the three person-layer budgets are lifted to
+        # effectively unlimited — the live budget already bounded what was
+        # RECORDED, so a smaller replay budget would silently drop recorded
+        # observations past the cut (replay walks the same deterministic
+        # candidate order and serves every recorded observation; an
+        # unrecorded candidate is a cheap offline SkipAndRecord that projects
+        # nothing).
+        replay_settings = settings.model_copy(update={
+            "allow_join": True, "unsafe": True,
+            "enrich_profiles": source.has_kind(run, "users.userfull"),
+            "profile_budget": 10**9, "participant_oracle_budget": 10**9,
+            "participant_reactions_budget": 10**9,
+        })
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:
             if p not in phases_seen:
@@ -173,6 +200,7 @@ async def reproject(
             web_client = RawReplayWebClient(source, clock, run)
             collectors = [
                 ChannelCollector(), HistoryCollector(), DiscussionCollector(),
+                ParticipantsCollector(), ProfilesCollector(),
                 GraphCollector(),
                 WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
                 MediaCollector(),

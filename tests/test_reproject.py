@@ -292,6 +292,11 @@ ROUND_TRIP_EXCLUDE = {
     "media": set(),
     "custody_log": {"id"},
     "web_snapshots": {"id"},
+    "users": {"source_raw_id"},
+    "user_snapshots": {"id", "source_raw_id"},
+    "user_photos": {"id", "source_raw_id"},
+    "participants": {"source_raw_id"},
+    "participant_snapshots": {"id", "source_raw_id"},
 }
 
 
