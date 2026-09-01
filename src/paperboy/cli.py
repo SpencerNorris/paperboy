@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from paperboy import app as composition
-from paperboy.config import Settings, load_settings, profile_dir
+from paperboy.config import Settings, load_settings, parse_duration, profile_dir
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
@@ -135,7 +135,8 @@ def collect(
     target: str,
     profile: str = typer.Option("default", "--profile"),
     phases: str = typer.Option(
-        None, "--phases", help="Comma-separated: channel,history,discussion,graph,web,media"
+        None, "--phases",
+        help="Comma-separated: channel,history,discussion,participants,profiles,graph,web,media",
     ),
     join: bool = typer.Option(
         False, "--join",
@@ -151,6 +152,19 @@ def collect(
     profile_budget: int = typer.Option(None, "--profile-budget"),
     max_rpc: int = typer.Option(None, "--max-rpc"),
     unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
+    profiles: bool = typer.Option(
+        False, "--profiles",
+        help="Run FULL profile enrichment (getFullUser, photo history, avatar download) on top of "
+             "the always-on getUsers triage — ~1 RPC/s, bounded by --profile-budget.",
+    ),
+    profile_interval: float = typer.Option(
+        None, "--profile-interval",
+        help="Seconds between full-profile RPCs (default: Budget's 1.0s).",
+    ),
+    profile_refresh_after: str = typer.Option(
+        None, "--profile-refresh-after",
+        help="Skip re-enriching users enriched more recently than this (e.g. 7d, 12h, 30m).",
+    ),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -165,7 +179,23 @@ def collect(
         overrides["profile_budget"] = profile_budget
     if max_rpc is not None:
         overrides["max_rpc_per_run"] = max_rpc
+    if profiles:
+        overrides["enrich_profiles"] = True
+    if profile_interval is not None:
+        overrides["profile_interval"] = profile_interval
+    if profile_refresh_after is not None:
+        try:
+            overrides["profile_refresh_after"] = parse_duration(profile_refresh_after)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--profile-refresh-after") from None
+    if unsafe:
+        overrides["unsafe"] = True
     settings = load_settings(profile, overrides)
+    if settings.enrich_profiles:
+        console.print(
+            "[yellow]--profiles enabled: full profile enrichment (getFullUser, photo history, "
+            f"avatars) will run for up to {settings.profile_budget} users this run.[/]"
+        )
 
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
@@ -173,7 +203,7 @@ def collect(
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
-        p for p in ("history", "discussion", "graph", "media", "web")
+        p for p in ("history", "discussion", "participants", "profiles", "graph", "media", "web")
         if phase_list and p in phase_list
     ]
     if phase_list is not None and _dependent_phases and "channel" not in phase_list:
@@ -201,7 +231,7 @@ def collect(
         results = _run_async_or_exit(
             _run_collect(
                 settings, secrets, profile, store, parsed_target,
-                phase_list, log, unsafe, media, web,
+                phase_list, log, media, web,
             )
         )
 
@@ -215,10 +245,10 @@ def collect(
 
 
 async def _run_collect(
-    settings, secrets, profile, store, target, phase_list, log, unsafe, media, web
+    settings, secrets, profile, store, target, phase_list, log, media, web
 ):
     gateway = await composition.build_gateway(settings, secrets, profile, store)
-    if not unsafe:
+    if not settings.unsafe:
         checks = await run_doctor(gateway, settings)
         if doctor_blocks(checks):
             console.print(
@@ -274,6 +304,8 @@ def status(
             table.add_row("messages", str(count("SELECT count(*) FROM messages")))
             table.add_row("peers", str(count("SELECT count(*) FROM peers")))
             table.add_row("edges", str(count("SELECT count(*) FROM edges")))
+            table.add_row("users", str(count("SELECT count(*) FROM users")))
+            table.add_row("participants", str(count("SELECT count(*) FROM participants")))
         console.print(table)
 
 

@@ -34,6 +34,7 @@ PARITY_TABLES = (
     "message_revisions", "message_metrics", "message_tombstones", "edges",
     "media", "custody_log", "web_snapshots", "sync_state", "sync_ranges",
     "run_events",
+    "users", "user_snapshots", "user_photos", "participants", "participant_snapshots",
 )
 
 
@@ -148,7 +149,10 @@ async def run_full_collect(
         await collect_channel(
             FakeGateway(fixtures), store, settings,
             parse_target("@durov"),
-            phases=["channel", "history", "discussion", "graph", "web", "media"],
+            phases=[
+                "channel", "history", "discussion", "participants", "profiles",
+                "graph", "web", "media",
+            ],
             log=logging.getLogger("parity"), collectors=collectors,
         )
     return db
@@ -160,7 +164,14 @@ def dump_db(conn, data_dir: Path, tables=PARITY_TABLES) -> dict[str, list]:
 
     `raw_records.run_id` (ADR-0005) is a random uuid4 hex per process, so it
     is normalized to `run-0001`, `run-0002`, ... in order of first appearance
-    (by raw rowid) — otherwise the golden would be non-reproducible.
+    (by raw rowid) — otherwise the golden would be non-reproducible. The SAME
+    raw run id also gets embedded verbatim in `sync_state('account',
+    'privacy_posture').value_json['run_id']` (posture.py's once-per-run
+    marker, person-layer plan) — normalized through the identical mapping so
+    it renders as the same `run-NNNN` label rather than a fresh random hex
+    every process. `raw_records` is dumped first (it heads `PARITY_TABLES`),
+    so every run id `sync_state` could reference is already mapped by the
+    time this branch runs.
     """
     prefix = str(data_dir)
     run_ids: dict[str, str] = {}
@@ -182,6 +193,11 @@ def dump_db(conn, data_dir: Path, tables=PARITY_TABLES) -> dict[str, list]:
             }
             if table == "raw_records":
                 d["run_id"] = _norm_run_id(d["run_id"])
+            elif table == "sync_state" and d.get("scope") == "account" \
+                    and d.get("key") == "privacy_posture":
+                value = json.loads(d["value_json"])
+                value["run_id"] = _norm_run_id(value.get("run_id"))
+                d["value_json"] = json.dumps(value, sort_keys=True)
             rows.append(d)
         out[table] = sorted(rows, key=lambda d: json.dumps(d, sort_keys=True, default=str))
     return out

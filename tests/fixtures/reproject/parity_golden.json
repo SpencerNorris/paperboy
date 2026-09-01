@@ -56,7 +56,7 @@
    "object_uri": "tg:username:sponsorchannel",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "predicate": "mentions",
-   "source_raw_id": 10,
+   "source_raw_id": 11,
    "subject_uri": "tg:channel:5",
    "tier": "stranger"
   },
@@ -66,7 +66,7 @@
    "object_uri": "tg:channel:501",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "predicate": "recommended_with",
-   "source_raw_id": 9,
+   "source_raw_id": 10,
    "subject_uri": "tg:channel:5",
    "tier": "stranger"
   },
@@ -76,7 +76,7 @@
    "object_uri": "tg:channel:502",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "predicate": "recommended_with",
-   "source_raw_id": 9,
+   "source_raw_id": 10,
    "subject_uri": "tg:channel:5",
    "tier": "stranger"
   }
@@ -230,6 +230,23 @@
    "via_bot_id": null
   }
  ],
+ "participant_snapshots": [
+  {
+   "enumerated": 0,
+   "group_id": 5,
+   "id": 1,
+   "join_date": null,
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "rank": null,
+   "reason": "broadcast_channel: subscriber roster is never enumerable below admin (CHAT_ADMIN_REQUIRED for every filter)",
+   "source_raw_id": 9,
+   "status": null,
+   "subscription_until_date": null,
+   "true_count": 100,
+   "uri": null
+  }
+ ],
+ "participants": [],
  "peers": [
   {
    "access_hash": 1001,
@@ -243,7 +260,7 @@
    "last_seen": "2026-01-01T00:00:00+00:00",
    "seen_in_chat": null,
    "seen_in_msg": null,
-   "source_raw_id": 9,
+   "source_raw_id": 10,
    "title": "Similar One",
    "uri": "tg:channel:501",
    "username": "similarone"
@@ -260,7 +277,7 @@
    "last_seen": "2026-01-01T00:00:00+00:00",
    "seen_in_chat": null,
    "seen_in_msg": null,
-   "source_raw_id": 9,
+   "source_raw_id": 10,
    "title": "Similar Two",
    "uri": "tg:channel:502",
    "username": "similartwo"
@@ -286,7 +303,7 @@
  "raw_records": [
   {
    "context_json": "{\"channel_id\": 5, \"msg_id\": 2}",
-   "id": 14,
+   "id": 15,
    "kind": "MediaDownload",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "payload_json": "{\"file_name\": \"a.txt\", \"kind\": \"document\", \"message_uri\": \"tg:msg:5/2\", \"mime_type\": \"text/plain\", \"path\": \"<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt\", \"sha256\": \"7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd\", \"size\": 13}",
@@ -296,6 +313,15 @@
   {
    "context_json": "{\"channel_id\": 5}",
    "id": 10,
+   "kind": "ChatsSlice",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"_\": \"ChatsSlice\", \"chats\": [{\"_\": \"Channel\", \"access_hash\": 1001, \"broadcast\": true, \"id\": 501, \"title\": \"Similar One\", \"username\": \"similarone\"}, {\"_\": \"Channel\", \"access_hash\": 1002, \"broadcast\": true, \"id\": 502, \"title\": \"Similar Two\", \"username\": \"similartwo\"}], \"count\": 37}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_id\": 5}",
+   "id": 11,
    "kind": "SponsoredMessage",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "payload_json": "{\"_\": \"SponsoredMessage\", \"additional_info\": \"Promoted\", \"button_text\": \"View\", \"message\": \"Check this out\", \"random_id\": \"AAAAAAAA\", \"sponsor_info\": \"Acme Corp\", \"title\": \"Sponsor Title\", \"url\": \"https://t.me/sponsorchannel\"}",
@@ -359,18 +385,9 @@
   {
    "context_json": "{\"channel_id\": 5}",
    "id": 9,
-   "kind": "ChatsSlice",
+   "kind": "RosterWalled",
    "observed_at": "2026-01-01T00:00:00+00:00",
-   "payload_json": "{\"_\": \"ChatsSlice\", \"chats\": [{\"_\": \"Channel\", \"access_hash\": 1001, \"broadcast\": true, \"id\": 501, \"title\": \"Similar One\", \"username\": \"similarone\"}, {\"_\": \"Channel\", \"access_hash\": 1002, \"broadcast\": true, \"id\": 502, \"title\": \"Similar Two\", \"username\": \"similartwo\"}], \"count\": 37}",
-   "run_id": "run-0001",
-   "tier": "stranger"
-  },
-  {
-   "context_json": "{\"channel_username\": \"durov\"}",
-   "id": 11,
-   "kind": "tme_page",
-   "observed_at": "2026-01-01T00:00:00+00:00",
-   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body>\\n<div class=\\\"tgme_widget_message\\\" data-post=\\\"durov/1\\\">\\n  <div class=\\\"tgme_widget_message_text\\\">m1</div>\\n  <time datetime=\\\"2026-01-01T00:00:00+00:00\\\"></time>\\n</div>\\n</body></html>\", \"url\": \"https://t.me/s/durov\"}",
+   "payload_json": "{\"_\": \"RosterWalled\", \"enumerated\": 0, \"group_id\": 5, \"participants_count\": 100, \"reason\": \"broadcast_channel: subscriber roster is never enumerable below admin (CHAT_ADMIN_REQUIRED for every filter)\"}",
    "run_id": "run-0001",
    "tier": "stranger"
   },
@@ -379,13 +396,22 @@
    "id": 12,
    "kind": "tme_page",
    "observed_at": "2026-01-01T00:00:00+00:00",
-   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body></body></html>\", \"url\": \"https://t.me/s/durov?before=1\"}",
+   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body>\\n<div class=\\\"tgme_widget_message\\\" data-post=\\\"durov/1\\\">\\n  <div class=\\\"tgme_widget_message_text\\\">m1</div>\\n  <time datetime=\\\"2026-01-01T00:00:00+00:00\\\"></time>\\n</div>\\n</body></html>\", \"url\": \"https://t.me/s/durov\"}",
    "run_id": "run-0001",
    "tier": "stranger"
   },
   {
    "context_json": "{\"channel_username\": \"durov\"}",
    "id": 13,
+   "kind": "tme_page",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "payload_json": "{\"status_code\": 200, \"text\": \"<html><body></body></html>\", \"url\": \"https://t.me/s/durov?before=1\"}",
+   "run_id": "run-0001",
+   "tier": "stranger"
+  },
+  {
+   "context_json": "{\"channel_username\": \"durov\"}",
+   "id": 14,
    "kind": "wayback_cdx",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "payload_json": "{\"status_code\": 200, \"text\": \"[[\\\"urlkey\\\", \\\"timestamp\\\", \\\"original\\\", \\\"mimetype\\\", \\\"statuscode\\\", \\\"digest\\\", \\\"length\\\"], [\\\"me,t)/s/durov\\\", \\\"20260101000000\\\", \\\"https://t.me/s/durov\\\", \\\"text/html\\\", \\\"200\\\", \\\"DIGEST1\\\", \\\"1234\\\"]]\", \"url\": \"https://web.archive.org/cdx/search/cdx?url=t.me/s/durov*&output=json&filter=statuscode:200&collapse=digest&limit=10000\"}",
@@ -414,6 +440,30 @@
  "run_events": [
   {
    "channel_id": 5,
+   "detail_json": "{\"code\": \"profiles_enrichment_off\", \"hint\": \"--profiles\", \"triaged\": 0}",
+   "id": 7,
+   "kind": "warning",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "profiles"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"avatars\": 0, \"backfilled_peers\": 0, \"empty\": 0, \"enriched\": 0, \"fresh_skipped\": 0, \"gathered\": 0, \"photos\": 0, \"photos_empty\": 0, \"refreshed\": 0, \"restricted_skipped\": 0, \"skipped\": 0, \"snapshots\": 0, \"triaged\": 0, \"unavailable\": 0, \"unresolvable\": 0}, \"stopped\": null}",
+   "id": 8,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "profiles"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"counts\": {\"backfilled_peers\": 0, \"edges\": 0, \"enumerated\": 0, \"oracle\": 0, \"participants\": 0, \"reaction_lists\": 0, \"reactors\": 0, \"rosters\": 0, \"service_joins\": 0, \"service_leaves\": 0, \"skipped\": 0, \"true_count\": 0, \"users\": 0, \"walled\": 1}, \"stopped\": \"no linked discussion group \u2014 no enumerable roster (a broadcast channel's subscribers are never enumerable); zero-RPC vectors still swept\"}",
+   "id": 5,
+   "kind": "complete",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "participants"
+  },
+  {
+   "channel_id": 5,
    "detail_json": "{\"counts\": {\"backfilled_peers\": 0, \"edges\": 0, \"messages\": 0, \"revisions\": 0, \"tombstones\": 0, \"unmapped\": 0}, \"stopped\": \"no linked discussion group\"}",
    "id": 3,
    "kind": "complete",
@@ -431,7 +481,7 @@
   {
    "channel_id": 5,
    "detail_json": "{\"counts\": {\"deleted_recovered\": 0, \"tme_posts\": 1, \"wayback_rows\": 1}, \"stopped\": null}",
-   "id": 5,
+   "id": 10,
    "kind": "complete",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "phase": "web"
@@ -439,7 +489,7 @@
   {
    "channel_id": 5,
    "detail_json": "{\"counts\": {\"downloaded\": 1, \"duplicates\": 0, \"skipped\": 0, \"skipped_kind\": 0, \"unavailable\": 0}, \"stopped\": null}",
-   "id": 6,
+   "id": 11,
    "kind": "complete",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "phase": "media"
@@ -455,10 +505,26 @@
   {
    "channel_id": 5,
    "detail_json": "{\"counts\": {\"edges\": 4, \"peers\": 2, \"raw\": 2, \"skipped\": 0}, \"stopped\": null}",
-   "id": 4,
+   "id": 9,
    "kind": "complete",
    "observed_at": "2026-01-01T00:00:00+00:00",
    "phase": "graph"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"group_id\": 5, \"participants_count\": 100, \"reason\": \"broadcast_channel: subscriber roster is never enumerable below admin (CHAT_ADMIN_REQUIRED for every filter)\"}",
+   "id": 4,
+   "kind": "roster_walled",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "participants"
+  },
+  {
+   "channel_id": 5,
+   "detail_json": "{\"lastseen\": {\"unavailable\": \"fake: no privacy fixture for 'lastseen'\"}, \"phone\": {\"unavailable\": \"fake: no privacy fixture for 'phone'\"}, \"photo\": {\"unavailable\": \"fake: no privacy fixture for 'photo'\"}}",
+   "id": 6,
+   "kind": "privacy_posture",
+   "observed_at": "2026-01-01T00:00:00+00:00",
+   "phase": "profiles"
   }
  ],
  "sync_ranges": [
@@ -486,9 +552,19 @@
    "value_json": "{\"backfill_complete\": true, \"incremental_in_progress\": false, \"max_id_seen\": 3, \"pending_high\": 3}"
   },
   {
+   "key": "5",
+   "scope": "profiles",
+   "value_json": "{\"budget\": 2000, \"enriched_this_run\": 0, \"fully_enriched\": 0, \"pass\": \"triage_only\", \"population\": 0}"
+  },
+  {
    "key": "durov",
    "scope": "web_tme",
    "value_json": "{\"newest_seen\": 1}"
+  },
+  {
+   "key": "privacy_posture",
+   "scope": "account",
+   "value_json": "{\"posture\": {\"lastseen\": {\"unavailable\": \"fake: no privacy fixture for 'lastseen'\"}, \"phone\": {\"unavailable\": \"fake: no privacy fixture for 'phone'\"}, \"photo\": {\"unavailable\": \"fake: no privacy fixture for 'photo'\"}}, \"run_id\": \"run-0001\"}"
   },
   {
    "key": "self",
@@ -496,6 +572,9 @@
    "value_json": "{\"id\": 1, \"uri\": \"tg:user:1\"}"
   }
  ],
+ "user_photos": [],
+ "user_snapshots": [],
+ "users": [],
  "web_snapshots": [
   {
    "channel_username": "durov",
