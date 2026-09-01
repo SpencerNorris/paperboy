@@ -349,13 +349,19 @@ class ParticipantsCollector:
             {"group_id": group_id, "enumerated": len(enumerated), "true_count": true_count,
              "walled": walled, "joined": joined},
         )
-        counts["enumerated"] += len(enumerated)
         counts["true_count"] += true_count or 0
 
         partial = walled is not None or (true_count is not None and len(enumerated) < true_count)
         if partial:
             await self._oracle(ctx, roster, enumerated, counts)
         await self._reactions(ctx, roster, counts)
+        # AFTER the oracle: a positive oracle answer adds the SAME kind of
+        # confirmed-member row (`participants`, `member_of`) as a roster
+        # page, so it must count toward `enumerated` too -- otherwise this
+        # count and the shortfall warning below (which reads the same
+        # mutated `enumerated` set) would disagree about how many members
+        # this run actually confirmed.
+        counts["enumerated"] += len(enumerated)
         if not partial or joined:
             return None
         warning = JOIN_SHORTFALL_WARNING.format(

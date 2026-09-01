@@ -460,6 +460,27 @@ async def test_oracle_wall_ends_the_oracle_loop_for_that_group(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_oracle_confirmed_members_count_toward_enumerated(tmp_path):
+    """A positive oracle answer writes the SAME kind of confirmed-member row
+    (`participants`, `member_of`) as a roster page, so it must count toward
+    the run's `enumerated` total too -- found running the Leg 3 DoD smoke:
+    the shortfall warning (built from the same, oracle-mutated `enumerated`
+    set) disagreed with `res.counts["enumerated"]`, which stopped counting
+    before the oracle ran."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 301, 21)
+        gw = _gw(
+            [_page(_member(2), count=3)],
+            participant={GROUP_ID: {21: _answer(21)}},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.counts["oracle"] == 1
+        assert res.counts["enumerated"] == 2, "the roster's 1 + the oracle's confirmed 21"
+        assert res.stopped is not None and "2 of 3" in res.stopped
+
+
+@pytest.mark.asyncio
 async def test_join_flag_joins_a_left_group_then_pages_admins_and_bots(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st)
