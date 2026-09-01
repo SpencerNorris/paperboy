@@ -78,6 +78,40 @@ def test_reacted_message_ids_newest_first_and_fetched_set(tmp_path):
         assert fetched_reaction_lists(st, GROUP_ID) == {12}
 
 
+def test_fetched_reaction_lists_excludes_a_message_truncated_mid_list(tmp_path):
+    """A message interrupted mid-list (a `HardStop`, or the participants
+    collector's hard per-message page cap) must not be reported as done just
+    because SOME page was recorded — only the MOST RECENTLY recorded page's
+    `next_offset` decides, so a later run resumes it instead of silently
+    treating a partial reactor list as complete forever (round-3 review)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _raw_message(st, 20, {
+            "_": "MessageReactions",
+            "results": [{"_": "ReactionCount", "count": 5, "reaction": {}}],
+        })
+        # page 1: more to come.
+        st.add_raw(
+            "messages.MessageReactionsList",
+            {"_": "MessageReactionsList", "count": 2, "reactions": [], "next_offset": "p2"},
+            "stranger", {"channel_id": GROUP_ID, "msg_id": 20, "offset": ""},
+        )
+        assert fetched_reaction_lists(st, GROUP_ID) == set()  # not done yet
+        # page 2: still truncated (e.g. the hard page cap fired here).
+        st.add_raw(
+            "messages.MessageReactionsList",
+            {"_": "MessageReactionsList", "count": 2, "reactions": [], "next_offset": "p3"},
+            "stranger", {"channel_id": GROUP_ID, "msg_id": 20, "offset": "p2"},
+        )
+        assert fetched_reaction_lists(st, GROUP_ID) == set()  # latest page STILL truncated
+        # page 3: the list actually ends.
+        st.add_raw(
+            "messages.MessageReactionsList",
+            {"_": "MessageReactionsList", "count": 2, "reactions": [], "next_offset": None},
+            "stranger", {"channel_id": GROUP_ID, "msg_id": 20, "offset": "p3"},
+        )
+        assert fetched_reaction_lists(st, GROUP_ID) == {20}
+
+
 def test_recent_reactions_never_replace_an_existing_provenance(tmp_path):
     # A reaction is not a documented inputPeerFromMessage context; the edge is
     # still recorded, but a provenance the store already holds is kept.

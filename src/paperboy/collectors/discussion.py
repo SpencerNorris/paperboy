@@ -77,7 +77,7 @@ async def join_or_skip(
     return None
 
 
-def linked_group(ctx: CollectContext) -> tuple[int, dict, bool] | str:
+def linked_group(ctx: CollectContext, phase: str = "discussion") -> tuple[int, dict, bool] | str:
     """`(group_id, input_channel, needs_join)`, or a `stopped` reason string.
 
     `needs_join` is True when the group sets `join_to_send` — reading it then
@@ -88,6 +88,14 @@ def linked_group(ctx: CollectContext) -> tuple[int, dict, bool] | str:
     The reasons are deliberately lexically disjoint — no reason contains
     another's distinguishing word — because tests assert on them, and an
     overlapping pair lets a test pass on the wrong branch.
+
+    `phase` names the caller (`self.name`) in the "no access hash known"
+    reason, mirroring `join_or_skip`'s own `phase` parameter and for the same
+    reason: that reason is a `stopped`/warning message the OPERATOR reads, so
+    it must name the phase that is actually running, not hard-code
+    "discussion" for every caller (round-3 review). "no linked discussion
+    group" stays phase-neutral — a channel either has one or it does not,
+    regardless of which phase asked.
 
     Extracted (Task 8) so `participants` can share it.
     """
@@ -107,7 +115,7 @@ def linked_group(ctx: CollectContext) -> tuple[int, dict, bool] | str:
     if peer is None or not peer["access_hash"]:
         # A stored `0` is not a usable hash — it yields CHANNEL_INVALID
         # against live Telegram, a phase error rather than a clean skip.
-        return f"discussion group {group_id}: no access hash known"
+        return f"{phase} group {group_id}: no access hash known"
 
     flags = json.loads(peer["flags_json"]) if peer["flags_json"] else {}
     # Reading is open to anyone *unless* `join_to_send` is set. Honouring it
@@ -142,7 +150,7 @@ class DiscussionCollector:
             ctx.store, ctx.channel_id, ctx.tier
         )
 
-        target = linked_group(ctx)
+        target = linked_group(ctx, self.name)
         if isinstance(target, str):
             return CollectResult(name=self.name, counts=counts, stopped=target)
         group_id, input_channel, needs_join = target
@@ -188,7 +196,7 @@ class DiscussionCollector:
     def _linked_group(self, ctx: CollectContext) -> tuple[int, dict, bool] | str:
         """Delegate to the module-level `linked_group` (shared with
         `participants`, Task 8)."""
-        return linked_group(ctx)
+        return linked_group(ctx, self.name)
 
     def _write_thread_edges(
         self, ctx: CollectContext, group_id: int, counts: dict[str, int]
