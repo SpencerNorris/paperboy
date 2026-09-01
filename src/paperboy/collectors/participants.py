@@ -37,24 +37,35 @@ from paperboy.collectors.discussion import join_or_skip, linked_group
 from paperboy.collectors.posture import record_privacy_posture
 from paperboy.doctor import session_age_days
 from paperboy.gateway import FILTER_ADMINS, FILTER_BOTS, FILTER_RECENT
-from paperboy.ids import namespaced_kind
+from paperboy.ids import iso_or_none, msg_uri, namespaced_kind, peer_ref_uri, peer_stub
 from paperboy.store.channels import channel_flags, upsert_channel
+from paperboy.store.edges import add_edge_once
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
 from paperboy.store.participants import (
+    ParticipantFacts,
     add_participant_snapshot,
     add_roster_snapshot,
     membership_edges,
     project_join_service_messages,
     upsert_participant,
+    write_participant,
 )
-from paperboy.store.peers import upsert_full_peer, upsert_peer
-from paperboy.store.reactions import backfill_recent_reactions
+from paperboy.store.peers import input_user_ref, upsert_full_peer, upsert_peer
+from paperboy.store.reactions import (
+    REACTED_TO,
+    backfill_recent_reactions,
+    fetched_reaction_lists,
+    reacted_message_ids,
+)
 from paperboy.store.users import add_user_snapshot, target_user_facts, upsert_user
 from paperboy.targets import Target
 
 _PAGE_SIZE = 200  # Telegram's page size, not a total cap (spec §6.3)
+_REACTIONS_PAGE = 100
 METHOD_GET_PARTICIPANTS = "channels.getParticipants"
+METHOD_GET_PARTICIPANT = "channels.getParticipant"
+METHOD_REACTIONS = "messages.getMessageReactionsList"
 # Admin-only sub-methods: detected via rights and SKIPPED, never attempted (spec §6.5).
 _ADMIN_ONLY_METHODS = (
     "channels.getAdminLog", "premium.getBoostsList", "messages.getChatInviteImporters",
@@ -454,9 +465,125 @@ class ParticipantsCollector:
     async def _oracle(
         self, ctx: CollectContext, roster: _Roster, enumerated: set[str], counts: dict[str, int]
     ) -> None:
-        return None  # Task 9
+        """`channels.getParticipant` for users REFERENCED in the group (message
+        authors, provenance) that a partial/walled roster did not cover and
+        that have no answer yet — bounded by `participant_oracle_budget`
+        (plan D9), never one call per known commenter. Confirmed un-joined /
+        non-admin on the group (spec §13); a `USER_NOT_PARTICIPANT` answer is a
+        definitive negative and is stored as such."""
+        budget = ctx.settings.participant_oracle_budget
+        if budget <= 0:
+            return
+        group_id = roster.group_id
+        rows = ctx.store.conn.execute(
+            """
+            SELECT DISTINCT uri FROM (
+                SELECT from_uri AS uri FROM messages
+                WHERE channel_id = ? AND from_uri LIKE 'tg:user:%'
+                UNION
+                SELECT uri FROM peers WHERE kind = 'user' AND seen_in_chat = ?
+            )
+            WHERE uri NOT IN (SELECT uri FROM participants WHERE group_id = ?)
+            ORDER BY uri
+            """,
+            (group_id, group_id, group_id),
+        ).fetchall()
+        candidates = [r["uri"] for r in rows if r["uri"] not in enumerated][:budget]
+        for uri in candidates:
+            ref = input_user_ref(ctx.store, uri)
+            if ref is None:
+                continue
+            try:
+                answer = await ctx.gateway.get_participant(roster.input_channel, ref)
+            except SkipAndRecord as exc:
+                # CHAT_ADMIN_REQUIRED here is the wall itself, not a per-user
+                # condition — stop asking this group.
+                ctx.log.warning("participants: oracle walled on group %s: %s", group_id, exc)
+                counts["skipped"] += 1
+                return
+            counts["oracle"] += 1
+            if answer is None:
+                payload = {"_": "UserNotParticipant", "user_id": ref["user_id"]}
+                stamp = ctx.clock.for_payload(payload)
+                raw_id = ctx.store.add_raw(
+                    "UserNotParticipant", payload, ctx.tier,
+                    {"channel_id": group_id, "user_id": ref["user_id"]}, observed_at=stamp,
+                )
+                facts = ParticipantFacts(uri, "left", None, None, None, None)
+                if write_participant(ctx.store, group_id, facts, raw_id, stamp):
+                    add_participant_snapshot(ctx.store, group_id, facts, stamp, raw_id)
+                continue
+            stamp = ctx.clock.for_payload(answer)
+            raw_id = ctx.store.add_raw(
+                namespaced_kind("channels", answer, "ChannelParticipant"), answer, ctx.tier,
+                {"channel_id": group_id, "user_id": ref["user_id"]}, observed_at=stamp,
+            )
+            self._project_users_vector(ctx, answer, raw_id, stamp, counts)
+            facts = upsert_participant(
+                ctx.store, group_id, answer.get("participant") or {}, raw_id, stamp
+            )
+            if facts is None:
+                continue
+            counts["participants"] += 1
+            enumerated.add(facts.uri)
+            add_participant_snapshot(ctx.store, group_id, facts, stamp, raw_id)
+            counts["edges"] += membership_edges(
+                ctx.store, group_id, facts, stamp, ctx.tier, raw_id,
+                {"source": "oracle", "status": facts.status},
+            )
 
     async def _reactions(
         self, ctx: CollectContext, roster: _Roster, counts: dict[str, int]
     ) -> None:
-        return None  # Task 9
+        """`messages.getMessageReactionsList` on reacted GROUP messages —
+        newest first, bounded by `participant_reactions_budget`, resumable
+        (the done-set is derived from the raw log). Reactors get a
+        `reacted_to` edge, a `users` row (the response's `users` vector) and
+        a `peers` row with the message as provenance. The first wall
+        (`BROADCAST_FORBIDDEN` / `CHAT_ADMIN_REQUIRED`) ends the vector."""
+        budget = ctx.settings.participant_reactions_budget
+        if budget <= 0:
+            return
+        group_id = roster.group_id
+        done = fetched_reaction_lists(ctx.store, group_id)
+        candidates = [m for m in reacted_message_ids(ctx.store, group_id) if m not in done][:budget]
+        for msg_id in candidates:
+            offset: str | None = None
+            while True:
+                try:
+                    result = await ctx.gateway.get_message_reactions_list(
+                        roster.input_channel, msg_id, offset=offset, limit=_REACTIONS_PAGE
+                    )
+                except SkipAndRecord as exc:
+                    ctx.log.warning(
+                        "participants: reaction lists skipped for group %s: %s", group_id, exc
+                    )
+                    counts["skipped"] += 1
+                    return
+                stamp = ctx.clock.for_payload(result)
+                raw_id = ctx.store.add_raw(
+                    namespaced_kind("messages", result, "MessageReactionsList"), result, ctx.tier,
+                    {"channel_id": group_id, "msg_id": msg_id, "offset": offset or ""},
+                    observed_at=stamp,
+                )
+                counts["reaction_lists"] += 1
+                self._project_users_vector(ctx, result, raw_id, stamp, counts)
+                for reaction in result.get("reactions") or []:
+                    subject = peer_ref_uri(reaction.get("peer_id"))
+                    stub = peer_stub(reaction.get("peer_id"))
+                    if subject is None or stub is None:
+                        continue
+                    if upsert_peer(
+                        ctx.store, stub, raw_id, stamp, seen_in_chat=group_id, seen_in_msg=msg_id
+                    ) is None:
+                        continue  # the collecting account reacted (#12)
+                    if add_edge_once(
+                        ctx.store, subject, REACTED_TO, msg_uri(group_id, msg_id), stamp, ctx.tier,
+                        raw_id,
+                        {"source": "reactions_list", "reaction": reaction.get("reaction"),
+                         "date": iso_or_none(reaction.get("date"))},
+                    ):
+                        counts["edges"] += 1
+                offset = result.get("next_offset")
+                if not offset:
+                    break

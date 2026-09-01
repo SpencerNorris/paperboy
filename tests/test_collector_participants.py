@@ -364,3 +364,225 @@ async def test_phase_stop_without_channel_context(tmp_path):
 def test_applies_to_channel_like_targets():
     assert ParticipantsCollector().applies_to(parse_target("@durov"))
     assert not ParticipantsCollector().applies_to(parse_target("+15551234567"))
+
+
+def _seed_group_comment(
+    st: Store, msg_id: int, user_id: int, *, reactions: dict | None = None
+) -> None:
+    m = {"_": "Message", "id": msg_id, "message": "c", "date": 1767322445,
+         "from_id": {"_": "PeerUser", "user_id": user_id},
+         "peer_id": {"_": "PeerChannel", "channel_id": GROUP_ID}}
+    if reactions is not None:
+        m["reactions"] = reactions
+    raw_id = st.add_raw("Message", m, "stranger", {"channel_id": GROUP_ID}, observed_at=T0)
+    upsert_message(st, GROUP_ID, m, raw_id, T0, "stranger")
+    # what `history._observe_message` does for an author: the min stub with provenance —
+    # without a `peers` row `input_user_ref` is None and the oracle has nothing to ask
+    upsert_peer(st, {"_": "User", "id": user_id, "min": True}, raw_id, T0,
+                seen_in_chat=GROUP_ID, seen_in_msg=msg_id)
+
+
+def _answer(uid: int) -> dict:
+    return {
+        "_": "ChannelParticipant", "participant": _member(uid), "chats": [],
+        "users": [_user(uid)],
+    }
+
+
+@pytest.mark.asyncio
+async def test_oracle_runs_only_on_a_partial_roster_and_is_bounded(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for uid, mid in ((21, 301), (22, 302), (23, 303), (2, 304)):
+            _seed_group_comment(st, mid, uid)  # 2 is also in the roster; 21-23 are not
+        complete = _gw(
+            [_page(_member(2), count=1)],
+            participant={GROUP_ID: {21: _answer(21), 22: None, 23: _answer(23)}},
+        )
+        await ParticipantsCollector().collect(_ctx(st, complete))
+        assert complete.participant_calls == []  # complete roster: no oracle spend
+
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st)
+        for uid, mid in ((21, 301), (22, 302), (23, 303), (2, 304)):
+            _seed_group_comment(st, mid, uid)
+        partial = _gw(
+            [_page(_member(2), count=307)],
+            participant={GROUP_ID: {21: _answer(21), 22: None, 23: _answer(23)}},
+        )
+        res = await ParticipantsCollector().collect(
+            _ctx(st, partial, _settings(participant_oracle_budget=2))
+        )
+        assert partial.participant_calls == [(GROUP_ID, 21), (GROUP_ID, 22)]  # bounded, uri order
+        assert res.counts["oracle"] == 2
+        rows = {
+            r["uri"]: r["status"]
+            for r in st.conn.execute("select uri, status from participants")
+        }
+        assert rows["tg:user:21"] == "member" and rows["tg:user:22"] == "left"
+        assert "tg:user:23" not in rows
+        raw = [r["kind"] for r in st.conn.execute(
+            "select kind from raw_records where json_extract(context_json,'$.user_id') "
+            "in (21, 22) order by id")]
+        assert raw == ["channels.ChannelParticipant", "UserNotParticipant"]
+        edge = st.conn.execute(
+            "select evidence_json from edges where subject_uri='tg:user:21' "
+            "and predicate='member_of'").fetchone()
+        assert '"source": "oracle"' in edge["evidence_json"]
+        assert st.conn.execute(
+            "select count(*) from users where uri='tg:user:21'"
+        ).fetchone()[0] == 1
+
+        # a later run asks only about users still without an answer
+        again = _gw(
+            [_page(_member(2), count=307)],
+            participant={GROUP_ID: {21: _answer(21), 22: None, 23: _answer(23)}},
+        )
+        await ParticipantsCollector().collect(
+            _ctx(st, again, _settings(participant_oracle_budget=2))
+        )
+        assert again.participant_calls == [(GROUP_ID, 23)]
+
+
+@pytest.mark.asyncio
+async def test_oracle_wall_ends_the_oracle_loop_for_that_group(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for uid, mid in ((21, 301), (22, 302)):
+            _seed_group_comment(st, mid, uid)
+        gw = _gw(
+            [_page(_member(2), count=307)],
+            participant={GROUP_ID: {21: SkipAndRecord("CHAT_ADMIN_REQUIRED"), 22: _answer(22)}},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.participant_calls == [(GROUP_ID, 21)]
+        assert res.counts["skipped"] == 1 and res.counts["oracle"] == 0
+
+
+@pytest.mark.asyncio
+async def test_join_flag_joins_a_left_group_then_pages_admins_and_bots(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        admins = {"_": "ChannelParticipants", "count": 1, "chats": [], "users": [_user(9)],
+                  "participants": [{"_": "ChannelParticipantCreator", "user_id": 9,
+                                    "admin_rights": {"_": "ChatAdminRights"}, "rank": "founder"}]}
+        bots = _page(_member(30), count=1, users=[_user(30, bot=True)])
+        gw = FakeGateway({
+            "full_channel_by_id": {GROUP_ID: _group_full(left=True)},
+            "participants": {GROUP_ID: {"channelParticipantsRecent": [_page(_member(2), count=3)],
+                                        "channelParticipantsAdmins": [admins],
+                                        "channelParticipantsBots": [bots]}},
+            "join": {"_": "Updates", "updates": []},
+        })
+        res = await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 1
+        assert [c[1] for c in gw.participants_calls] == [
+            "channelParticipantsRecent", "channelParticipantsAdmins", "channelParticipantsBots",
+        ]
+        assert st.conn.execute(
+            "select status from participants where uri='tg:user:9'"
+        ).fetchone()[0] == "creator"
+        assert st.conn.execute(
+            "select count(*) from run_events where kind='join'"
+        ).fetchone()[0] == 1
+        assert res.stopped is None  # joined: the shortfall is not a --join warning any more
+
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st)
+        gw = FakeGateway({
+            "full_channel_by_id": {GROUP_ID: _group_full(left=False)},
+            "participants": {GROUP_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]}},
+        })
+        await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 0  # already a member: never re-joined
+        assert [c[1] for c in gw.participants_calls][1:] == [
+            "channelParticipantsAdmins", "channelParticipantsBots",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_join_never_fires_without_the_flag_and_a_refused_join_falls_back(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        gw = _gw([_page(_member(2), count=1)], join={"_": "Updates", "updates": []})
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        assert "join_channel" not in gw.calls
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st)
+        gw = _gw([_page(_member(2), count=1)], join=SkipAndRecord("INVITE_REQUEST_SENT"))
+        res = await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 1
+        assert [c[1] for c in gw.participants_calls] == ["channelParticipantsRecent"]  # un-joined
+        assert res.counts["enumerated"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reaction_lists_are_bounded_newest_first_and_resumable(tmp_path):
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 2, "reaction": {}}],
+    }
+
+    def _list(*uids: int, next_offset=None) -> dict:
+        return {
+            "_": "MessageReactionsList", "count": len(uids), "chats": [],
+            "next_offset": next_offset,
+            "users": [_user(u) for u in uids],
+            "reactions": [
+                {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": u},
+                 "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "🔥"}}
+                for u in uids
+            ],
+        }
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for mid in (401, 402, 403):
+            _seed_group_comment(st, mid, 2, reactions=reacted)
+        _seed_group_comment(st, 404, 2)  # no reactions: never asked
+        gw = _gw([_page(_member(2), count=1)], reactions={GROUP_ID: {
+            403: [_list(31, 32, next_offset="p2"), _list(33)], 402: _list(34), 401: _list(35),
+        }})
+        res = await ParticipantsCollector().collect(
+            _ctx(st, gw, _settings(participant_reactions_budget=2))
+        )
+        assert gw.reactions_calls == [
+            (GROUP_ID, 403, None), (GROUP_ID, 403, "p2"), (GROUP_ID, 402, None),
+        ]
+        assert res.counts["reaction_lists"] == 3
+        edges = {(e[0], e[2]) for e in st.conn.execute(
+            "select subject_uri, predicate, object_uri from edges where predicate='reacted_to'")}
+        assert edges == {
+            ("tg:user:31", "tg:msg:77/403"), ("tg:user:32", "tg:msg:77/403"),
+            ("tg:user:33", "tg:msg:77/403"), ("tg:user:34", "tg:msg:77/402"),
+        }
+        assert st.conn.execute(
+            "select count(*) from users where uri in ('tg:user:31','tg:user:34')"
+        ).fetchone()[0] == 2
+        peer = st.conn.execute(
+            "select seen_in_chat, seen_in_msg from peers where uri='tg:user:31'"
+        ).fetchone()
+        assert (peer["seen_in_chat"], peer["seen_in_msg"]) == (GROUP_ID, 403)
+
+        again = _gw([_page(_member(2), count=1)], reactions={GROUP_ID: {401: _list(35)}})
+        await ParticipantsCollector().collect(
+            _ctx(st, again, _settings(participant_reactions_budget=2))
+        )
+        assert again.reactions_calls == [(GROUP_ID, 401, None)]  # 403/402 fetched: resumable
+
+
+@pytest.mark.asyncio
+async def test_reaction_list_wall_is_a_recorded_skip(tmp_path):
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 2, "reaction": {}}],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 401, 2, reactions=reacted)
+        _seed_group_comment(st, 402, 2, reactions=reacted)
+        gw = _gw(
+            [_page(_member(2), count=1)],
+            reactions={GROUP_ID: {402: SkipAndRecord("BROADCAST_FORBIDDEN")}},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.reactions_calls == [(GROUP_ID, 402, None)]  # the wall ends the vector
+        assert res.counts["skipped"] == 1 and res.stopped is None
