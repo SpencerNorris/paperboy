@@ -18,7 +18,7 @@ true min/max window regardless of arrival order.
 
 from __future__ import annotations
 
-from paperboy.ids import channel_uri, chat_uri, primary_username, user_uri
+from paperboy.ids import channel_uri, chat_uri, parse_uri, primary_username, user_uri
 from paperboy.store.db import Store, dumps
 from paperboy.store.sync import is_self
 
@@ -158,3 +158,53 @@ def upsert_peer(
         ),
     )
     return uri
+
+
+def input_user_ref(store: Store, uri: str) -> dict | None:
+    """The store side of spec §5's `_input_user` builder: the dict the gateway
+    turns into an `InputUser`/`InputPeerUser`.
+
+    1. A non-`min` row with a real `access_hash` — in `users` (a triaged/
+       enriched person) first, else `peers` (seen in a full `users` vector) —
+       → `{"user_id", "access_hash"}`.
+    2. Else a `min` stub with `(seen_in_chat, seen_in_msg)` provenance into a
+       channel whose own hash `peers` knows → `{"user_id", "from_msg": {...}}`
+       for `inputUserFromMessage` (research §1.9/§8.7 — the ONLY way a
+       message-discovered stub is ever enrichable).
+    3. Else `None`: unresolvable (a `min` hash is only good for photo
+       downloads and is never offered here).
+    """
+    kind, ids = parse_uri(uri)
+    if kind != "user":
+        raise ValueError(f"input_user_ref expects a user URI, got {uri!r}")
+    user_id = ids[0]
+    user = store.conn.execute(
+        "SELECT is_min, access_hash FROM users WHERE uri=?", (uri,)
+    ).fetchone()
+    if user is not None and not user["is_min"] and user["access_hash"]:
+        return {"user_id": user_id, "access_hash": user["access_hash"]}
+    peer = store.conn.execute(
+        "SELECT is_min, access_hash, seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
+    ).fetchone()
+    if peer is None:
+        return None
+    if not peer["is_min"] and peer["access_hash"]:
+        return {"user_id": user_id, "access_hash": peer["access_hash"]}
+    if peer["seen_in_chat"] and peer["seen_in_msg"]:
+        chan = store.conn.execute(
+            "SELECT is_min, access_hash FROM peers WHERE uri=?",
+            (channel_uri(peer["seen_in_chat"]),),
+        ).fetchone()
+        # A `min` channel's access_hash is only usable for photo file
+        # locations (research §8.7 / api/min) — never for building a
+        # from-message ref, so it must be checked here exactly like the
+        # user-row case above (symmetry, hardening).
+        if chan is not None and not chan["is_min"] and chan["access_hash"]:
+            return {
+                "user_id": user_id,
+                "from_msg": {
+                    "channel_id": peer["seen_in_chat"], "access_hash": chan["access_hash"],
+                    "msg_id": peer["seen_in_msg"],
+                },
+            }
+    return None

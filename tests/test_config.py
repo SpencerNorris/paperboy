@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from paperboy.config import Settings, load_settings, profile_dir
+import pytest
+
+from paperboy.config import Settings, load_settings, parse_duration, profile_dir
 
 
 def test_env_override(monkeypatch):
@@ -55,3 +57,25 @@ def test_profile_dir_scopes_data_dir(tmp_path):
 def test_two_profiles_dont_share_a_dir(tmp_path):
     s = load_settings("default", {"data_dir": str(tmp_path)})
     assert profile_dir(s, "a") != profile_dir(s, "b")
+
+
+def test_person_layer_defaults():
+    s = load_settings("default", {})
+    assert s.unsafe is False
+    assert s.enrich_profiles is False
+    assert s.profile_interval is None
+    assert s.profile_refresh_after is None
+    assert s.profile_budget == 2000
+    assert s.participant_oracle_budget == 100
+    assert s.participant_reactions_budget == 200
+
+
+def test_parse_duration_units():
+    assert parse_duration("7d") == 7 * 86400
+    assert parse_duration("12h") == 12 * 3600
+    assert parse_duration("30m") == 1800
+    assert parse_duration("45s") == 45
+    assert parse_duration("3600") == 3600
+    for bad in ("", "7x", "-1d", "d"):
+        with pytest.raises(ValueError):
+            parse_duration(bad)

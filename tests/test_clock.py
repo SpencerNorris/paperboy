@@ -87,3 +87,15 @@ def test_add_raw_without_begin_run_leaves_null(tmp_path):
 def test_begin_run_accepts_injected_id(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as store:
         assert store.begin_run("legacy-0001") == "legacy-0001"
+
+
+def test_live_clock_now_is_iso_utc():
+    assert LiveClock().now().endswith("+00:00")
+
+
+def test_replay_clock_now_is_the_last_served_stamp():
+    clock = ReplayClock()
+    with pytest.raises(ReplayClockError):
+        clock.now()
+    clock.serve("2026-01-01T00:00:07+00:00", {"_": "a"})
+    assert clock.now() == "2026-01-01T00:00:07+00:00"

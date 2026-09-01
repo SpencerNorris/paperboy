@@ -564,6 +564,43 @@ class RawReplayGateway:
             messages.append(json.loads(row["payload_json"]))
         return {"_": "SponsoredMessages", "messages": messages}
 
+    # Person-layer replay methods (`participants`/`profiles`, spec §10) —
+    # deliberately UNIMPLEMENTED here. This leg (person-layer plan Tasks
+    # 1-5) only grows the `Gateway` Protocol so `TelethonGateway`/
+    # `FakeGateway` can serve these seven methods; the replay-side
+    # implementation (7 replay methods + `get_privacy` serving + phase
+    # detection, plan Task 10) is a later leg. `reproject.py`'s current
+    # collector list never calls these — `ParticipantsCollector`/
+    # `ProfilesCollector` are not wired into it until that same later leg —
+    # so a stub that fails loudly if ever reached (rather than one that
+    # silently returns an empty result) is the honest placeholder: it keeps
+    # `RawReplayGateway` a structural `Gateway` for pyright without
+    # pretending replay support exists yet.
+    async def get_participants(
+        self, input_channel: dict, filter: dict, offset: int, limit: int, hash_: int = 0
+    ) -> dict:
+        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+
+    async def get_participant(self, input_channel: dict, participant: dict) -> dict | None:
+        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+
+    async def get_users(self, refs: list[dict]) -> list[dict]:
+        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+
+    async def get_full_user(self, ref: dict) -> dict:
+        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+
+    async def get_user_photos(self, ref: dict, *, offset: int, max_id: int, limit: int) -> dict:
+        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+
+    async def download_user_photo(self, photo: dict) -> bytes | None:
+        raise NotImplementedError("profiles replay lands in a later person-layer leg (Task 10)")
+
+    async def get_message_reactions_list(
+        self, input_channel: dict, msg_id: int, *, offset: str | None, limit: int
+    ) -> dict:
+        raise NotImplementedError("participants replay lands in a later person-layer leg (Task 10)")
+
 
 class RawReplayWebClient:
     """Serve stored `tme_page`/`wayback_cdx` captures as `httpx.Response`s,
