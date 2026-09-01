@@ -104,6 +104,7 @@ def test_0004_people_tables_exist(tmp_path):
         }
         for expected in (
             "users", "user_snapshots", "user_photos", "participants", "participant_snapshots",
+            "profile_attempts",
         ):
             assert expected in names, f"missing table {expected}"
 

@@ -462,6 +462,13 @@ def _input_peer_channel(input_channel: dict) -> InputPeerChannel:
     )
 
 
+# The discriminator a REPLAY gateway answers `get_users` with for an id the
+# original run never got an answer for (reproject D4.1's analogue for users):
+# a placeholder the collector counts as `skipped` and never records as an
+# observation. Defined here, on the seam, so `RawReplayGateway.get_users`
+# (Task 10) and `ProfilesCollector` agree on one name.
+REPLAY_UNKNOWN_USER_KIND = "ReplayUnknownUser"
+
 FILTER_RECENT = {"_": "channelParticipantsRecent"}
 FILTER_ADMINS = {"_": "channelParticipantsAdmins"}
 FILTER_BOTS = {"_": "channelParticipantsBots"}
