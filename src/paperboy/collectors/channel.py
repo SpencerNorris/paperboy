@@ -32,13 +32,16 @@ def _redact_self(user: dict) -> dict:
     return {k: v for k, v in user.items() if k not in _SELF_CREDENTIAL_FIELDS}
 
 
-def _pick_channel(chats: list[dict], channel_id: int) -> dict:
+def pick_channel(chats: list[dict], channel_id: int) -> dict:
     """The channel-typed chat in `chats` whose id is `channel_id`.
 
     Never pick by vector position: a linked discussion megagroup serialises as
     `Channel` too, and Telegram promises no ordering — a group listed first
     would silently misattribute the entire collect (issue #23). The
     authoritative id comes from `ResolvedPeer.peer` / `full_chat.id`.
+
+    Public (Task 8): `participants` needs it too for the linked group's own
+    preflight `ChatFull`.
     """
     for chat in chats:
         # Telethon's to_dict() uses the PascalCase class name ("Channel",
@@ -48,6 +51,9 @@ def _pick_channel(chats: list[dict], channel_id: int) -> dict:
     raise ValueError(
         f"no channel-typed chat with id {channel_id} in the response's chats vector"
     )
+
+
+_pick_channel = pick_channel  # back-compat alias
 
 
 def _resolved_channel_id(resolved: dict) -> int:
@@ -98,7 +104,7 @@ class ChannelCollector:
             resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw},
             observed_at=t_resolved,
         )
-        chan = _pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
+        chan = pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
         input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
 
         full = await ctx.gateway.get_full_channel(input_channel)
@@ -121,7 +127,7 @@ class ChannelCollector:
         # Prefer the richer `chat` object returned alongside getFullChannel
         # (may carry admin_rights/creator not present on the resolve() one).
         full_chats = full.get("chats", [])
-        chan_for_channel = _pick_channel(full_chats, full_chat["id"]) if full_chats else chan
+        chan_for_channel = pick_channel(full_chats, full_chat["id"]) if full_chats else chan
 
         channel_id = chan_for_channel["id"]
         channel_uri_ = upsert_channel(

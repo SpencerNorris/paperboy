@@ -36,6 +36,85 @@ _COMMENTED_ON = "commented_on"
 _REPLIED_TO = "replied_to"
 
 
+async def join_or_skip(
+    ctx: CollectContext, phase: str, group_id: int, input_channel: dict
+) -> str | None:
+    """Join a `join_to_send` group under `--join`, or return a skip reason.
+
+    Joining is the one WRITE paperboy makes and the single documented
+    exception to read-only (spec §2, issue #20): it happens ONLY under an
+    explicit `--join`, is routed through the budget/guardrail module (so
+    `PEER_FLOOD` is a `HardStop` that ends the run and is deliberately NOT
+    caught here), and is recorded in `run_events` as an active, non-passive
+    act. A refused join (e.g. an approval-gated group -> `INVITE_REQUEST_SENT`)
+    is a clean skip, distinguishable from "join_to_send set, --join not given".
+
+    Extracted (Task 8) so `participants` can share it: `phase` names the
+    caller (`self.name`) in the `run_events` row and the log line.
+    """
+    if not ctx.settings.allow_join:
+        return (
+            f"discussion group {group_id}: join_to_send is set; "
+            "re-run with --join to join and read it"
+        )
+    try:
+        await ctx.gateway.join_channel(input_channel)
+    except SkipAndRecord as exc:
+        ctx.log.warning(
+            "%s: --join join of group %s was refused: %s", phase, group_id, exc
+        )
+        return f"discussion group {group_id}: --join was given but joining failed"
+    record_run_event(
+        ctx.store, ctx.channel_id, phase, "join",
+        {"group_id": group_id, "method": "channels.joinChannel", "active": True},
+    )
+    ctx.log.warning(
+        "%s: JOINED group %s via --join — an active, non-passive act", phase, group_id
+    )
+    return None
+
+
+def linked_group(ctx: CollectContext) -> tuple[int, dict, bool] | str:
+    """`(group_id, input_channel, needs_join)`, or a `stopped` reason string.
+
+    `needs_join` is True when the group sets `join_to_send` — reading it then
+    requires membership, and the caller will join under `--join` or skip.
+    Every failure here is a clean skip, never an exception: a channel with no
+    discussion group, or one whose access hash is unknown, is normal.
+
+    The reasons are deliberately lexically disjoint — no reason contains
+    another's distinguishing word — because tests assert on them, and an
+    overlapping pair lets a test pass on the wrong branch.
+
+    Extracted (Task 8) so `participants` can share it.
+    """
+    row = ctx.store.conn.execute(
+        "SELECT linked_chat_id FROM channels WHERE id=?", (ctx.channel_id,)
+    ).fetchone()
+    group_id = row["linked_chat_id"] if row else None
+    if not group_id:
+        # `0` is as meaningful as NULL here and must not be treated as a
+        # channel id — falsy, not `is None`.
+        return "no linked discussion group"
+
+    peer = ctx.store.conn.execute(
+        "SELECT access_hash, flags_json FROM peers WHERE uri=?",
+        (channel_uri(group_id),),
+    ).fetchone()
+    if peer is None or not peer["access_hash"]:
+        # A stored `0` is not a usable hash — it yields CHANNEL_INVALID
+        # against live Telegram, a phase error rather than a clean skip.
+        return f"discussion group {group_id}: no access hash known"
+
+    flags = json.loads(peer["flags_json"]) if peer["flags_json"] else {}
+    # Reading is open to anyone *unless* `join_to_send` is set. Honouring it
+    # is what keeps collection passive; `--join` (issue #20) is the explicit
+    # escape hatch, applied by `join_or_skip`.
+    needs_join = bool(flags.get("join_to_send"))
+    input_channel = {"channel_id": group_id, "access_hash": peer["access_hash"]}
+    return group_id, input_channel, needs_join
+
+
 class DiscussionCollector:
     name = "discussion"
 
@@ -60,13 +139,13 @@ class DiscussionCollector:
             ctx.store, ctx.channel_id, ctx.tier
         )
 
-        target = self._linked_group(ctx)
+        target = linked_group(ctx)
         if isinstance(target, str):
             return CollectResult(name=self.name, counts=counts, stopped=target)
         group_id, input_channel, needs_join = target
 
         if needs_join:
-            skip = await self._join_or_skip(ctx, group_id, input_channel)
+            skip = await join_or_skip(ctx, self.name, group_id, input_channel)
             if skip is not None:
                 return CollectResult(name=self.name, counts=counts, stopped=skip)
 
@@ -99,74 +178,14 @@ class DiscussionCollector:
     async def _join_or_skip(
         self, ctx: CollectContext, group_id: int, input_channel: dict
     ) -> str | None:
-        """Join a `join_to_send` group under `--join`, or return a skip reason.
-
-        Joining is the one WRITE paperboy makes and the single documented
-        exception to read-only (spec §2, issue #20): it happens ONLY under an
-        explicit `--join`, is routed through the budget/guardrail module (so
-        `PEER_FLOOD` is a `HardStop` that ends the run and is deliberately NOT
-        caught here), and is recorded in `run_events` as an active, non-passive
-        act. A refused join (e.g. an approval-gated group -> `INVITE_REQUEST_SENT`)
-        is a clean skip, distinguishable from "join_to_send set, --join not given".
-        """
-        if not ctx.settings.allow_join:
-            return (
-                f"discussion group {group_id}: join_to_send is set; "
-                "re-run with --join to join and read it"
-            )
-        try:
-            await ctx.gateway.join_channel(input_channel)
-        except SkipAndRecord as exc:
-            ctx.log.warning(
-                "discussion: --join join of group %s was refused: %s", group_id, exc
-            )
-            return f"discussion group {group_id}: --join was given but joining failed"
-        record_run_event(
-            ctx.store, ctx.channel_id, self.name, "join",
-            {"group_id": group_id, "method": "channels.joinChannel", "active": True},
-        )
-        ctx.log.warning(
-            "discussion: JOINED group %s via --join — an active, non-passive act", group_id
-        )
-        return None
+        """Delegate to the module-level `join_or_skip` (shared with
+        `participants`, Task 8)."""
+        return await join_or_skip(ctx, self.name, group_id, input_channel)
 
     def _linked_group(self, ctx: CollectContext) -> tuple[int, dict, bool] | str:
-        """`(group_id, input_channel, needs_join)`, or a `stopped` reason string.
-
-        `needs_join` is True when the group sets `join_to_send` — reading it then
-        requires membership, and `collect` will join under `--join` or skip.
-        Every failure here is a clean skip, never an exception: a channel with no
-        discussion group, or one whose access hash is unknown, is normal.
-
-        The reasons are deliberately lexically disjoint — no reason contains
-        another's distinguishing word — because tests assert on them, and an
-        overlapping pair lets a test pass on the wrong branch.
-        """
-        row = ctx.store.conn.execute(
-            "SELECT linked_chat_id FROM channels WHERE id=?", (ctx.channel_id,)
-        ).fetchone()
-        group_id = row["linked_chat_id"] if row else None
-        if not group_id:
-            # `0` is as meaningful as NULL here and must not be treated as a
-            # channel id — falsy, not `is None`.
-            return "no linked discussion group"
-
-        peer = ctx.store.conn.execute(
-            "SELECT access_hash, flags_json FROM peers WHERE uri=?",
-            (channel_uri(group_id),),
-        ).fetchone()
-        if peer is None or not peer["access_hash"]:
-            # A stored `0` is not a usable hash — it yields CHANNEL_INVALID
-            # against live Telegram, a phase error rather than a clean skip.
-            return f"discussion group {group_id}: no access hash known"
-
-        flags = json.loads(peer["flags_json"]) if peer["flags_json"] else {}
-        # Reading is open to anyone *unless* `join_to_send` is set. Honouring it
-        # is what keeps collection passive; `--join` (issue #20) is the explicit
-        # escape hatch, applied by `_join_or_skip`.
-        needs_join = bool(flags.get("join_to_send"))
-        input_channel = {"channel_id": group_id, "access_hash": peer["access_hash"]}
-        return group_id, input_channel, needs_join
+        """Delegate to the module-level `linked_group` (shared with
+        `participants`, Task 8)."""
+        return linked_group(ctx)
 
     def _write_thread_edges(
         self, ctx: CollectContext, group_id: int, counts: dict[str, int]

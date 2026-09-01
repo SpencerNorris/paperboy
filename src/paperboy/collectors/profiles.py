@@ -39,7 +39,7 @@ from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import channel_uri, namespaced_kind, user_uri
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
-from paperboy.store.peers import classify_peer, input_user_ref, upsert_peer
+from paperboy.store.peers import input_user_ref, upsert_full_peer
 from paperboy.store.sync import record_profile_attempt, set_state
 from paperboy.store.users import (
     add_user_snapshot,
@@ -266,7 +266,7 @@ class ProfilesCollector:
     ) -> str | None:
         """`users` + `user_snapshots` (+ the full object into `peers`, keeping
         the stub's provenance). `None` for the collecting account."""
-        self._upsert_peer_keeping_provenance(ctx, user, raw_id, observed_at)
+        upsert_full_peer(ctx.store, user, raw_id, observed_at)
         uri = upsert_user(ctx.store, user, raw_id, observed_at, ctx.tier, full_user=full_user)
         if uri is None:
             return None
@@ -276,33 +276,6 @@ class ProfilesCollector:
         if add_user_snapshot(ctx.store, uri, observed_at, ctx.tier, method, bundle, raw_id):
             counts["snapshots"] += 1
         return uri
-
-    @staticmethod
-    def _upsert_peer_keeping_provenance(
-        ctx: CollectContext, obj: dict, raw_id: int, observed_at: str
-    ) -> str | None:
-        """`upsert_peer` for a FULL object returned by a profile RPC. A full
-        observation carrying no provenance of its own would — correctly, by
-        the recency rule — overwrite the stub's `seen_in_chat`/`seen_in_msg`
-        with NULLs, losing the only path back to `inputUserFromMessage`. Pass
-        the stored provenance through instead.
-
-        The URI must be derived exactly the way `upsert_peer` itself derives
-        it — via `classify_peer` — not re-hand-rolled: a `Chat`/`ChatForbidden`/
-        `ChatEmpty` object (a legal member of `users.UserFull.chats`, a
-        `Vector<Chat>`) classifies as `chat`, not `channel`; a hand-rolled
-        `user_uri(...) if kind.startswith("user") else channel_uri(...)`
-        branch reads/writes the wrong peer row for one (round-2 review).
-        """
-        _, uri, _ = classify_peer(obj)
-        row = ctx.store.conn.execute(
-            "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
-        ).fetchone()
-        return upsert_peer(
-            ctx.store, obj, raw_id, observed_at,
-            seen_in_chat=row["seen_in_chat"] if row else None,
-            seen_in_msg=row["seen_in_msg"] if row else None,
-        )
 
     def _record_summary(self, ctx: CollectContext, counts: dict[str, int], *, pass_: str) -> None:
         """The run's convergence summary (spec §7.1). The enrichment POSITION
@@ -472,7 +445,7 @@ class ProfilesCollector:
                         "SELECT 1 FROM peers WHERE uri=?", (channel_uri(chat["id"]),)
                     ).fetchone() is not None:
                         continue
-                    self._upsert_peer_keeping_provenance(ctx, chat, raw_id, observed_at)
+                    upsert_full_peer(ctx.store, chat, raw_id, observed_at)
                 if self._project_user(
                     ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts,
                     full_user=full_user,
