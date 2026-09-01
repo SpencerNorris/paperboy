@@ -14,6 +14,7 @@ from paperboy.config import load_settings
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
 from paperboy.store.messages import upsert_message
+from paperboy.store.participants import ParticipantFacts, write_participant
 from paperboy.store.peers import upsert_peer
 from paperboy.store.sync import get_state, set_state
 from paperboy.targets import parse_target
@@ -279,3 +280,213 @@ async def test_phase_stop_when_channel_context_is_missing(tmp_path):
 def test_applies_to_channel_like_targets():
     assert ProfilesCollector().applies_to(parse_target("@durov"))
     assert not ProfilesCollector().applies_to(parse_target("#osint"))
+
+
+def _full(user_id: int, **full_extra) -> dict:
+    return {
+        "_": "UserFull",
+        "full_user": {
+            "_": "UserFull", "id": user_id, "about": f"bio {user_id}", "common_chats_count": 0,
+            "blocked": None, "profile_photo": None, "fallback_photo": None, **full_extra,
+        },
+        "chats": [], "users": [_user(user_id)],
+    }
+
+
+def _photos(*photo_ids: int) -> dict:
+    return {"_": "Photos", "users": [], "photos": [
+        {"_": "Photo", "id": pid, "access_hash": 1, "file_reference": "AQ==", "date": 1767322445,
+         "dc_id": 2, "sizes": [{"_": "PhotoSize", "type": "x", "w": 640, "h": 640, "size": 1}],
+         "video_sizes": None}
+        for pid in photo_ids
+    ]}
+
+
+def _seed_population(st: Store) -> None:
+    """Five discovered users with distinct priorities: 1 admin, 2 author (posted
+    in the channel), 3 commenter (posted in the group), 4 and 5 others."""
+    _seed_channel(st)
+    for uid in (1, 2, 3, 4, 5):
+        _seed_stub(st, uid, msg=uid)
+    rid = st.add_raw("channels.ChannelParticipants", {}, "stranger", None)
+    facts = ParticipantFacts("tg:user:1", "admin", None, None, None, None)
+    write_participant(st, GROUP_ID, facts, rid, T0)
+    post = {"_": "Message", "id": 900, "message": "post", "date": 1767322445,
+            "from_id": {"_": "PeerUser", "user_id": 2}}
+    post_raw = st.add_raw("Message", post, "stranger", {"channel_id": CHANNEL_ID})
+    upsert_message(st, CHANNEL_ID, post, post_raw, T0, "stranger")
+    comment = {"_": "Message", "id": 901, "message": "comment", "date": 1767322445,
+               "from_id": {"_": "PeerUser", "user_id": 3}}
+    comment_raw = st.add_raw("Message", comment, "stranger", {"channel_id": GROUP_ID})
+    upsert_message(st, GROUP_ID, comment, comment_raw, T0, "stranger")
+
+
+def _enrich_gw(ids=(1, 2, 3, 4, 5), **more) -> FakeGateway:
+    return FakeGateway({
+        "users": {i: _user(i) for i in ids},
+        "full_user": {i: _full(i) for i in ids},
+        **more,
+    })
+
+
+@pytest.mark.asyncio
+async def test_profiles_flag_enriches_in_priority_order_within_budget(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        gw = _enrich_gw()
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=2))
+        )
+        assert gw.full_user_calls == [1, 2]  # admin, then author — budget 2
+        assert gw.user_photos_calls == [1, 2]
+        assert res.counts["enriched"] == 2 and res.counts["triaged"] == 5
+        row = st.conn.execute(
+            "select about, enriched_at from users where uri='tg:user:1'"
+        ).fetchone()
+        assert row["about"] == "bio 1" and row["enriched_at"] is not None
+        user3_enriched = st.conn.execute(
+            "select enriched_at from users where uri='tg:user:3'"
+        ).fetchone()[0]
+        assert user3_enriched is None
+        kinds = [r["kind"] for r in st.conn.execute(
+            "select kind from raw_records "
+            "where json_extract(context_json, '$.user_id')=1 order by id"
+        )]
+        assert kinds == ["User", "users.UserFull", "photos.Photos"]
+        snaps = [s["method"] for s in st.conn.execute(
+            "select method from user_snapshots where uri='tg:user:1' order by id"
+        )]
+        assert snaps == ["users.getUsers", "users.getFullUser"]
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None
+        assert summary["pass"] == "initial"
+        assert summary["fully_enriched"] == 2 and summary["population"] == 5
+
+
+@pytest.mark.asyncio
+async def test_resume_to_convergence_then_refresh_wraps_stalest_first(tmp_path):
+    # Spec §11: budget 2 over 5 people — run 1 enriches [1,2], run 2 [3,4],
+    # run 3 enriches the tail [5] and THEN wraps to refresh the stalest
+    # already-enriched user (1). No head re-enriched before the tail is reached.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=2)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = _enrich_gw()
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
+            seen.append(gw.full_user_calls)
+        assert seen == [[1, 2], [3, 4], [5, 1]]
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["pass"] == "refresh"
+        fully = st.conn.execute(
+            "select count(*) from users where enriched_at is not null"
+        ).fetchone()[0]
+        assert fully == 5
+
+
+@pytest.mark.asyncio
+async def test_refresh_floor_skips_recently_enriched_users(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        first = _enrich_gw()
+        first_settings = _settings(tmp_path, enrich_profiles=True, profile_budget=5)
+        await ProfilesCollector().collect(_ctx(st, first, first_settings))
+        assert first.full_user_calls == [1, 2, 3, 4, 5]
+        second = _enrich_gw()
+        second_settings = _settings(
+            tmp_path, enrich_profiles=True, profile_budget=5, profile_refresh_after=7 * 86400
+        )
+        res = await ProfilesCollector().collect(_ctx(st, second, second_settings))
+        assert second.full_user_calls == []
+        assert res.counts["fresh_skipped"] == 5 and res.counts["refreshed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_photo_history_and_avatar_download_are_content_addressed(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        photo_bytes = {701: b"jpeg-1", 702: b"jpeg-2"}
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701, 702)}, avatar=photo_bytes)
+        photo_settings = _settings(tmp_path, enrich_profiles=True)
+        res = await ProfilesCollector().collect(_ctx(st, gw, photo_settings))
+        assert gw.avatar_calls == [701, 702]
+        assert res.counts["photos"] == 2 and res.counts["avatars"] == 2
+        rows = st.conn.execute(
+            "select photo_id, date, sha256 from user_photos order by photo_id"
+        ).fetchall()
+        assert [r["photo_id"] for r in rows] == [701, 702]
+        assert all(r["sha256"] for r in rows) and rows[0]["date"] == "2026-01-02T02:54:05+00:00"
+        media = st.conn.execute("select kind, message_uri, path, mime_type from media").fetchall()
+        assert {m["kind"] for m in media} == {"avatar"}
+        assert all(m["message_uri"] is None for m in media)
+        media_dir = str(tmp_path / "p" / "media")
+        assert all(m["path"].startswith(media_dir) and m["path"].endswith(".jpg") for m in media)
+        custody = st.conn.execute(
+            "select count(*) from custody_log where source_message_uri is null"
+        ).fetchone()[0]
+        assert custody == 2
+        avatar_raw = st.conn.execute(
+            "select count(*) from raw_records where kind='AvatarDownload'"
+        ).fetchone()[0]
+        assert avatar_raw == 2
+        # a second run re-lists the history but never re-downloads a known photo
+        again = _enrich_gw(ids=(1,), user_photos={1: _photos(701, 702)}, avatar=photo_bytes)
+        await ProfilesCollector().collect(_ctx(st, again, photo_settings))
+        assert again.avatar_calls == []
+        assert st.conn.execute("select count(*) from custody_log").fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_restricted_users_avatars_are_listed_but_not_downloaded(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        restricted = _user(1, restricted=True, restriction_reason=[
+            {"_": "RestrictionReason", "platform": "all", "reason": "porn", "text": "x"}])
+        gw = FakeGateway({"users": {1: restricted},
+                          "full_user": {1: {**_full(1), "users": [restricted]}},
+                          "user_photos": {1: _photos(701)}, "avatar": {701: b"bytes"}})
+        settings = _settings(tmp_path, enrich_profiles=True)
+        res = await ProfilesCollector().collect(_ctx(st, gw, settings))
+        assert gw.avatar_calls == []
+        assert res.counts["photos"] == 1
+        assert res.counts["restricted_skipped"] == 1 and res.counts["avatars"] == 0
+
+
+@pytest.mark.asyncio
+async def test_full_user_skip_is_counted_spends_budget_and_continues(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        gw = _enrich_gw()
+        gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=2))
+        )
+        assert gw.full_user_calls == [1, 2]  # the failed attempt still spent budget
+        assert res.counts["skipped"] == 1 and res.counts["enriched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_full_profile_disambiguates_a_hidden_photo(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = _full(
+            1, fallback_photo={"_": "Photo", "id": 5}, private_forward_name="Anon"
+        )
+        await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, enrich_profiles=True)))
+        states_json = st.conn.execute(
+            "select field_states_json from users where uri='tg:user:1'"
+        ).fetchone()[0]
+        states = json.loads(states_json)
+        assert states["photo"] == {"state": "hidden_from_you", "why": "fallback_photo"}
+        assert states["forwards"] == {"state": "hidden_from_you", "why": "private_forward_name"}
+        fields_json = st.conn.execute(
+            "select fields_json from user_snapshots where method='users.getFullUser'"
+        ).fetchone()[0]
+        bundle = json.loads(fields_json)
+        assert "common_chats_count" not in bundle["full_user"]
+        assert "blocked" not in bundle["full_user"]
