@@ -28,13 +28,22 @@ _FLAG_KEYS = (
 )
 
 
-def _classify(obj: dict) -> tuple[str, str, int]:
+def classify_peer(obj: dict) -> tuple[str, str, int]:
     """Map a TL peer-ish dict's `_` discriminator to (kind, uri, numeric id).
 
     Telethon's `to_dict()` uses the PascalCase class name (`"Channel"`,
     `"ChannelForbidden"`, ...), not the lowercase TL constructor name — this
     lowercases before matching so both that and any hand-authored lowercase
     test fixture work.
+
+    Public (not `_`-prefixed): this is the one place that maps a peer
+    object's discriminator to its URI kind, and `upsert_peer` relies on
+    every caller using it rather than re-deriving the mapping — a
+    hand-rolled `user_uri(...) if kind.startswith("user") else channel_uri(...)`
+    elsewhere silently mis-files any `chat`-tagged object (see
+    `collectors/profiles.py`'s `_upsert_peer_keeping_provenance`, fixed to
+    call this instead after round-2 review caught it reading/writing the
+    wrong peer row for `Chat`/`ChatForbidden`/`ChatEmpty` objects).
     """
     tag = obj["_"].lower()
     id_ = obj["id"]
@@ -61,7 +70,7 @@ def upsert_peer(
     entirely (issue #12; the id lives only in `sync_state('account','self')`).
     Callers that use the return value as an edge endpoint must skip a `None`.
     """
-    kind, uri, id_ = _classify(obj)
+    kind, uri, id_ = classify_peer(obj)
     if is_self(store, uri):
         return None
     is_min = bool(obj.get("min"))

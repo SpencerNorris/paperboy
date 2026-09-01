@@ -101,3 +101,20 @@ CREATE TABLE IF NOT EXISTS participant_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_participant_snapshots_group
     ON participant_snapshots(group_id, observed_at);
+
+-- `profiles` scheduling state: the newest `users.getFullUser` ATTEMPT per
+-- user, whatever its outcome (plan D3 as amended after the Leg 2 review).
+-- `users.enriched_at` moves only when full columns were actually applied, so
+-- it cannot double as the rotation key — a user whose fetch permanently fails
+-- would sit at the head of every run and starve the rest. Written at the one
+-- point where a budget slot is spent (`outcome='attempted'`, before the RPC
+-- answers) and replaced by the arm that finishes the attempt; read by
+-- `ProfilesCollector._enrichment_candidates`. Bookkeeping, not a projection —
+-- excluded from round-trip identity like `sync_state`.
+CREATE TABLE IF NOT EXISTS profile_attempts (
+    uri           TEXT PRIMARY KEY,
+    attempted_at  TEXT NOT NULL,
+    outcome       TEXT NOT NULL
+        CHECK (outcome IN ('attempted', 'enriched', 'skipped', 'malformed', 'not_projected')),
+    detail        TEXT
+);
