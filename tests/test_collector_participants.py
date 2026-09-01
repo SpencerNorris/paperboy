@@ -1131,3 +1131,161 @@ async def test_no_access_hash_reason_names_the_running_phase(tmp_path):
         assert res.stopped is not None
         assert "participants group 77: no access hash known" in res.stopped
         assert "discussion group" not in res.stopped
+
+
+@pytest.mark.asyncio
+async def test_reaction_list_never_clobbers_a_min_reactors_identity(tmp_path):
+    """Round-4 correctness (blocking): the reactor's rich `User` is in the
+    response's own `users` vector; the per-reaction provenance write must use
+    it (or, when provenance is already known, not re-write the peer at all) —
+    never a bare `min` stub that would NULL a `min` peer's username/name/hash
+    under `upsert_peer`'s recency rule."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    rich = _user(31, access_hash=3100, username="thirtyone", premium=True)
+    rlist = {
+        "_": "MessageReactionsList", "count": 2, "chats": [], "next_offset": None,
+        # 31 is present (rich); 32 reacts but is ABSENT from the users vector —
+        # the exact case the old per-reaction `min`-stub write NULLed.
+        "users": [rich],
+        "reactions": [
+            {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": u},
+             "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "x"}}
+            for u in (31, 32)
+        ],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 401, 2, reactions=reacted)
+        # user 32 already has authorship provenance from an earlier message.
+        author32 = {"_": "User", "id": 32, "min": True, "username": "author32", "access_hash": 9999}
+        upsert_peer(
+            st, author32, st.add_raw("User", author32, "stranger", None),
+            "2026-01-01T00:00:00+00:00", seen_in_chat=GROUP_ID, seen_in_msg=200,
+        )
+        gw = _gw([_page(_member(2), count=1)], reactions={GROUP_ID: {401: rlist}})
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        # 31 was new -> filled from the RICH object, not blanked
+        r31 = st.conn.execute(
+            "select username, access_hash, is_min, seen_in_chat, seen_in_msg "
+            "from peers where uri='tg:user:31'"
+        ).fetchone()
+        assert (r31["username"], r31["access_hash"]) == ("thirtyone", 3100)
+        assert (r31["seen_in_chat"], r31["seen_in_msg"]) == (GROUP_ID, 401)
+        # 32 already had provenance -> untouched (fill-only), authorship kept
+        r32 = st.conn.execute(
+            "select username, access_hash, seen_in_msg from peers where uri='tg:user:32'"
+        ).fetchone()
+        assert (r32["username"], r32["access_hash"], r32["seen_in_msg"]) == ("author32", 9999, 200)
+        # both edges still emitted
+        assert st.conn.execute(
+            "select count(*) from edges where predicate='reacted_to'"
+        ).fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_hidden_group_runs_the_oracle_and_reaction_fallback(tmp_path):
+    """Round-4 correctness (blocking): a `participants_hidden` linked group is
+    bulk-walled, but the getParticipant oracle and the reaction-list vector
+    are the designated fallback (spec §5/§6.2, plan D9) — they must run, with
+    ZERO `getParticipants` paging RPC and only ONE walled record."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    rlist = {"_": "MessageReactionsList", "count": 1, "chats": [], "next_offset": None,
+             "users": [_user(31, access_hash=3100)],
+             "reactions": [{"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 31},
+                            "date": 1767322500,
+                            "reaction": {"_": "ReactionEmoji", "emoticon": "x"}}]}
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 401, 21, reactions=reacted)  # author 21 (a candidate), reacted msg
+        gw = _gw(
+            full_channel_by_id={GROUP_ID: _group_full(hidden=True)},
+            participant={GROUP_ID: {21: _answer(21)}},
+            reactions={GROUP_ID: {401: rlist}},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.participants_calls == []  # bulk paging never attempted
+        assert gw.participant_calls == [(GROUP_ID, 21)]  # oracle ran
+        assert res.counts["oracle"] == 1 and res.counts["reaction_lists"] == 1
+        assert st.conn.execute(
+            "select status from participants where uri='tg:user:21'"
+        ).fetchone()[0] == "member"
+        # exactly one RosterWalled for the group (recorded at preflight, not re-recorded)
+        walled = st.conn.execute(
+            "select count(*) from raw_records where kind='RosterWalled' "
+            "and json_extract(payload_json, '$.group_id')=?", (GROUP_ID,)
+        ).fetchone()[0]
+        assert walled == 1
+
+
+@pytest.mark.asyncio
+async def test_already_member_group_is_not_re_joined_across_runs(tmp_path):
+    """Round-4 adversarial (blocking): the join_to_send branch in `collect`
+    must consult membership like `_maybe_join` does, or it re-joins an
+    already-member group with an active audited write every run."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        # linked group is join_to_send; the peer row carries the flag.
+        _seed_channel(st, linked_flags={"join_to_send": True})
+        gw = FakeGateway({
+            "full_channel_by_id": {GROUP_ID: _group_full(left=False)},  # we ARE a member
+            "participants": {GROUP_ID: {"channelParticipantsRecent": [_page(_member(2), count=1)]}},
+            "join": {"_": "Updates", "updates": []},
+        })
+        for _ in range(3):
+            await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        # run 1 joins once (membership unknown); runs 2-3 read left=false and do not
+        assert gw.calls.count("join_channel") == 1
+        joins = st.conn.execute("select count(*) from run_events where kind='join'")
+        assert joins.fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_join_to_send_linked_broadcast_is_never_joined(tmp_path):
+    """Round-4 adversarial (blocking): a join_to_send flag on a linked
+    BROADCAST peer must not trigger a join — it is walled (terminal) instead."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)  # linked peer defaults to megagroup; overwrite it broadcast-only
+        st.conn.execute(
+            "update peers set flags_json=? where uri=?",
+            (json.dumps({"broadcast": True, "join_to_send": True}), "tg:channel:77"),
+        )
+        gw = FakeGateway({
+            "full_channel_by_id": {GROUP_ID: {
+                "_": "ChatFull",
+                "full_chat": {
+                    "_": "channelFull", "id": GROUP_ID, "participants_count": 9, "pts": 1,
+                },
+                "chats": [{"_": "Channel", "id": GROUP_ID, "access_hash": 4242, "title": "B",
+                           "broadcast": True}],
+                "users": [],
+            }},
+            "join": {"_": "Updates", "updates": []},
+        })
+        res = await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 0
+        assert gw.participants_calls == []  # a broadcast is never paged
+        assert res.counts["walled"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_member_without_join_flag_gets_no_join_suggestion(tmp_path):
+    """Round-4 correctness (minor): an already-member roster that comes back
+    short must not tell the operator to `--join` — they are already in."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, kind="megagroup", linked=None, target_flags={"left": False})
+        gw = FakeGateway({
+            "participants": {
+                CHANNEL_ID: {"channelParticipantsRecent": [_page(_member(2), count=9)]},
+            },
+        })
+        res = await ParticipantsCollector().collect(_ctx(st, gw))  # no --join
+        assert res.stopped is None or "--join" not in res.stopped
+        # the shortfall is still recorded in the snapshot row
+        snap = st.conn.execute(
+            "select enumerated, true_count from participant_snapshots "
+            "where group_id=? and uri is null order by id desc limit 1", (CHANNEL_ID,)
+        ).fetchone()
+        assert snap["enumerated"] == 1 and snap["true_count"] == 9
