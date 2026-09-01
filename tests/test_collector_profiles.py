@@ -90,7 +90,7 @@ def _user(user_id: int, **extra) -> dict:
             "restriction_reason": [], "usernames": [], **extra}
 
 
-def _gw(users: dict[int, dict | SkipAndRecord], **more) -> FakeGateway:
+def _gw(users: dict[int, dict | BaseException], **more) -> FakeGateway:
     return FakeGateway({"users": users, **more})
 
 
@@ -226,6 +226,7 @@ async def test_privacy_posture_is_recorded_once_per_run(tmp_path):
     }
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st)
+        st.begin_run()  # the dedup guard keys off Store.run_id — exercise it for real
         gw = _gw({}, privacy={"phone": rules, "lastseen": rules})  # `photo` deliberately missing
         await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path)))
         assert gw.calls.count("get_privacy") == 3
@@ -240,6 +241,20 @@ async def test_privacy_posture_is_recorded_once_per_run(tmp_path):
         ).fetchone()["detail_json"])
         assert posture["phone"] == ["PrivacyValueAllowContacts"]
         assert "unavailable" in posture["photo"]
+
+        # Same run, second collect: the dedup guard must make this a no-op —
+        # no further get_privacy calls, no second run_events/raw_records row.
+        gw2 = _gw({}, privacy={"phone": rules, "lastseen": rules})
+        await ProfilesCollector().collect(_ctx(st, gw2, _settings(tmp_path)))
+        assert gw2.calls.count("get_privacy") == 0
+        events = st.conn.execute(
+            "select count(*) from run_events where kind='privacy_posture'"
+        ).fetchone()[0]
+        assert events == 1
+        raw_count = st.conn.execute(
+            "select count(*) from raw_records where kind like '%PrivacyRules'"
+        ).fetchone()[0]
+        assert raw_count == 2
 
 
 @pytest.mark.asyncio
@@ -453,6 +468,141 @@ async def test_restricted_users_avatars_are_listed_but_not_downloaded(tmp_path):
         assert gw.avatar_calls == []
         assert res.counts["photos"] == 1
         assert res.counts["restricted_skipped"] == 1 and res.counts["avatars"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_users_are_not_double_counted_during_enrichment(tmp_path):
+    # Round-2 review: `_gather` counts every unresolvable peer once; `_enrich`'s
+    # candidate loop reaches the same peers again (nothing between the two
+    # passes changes resolvability) and must not count them a second time.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1, chat=None, msg=None)  # unresolvable: no provenance at all
+        _seed_stub(st, 2)
+        gw = _enrich_gw(ids=(2,))
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=10))
+        )
+        assert res.counts["gathered"] == 2
+        assert res.counts["unresolvable"] == 1
+        assert res.counts["enriched"] == 1
+
+
+@pytest.mark.asyncio
+async def test_full_user_chats_vector_preserves_chat_provenance(tmp_path):
+    # Round-2 review: a `Chat`-tagged object in `users.UserFull.chats` (a
+    # `Vector<Chat>`, so basic groups are as legal a member as channels) was
+    # classified by a hand-rolled `user_uri`/`channel_uri` branch that never
+    # matches `chat*` — filing it under `tg:channel:88` instead of
+    # `tg:chat:88`, missing the real row's stored provenance and (by the
+    # recency rule) nulling it out. Fixed to reuse `classify_peer`, the same
+    # classifier `upsert_peer` uses.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        chat_raw = st.add_raw(
+            "Message", {"_": "Message", "id": 55}, "stranger", {"channel_id": GROUP_ID}
+        )
+        upsert_peer(
+            st, {"_": "Chat", "id": 88, "min": True}, chat_raw, T0,
+            seen_in_chat=GROUP_ID, seen_in_msg=55,
+        )
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {
+            **_full(1), "chats": [{"_": "Chat", "id": 88, "title": "Fan Chat"}],
+        }
+        await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, enrich_profiles=True)))
+        rows = st.conn.execute(
+            "select uri, seen_in_chat, seen_in_msg, is_min, title from peers where id=88"
+        ).fetchall()
+        assert [r["uri"] for r in rows] == ["tg:chat:88"]  # never tg:channel:88
+        assert (rows[0]["seen_in_chat"], rows[0]["seen_in_msg"]) == (GROUP_ID, 55)
+        assert rows[0]["is_min"] == 0 and rows[0]["title"] == "Fan Chat"
+
+
+@pytest.mark.asyncio
+async def test_malformed_full_user_envelope_is_skipped_not_crashed(tmp_path):
+    # Round-2 review: `full_user = full.get("full_user") or {}` then passed to
+    # `upsert_user`, which raises ValueError on any full_user/user id mismatch
+    # — and `{}` always mismatches. A malformed `users.UserFull` envelope must
+    # be counted and skipped like the sibling missing-`user` case, never crash
+    # the run.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {
+            "_": "UserFull", "full_user": None, "users": [_user(1)], "chats": None,
+        }
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True))
+        )
+        assert res.counts["skipped"] == 1 and res.counts["enriched"] == 0
+        assert st.conn.execute(
+            "select enriched_at from users where uri='tg:user:1'"
+        ).fetchone()[0] is None
+        assert st.conn.execute(
+            "select count(*) from raw_records where kind='users.UserFull'"
+        ).fetchone()[0] == 1  # recorded raw, never guessed at
+
+
+@pytest.mark.asyncio
+async def test_avatar_unavailable_is_logged_not_silently_dropped(tmp_path, caplog):
+    # Round-2 review: `download_user_photo` returning `None` (server-side
+    # unavailable, not a raised `SkipAndRecord`) was dropped with no count and
+    # no log line — invisible in both the counts dict and the run log.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={})  # no bytes for 701
+        with caplog.at_level(logging.WARNING):
+            res = await ProfilesCollector().collect(
+                _ctx(st, gw, _settings(tmp_path, enrich_profiles=True))
+            )
+        assert res.counts["photos"] == 1 and res.counts["avatars"] == 0
+        assert any(
+            "avatar" in r.getMessage() and "701" in r.getMessage()
+            and "unavailable" in r.getMessage()
+            for r in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+async def test_phase_stop_during_triage_still_reports_partial_counts(tmp_path):
+    # Correctness review: a PhaseStop escaping `_triage` (FLOOD_WAIT above
+    # threshold on `users.getUsers`) must not surface an empty result for a
+    # run that already gathered/triaged real work.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for i in (1, 2, 3):
+            _seed_stub(st, i, msg=i)
+        gw = _gw({1: _user(1), 2: _user(2), 3: PhaseStop("FLOOD_WAIT_OF_300_SECONDS")})
+        with pytest.raises(PhaseStop) as excinfo:
+            await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path)))
+        assert excinfo.value.counts["gathered"] == 3
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["pass"] == "triage_only"
+
+
+@pytest.mark.asyncio
+async def test_phase_stop_mid_enrichment_preserves_counts_and_summary(tmp_path):
+    # Correctness review: a PhaseStop escaping `_enrich` (FLOOD_WAIT above
+    # threshold on `users.getFullUser`) must carry the enrichment already done
+    # this run, and `_record_summary` must still run — otherwise the operator
+    # reads an empty result and the persisted convergence summary silently
+    # keeps the previous run's figures.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)  # priority order: admin 1, author 2, commenter 3, others 4/5
+        gw = _enrich_gw()
+        gw._fx["full_user"][3] = PhaseStop("FLOOD_WAIT_OF_300_SECONDS")
+        with pytest.raises(PhaseStop) as excinfo:
+            await ProfilesCollector().collect(
+                _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=5))
+            )
+        assert excinfo.value.counts["enriched"] == 2  # 1, 2 landed before the stop
+        assert excinfo.value.counts["triaged"] == 5
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["fully_enriched"] == 2
 
 
 @pytest.mark.asyncio
