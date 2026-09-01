@@ -37,7 +37,7 @@ from paperboy.collectors.discussion import join_or_skip, linked_group
 from paperboy.collectors.posture import record_privacy_posture
 from paperboy.doctor import session_age_days
 from paperboy.gateway import FILTER_ADMINS, FILTER_BOTS, FILTER_RECENT
-from paperboy.ids import iso_or_none, msg_uri, namespaced_kind, peer_ref_uri, peer_stub
+from paperboy.ids import channel_uri, iso_or_none, msg_uri, namespaced_kind, peer_ref_uri, peer_stub
 from paperboy.store.channels import channel_flags, upsert_channel
 from paperboy.store.edges import add_edge_once
 from paperboy.store.events import record_run_event
@@ -58,6 +58,7 @@ from paperboy.store.reactions import (
     backfill_recent_reactions,
     fetched_reaction_lists,
     reacted_message_ids,
+    reaction_resume_offsets,
 )
 from paperboy.store.sync import is_self
 from paperboy.store.users import add_user_snapshot, target_user_facts, upsert_user
@@ -93,19 +94,25 @@ _REASON_BROADCAST = (
 _REASON_HIDDEN = "participants_hidden: roster not viewable"
 
 
-def _roster_wall_reason(flags: dict) -> str | None:
-    """spec §6.1/§6.2: a roster that is structurally never enumerable below
-    admin — a BROADCAST peer's subscriber list (`channelFull.linked_chat_id`
-    is bidirectional: a group's own link points back at its broadcast, not
-    only the broadcast->group direction — research
-    sources/mtproto-channel-messages.md:154), or a group whose owner has
-    hidden participants (`participants_hidden` / `can_view_participants`) —
-    walls with ZERO enumeration RPC. Shared by the target's own roster and
-    the linked group's preflight so both paths agree on one check."""
+def _roster_wall_reason(flags: dict) -> tuple[str, bool] | None:
+    """spec §6.1/§6.2: a roster whose BULK enumeration is walled below admin,
+    as `(reason, terminal)`. `terminal=True` for a BROADCAST peer's
+    subscriber list (`channelFull.linked_chat_id` is bidirectional: a group's
+    own link points back at its broadcast — research
+    sources/mtproto-channel-messages.md:154): the per-user oracle is
+    `CHAT_ADMIN_REQUIRED` there too (spec §13), so there is nothing left to
+    do and no `_Roster` is built. `terminal=False` for a group whose owner
+    hid participants (`participants_hidden` / `can_view_participants` false):
+    ONLY the bulk `getParticipants` sweep is walled — the `getParticipant`
+    oracle and the reaction-list vector are exactly the designated fallback
+    for a hidden-member group (spec §5/§6.2, plan D9, research §1.8), so a
+    `_Roster` IS built (carrying `bulk_walled`) and `_enumerate` runs those
+    vectors without paging. Shared by the target's own roster and the linked
+    group's preflight so both paths agree on one check."""
     if flags.get("broadcast") and not flags.get("megagroup"):
-        return _REASON_BROADCAST
+        return (_REASON_BROADCAST, True)
     if flags.get("participants_hidden") or flags.get("can_view_participants") is False:
-        return _REASON_HIDDEN
+        return (_REASON_HIDDEN, False)
     return None
 
 
@@ -128,6 +135,12 @@ class _Roster:
     # TARGET, from the `channel` phase's own row. `left` is what `--join`
     # reads — `False` means we are already a member and nothing is written.
     flags: dict
+    # Set once `collect` has already joined this group this run (the
+    # `join_to_send` branch): `_maybe_join` must not join it a SECOND time.
+    prejoined: bool = False
+    # The bulk `getParticipants` wall reason for a hidden-member group, if
+    # any: `_enumerate` skips paging and runs the oracle/reaction fallback.
+    bulk_walled: str | None = None
 
 
 class ParticipantsCollector:
@@ -159,7 +172,7 @@ class ParticipantsCollector:
         run_stamp: str = chan["last_seen"]
         target_is_group = chan["kind"] != "broadcast"
         target_flags: dict = {}
-        target_wall: str | None = None
+        target_wall: tuple[str, bool] | None = None
 
         if not target_is_group:
             # §6.2: the broadcast channel's OWN subscriber roster is never
@@ -182,7 +195,7 @@ class ParticipantsCollector:
             target_wall = _roster_wall_reason(target_flags)
             if target_wall is not None:
                 self._record_walled(
-                    ctx, ctx.channel_id, target_wall, chan["participants_count"], run_stamp,
+                    ctx, ctx.channel_id, target_wall[0], chan["participants_count"], run_stamp,
                     counts,
                 )
         linked = linked_group(ctx, self.name)
@@ -231,28 +244,57 @@ class ParticipantsCollector:
             # phase observed — pass it through so `_maybe_join` can see
             # known membership for the TARGET exactly as it does for the
             # linked group, instead of re-joining a group we already know
-            # we are in on every run (round-3 review). The wall itself (if
-            # any) was already recorded above, before the session gate.
+            # we are in on every run (round-3 review).
             rosters.append(_Roster(
                 ctx.channel_id, ctx.input_channel,
                 chan["participants_count"], run_stamp, chan["source_raw_id"], target_flags,
             ))
+        elif target_is_group and target_wall is not None and not target_wall[1]:
+            # A HIDDEN megagroup target: bulk enumeration is walled (recorded
+            # above, before the gate) but the oracle + reaction-list vectors
+            # are the designated fallback — build a roster so `_enumerate`
+            # runs them without paging (round-4 review).
+            rosters.append(_Roster(
+                ctx.channel_id, ctx.input_channel,
+                chan["participants_count"], run_stamp, chan["source_raw_id"], target_flags,
+                bulk_walled=target_wall[0],
+            ))
         if not isinstance(linked, str):
             group_id, input_channel, needs_join = linked
             proceed = True
+            prejoined = False
             if needs_join:
                 # `join_to_send` is honoured the same way `discussion` treats
-                # it for the SAME group (its docstring: reading it then
-                # requires membership) — a roster read is not exempt from
-                # that just because it is not a message read.
-                skip = await join_or_skip(ctx, self.name, group_id, input_channel)
-                if skip is not None:
-                    ctx.log.warning("participants: %s", skip)
-                    stopped.append(skip)
-                    proceed = False
+                # it (reading it then requires membership) — but ONLY when we
+                # are not already a member and the peer is a group, not a
+                # broadcast. This is the same membership check `_maybe_join`
+                # makes for the roster path; without it, this second join
+                # site re-joined an already-member group with an active,
+                # audited `channels.joinChannel` on every run (round-4
+                # review). Membership is read from `channels.flags_json`,
+                # written by a PRIOR run's preflight — unknown on the first
+                # run, so we join once, then never again.
+                stored = self._stored_group_flags(ctx, group_id)
+                if stored.get("broadcast") and not stored.get("megagroup"):
+                    # A `join_to_send` flag on a BROADCAST linked peer: never
+                    # join it — the preflight below walls it (terminal) with
+                    # zero further RPC.
+                    ctx.log.info(
+                        "participants: linked peer %s is a broadcast — not joining", group_id
+                    )
+                elif self._already_member(ctx, group_id):
+                    prejoined = True  # a prior run's preflight recorded left=false
+                else:
+                    skip = await join_or_skip(ctx, self.name, group_id, input_channel)
+                    if skip is not None:
+                        ctx.log.warning("participants: %s", skip)
+                        stopped.append(skip)
+                        proceed = False
+                    else:
+                        prejoined = True
             if proceed:
                 roster = await self._preflight_group(
-                    ctx, group_id, input_channel, run_stamp, counts,
+                    ctx, group_id, input_channel, run_stamp, counts, prejoined=prejoined,
                 )
                 if roster is not None:
                     rosters.append(roster)
@@ -276,9 +318,31 @@ class ParticipantsCollector:
 
     # ---- preflight + gate --------------------------------------------------------
 
+    @staticmethod
+    def _stored_group_flags(ctx: CollectContext, group_id: int) -> dict:
+        """The linked group's stored boolean flags from `peers` (the `channel`
+        phase's row) — used BEFORE preflight to refuse joining a broadcast
+        peer. `left` is not among `peers._FLAG_KEYS`, so membership is read
+        from `channels` (`_already_member`), not here."""
+        row = ctx.store.conn.execute(
+            "SELECT flags_json FROM peers WHERE uri=?", (channel_uri(group_id),)
+        ).fetchone()
+        return json.loads(row["flags_json"]) if row and row["flags_json"] else {}
+
+    @staticmethod
+    def _already_member(ctx: CollectContext, group_id: int) -> bool:
+        """True when a PRIOR run's preflight recorded this group in `channels`
+        with `left=false`. Unknown (absent) on the first run, so the first
+        `--join`/`join_to_send` join happens once and no run repeats it."""
+        row = ctx.store.conn.execute(
+            "SELECT flags_json FROM channels WHERE id=?", (group_id,)
+        ).fetchone()
+        flags = json.loads(row["flags_json"]) if row and row["flags_json"] else {}
+        return flags.get("left") is False
+
     async def _preflight_group(
         self, ctx: CollectContext, group_id: int, input_channel: dict, run_stamp: str,
-        counts: dict[str, int],
+        counts: dict[str, int], *, prejoined: bool = False,
     ) -> _Roster | None:
         """§6.1: `can_view_participants` / `participants_hidden` live on the
         GROUP's channelFull, which no phase has fetched before — a hidden
@@ -308,6 +372,10 @@ class ParticipantsCollector:
                 group_id, full_chat.get("id"),
             )
             counts["skipped"] += 1
+            record_run_event(
+                ctx.store, ctx.channel_id, self.name, "preflight_mismatch",
+                {"group_id": group_id, "answered_id": full_chat.get("id")},
+            )
             return None
         chats = full.get("chats") or []
         try:
@@ -348,13 +416,21 @@ class ParticipantsCollector:
         flags = channel_flags(full_chat, chan)
         wall = _roster_wall_reason(flags)
         if wall is not None:
+            reason, terminal = wall
             self._record_walled(
-                ctx, group_id, wall, full_chat.get("participants_count"), observed_at, counts,
+                ctx, group_id, reason, full_chat.get("participants_count"), observed_at, counts,
             )
-            return None
+            if terminal:
+                return None  # a broadcast peer: the oracle is walled too
+            # A hidden-member group: bulk paging is walled, but the oracle +
+            # reaction-list fallback still run — carry the wall to `_enumerate`.
+            return _Roster(
+                group_id, input_channel, full_chat.get("participants_count"), observed_at,
+                raw_id, flags, prejoined=prejoined, bulk_walled=reason,
+            )
         return _Roster(
             group_id, input_channel, full_chat.get("participants_count"), observed_at, raw_id,
-            flags,
+            flags, prejoined=prejoined,
         )
 
     async def _session_gate(self, ctx: CollectContext) -> str | None:
@@ -431,6 +507,16 @@ class ParticipantsCollector:
         every roster `_enumerate` is called for."""
         group_id = roster.group_id
         counts["rosters"] += 1
+        if roster.bulk_walled is not None:
+            # Bulk enumeration is walled (participants_hidden) and already
+            # recorded at preflight/collect — do NOT re-record it. The oracle
+            # and the reaction-list vector are the designated fallback for a
+            # hidden-member group (spec §5/§6.2, plan D9): run them, page
+            # nothing. `--join` cannot un-hide members for a non-admin, so
+            # there is no shortfall escalation to emit.
+            await self._oracle(ctx, roster, set(), counts, budgets)
+            await self._reactions(ctx, roster, counts, budgets)
+            return None
         joined = await self._maybe_join(ctx, roster)
         enumerated: set[str] = set()
         self_seen = False
@@ -497,7 +583,13 @@ class ParticipantsCollector:
         # `roster_enumerated` above, which stays roster-page-only (spec
         # §6.3: an accounting row for the roster RPC alone).
         counts["enumerated"] += len(enumerated)
-        if not partial or joined:
+        # `joined` is True only under `--join`; a member reached without the
+        # flag (`flags.left is False`, or a `prejoined` join_to_send join)
+        # is equally past the point of a `--join` suggestion. Suppress the
+        # escalation for any member — the `add_roster_snapshot` shortfall row
+        # above still records the gap (round-4 review).
+        member = joined or roster.prejoined or roster.flags.get("left") is False
+        if not partial or member:
             return None
         warning = JOIN_SHORTFALL_WARNING.format(
             enumerated=roster_enumerated, total=true_count if true_count is not None else "?",
@@ -516,6 +608,8 @@ class ParticipantsCollector:
         true, or membership unknown) through the shared audited path; a
         refused join falls back to the un-joined branch. Never without the
         flag (plan D11)."""
+        if roster.prejoined:
+            return True  # `collect` already joined this group this run
         if not ctx.settings.allow_join:
             return False
         if roster.flags.get("left") is False:
@@ -674,9 +768,14 @@ class ParticipantsCollector:
                 answer = await ctx.gateway.get_participant(roster.input_channel, ref)
             except SkipAndRecord as exc:
                 # CHAT_ADMIN_REQUIRED here is the wall itself, not a per-user
-                # condition — stop asking this group.
+                # condition — stop asking this group, and record it (every
+                # other wall in this module is a stored fact, round-4 review).
                 ctx.log.warning("participants: oracle walled on group %s: %s", group_id, exc)
                 counts["skipped"] += 1
+                record_run_event(
+                    ctx.store, ctx.channel_id, self.name, "oracle_walled",
+                    {"group_id": group_id, "reason": str(exc)},
+                )
                 return
             counts["oracle"] += 1
             if answer is None:
@@ -726,10 +825,15 @@ class ParticipantsCollector:
             return
         group_id = roster.group_id
         done = fetched_reaction_lists(ctx.store, group_id)
+        resume = reaction_resume_offsets(ctx.store, group_id)
         candidates = [m for m in reacted_message_ids(ctx.store, group_id) if m not in done][:budget]
         for msg_id in candidates:
             budgets["reactions"] -= 1
-            offset: str | None = None
+            # Resume from the last recorded page of a list truncated by the
+            # page cap, rather than restarting at page 1 — so a >cap-reactor
+            # list CONVERGES over runs instead of re-walking the same head
+            # forever (round-4 review). A fresh message has no resume offset.
+            offset: str | None = resume.get(msg_id)
             for _ in range(_REACTIONS_MAX_PAGES):
                 try:
                     result = await ctx.gateway.get_message_reactions_list(
@@ -749,6 +853,15 @@ class ParticipantsCollector:
                 )
                 counts["reaction_lists"] += 1
                 self._project_users_vector(ctx, result, raw_id, stamp, counts, METHOD_REACTIONS)
+                # The reactor's rich `User` is in the response's own `users`
+                # vector (already projected by `_project_users_vector` above);
+                # index it so the provenance write below is never a bare,
+                # information-losing `min` stub that would NULL a `min` peer's
+                # identity under `upsert_peer`'s recency rule (round-4 review).
+                by_id = {
+                    u["id"]: u for u in (result.get("users") or []) + (result.get("chats") or [])
+                    if isinstance(u.get("id"), int)
+                }
                 for reaction in result.get("reactions") or []:
                     subject = peer_ref_uri(reaction.get("peer_id"))
                     stub = peer_stub(reaction.get("peer_id"))
@@ -757,21 +870,29 @@ class ParticipantsCollector:
                     # Fill-only provenance, mirroring the zero-RPC vector's
                     # own rule (store/reactions.py): a reaction is not a
                     # documented `inputPeerFromMessage` context (research
-                    # §8.7 lists author, forward header and mention), so it
-                    # must never replace stronger provenance a message
-                    # authorship already recorded for this same peer.
+                    # §8.7 lists author, forward header and mention). When a
+                    # peer already carries provenance, do NOT re-upsert it —
+                    # a re-write can only lose data — just guard `#12` and
+                    # emit the edge. When it does not, fill it from the
+                    # response's rich object (falling back to the stub only
+                    # if the reactor is in neither vector).
                     known = ctx.store.conn.execute(
                         "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (subject,)
                     ).fetchone()
-                    known_chat = known["seen_in_chat"] if known is not None else None
-                    known_msg = known["seen_in_msg"] if known is not None else None
-                    fill = known_chat is None or known_msg is None
-                    if upsert_peer(
-                        ctx.store, stub, raw_id, stamp,
-                        seen_in_chat=group_id if fill else known_chat,
-                        seen_in_msg=msg_id if fill else known_msg,
-                    ) is None:
-                        continue  # the collecting account reacted (#12)
+                    fill = (
+                        known is None
+                        or known["seen_in_chat"] is None
+                        or known["seen_in_msg"] is None
+                    )
+                    if fill:
+                        rich = by_id.get(stub["id"], stub)
+                        if upsert_peer(
+                            ctx.store, rich, raw_id, stamp,
+                            seen_in_chat=group_id, seen_in_msg=msg_id,
+                        ) is None:
+                            continue  # the collecting account reacted (#12)
+                    elif is_self(ctx.store, subject):
+                        continue
                     if add_edge_once(
                         ctx.store, subject, REACTED_TO, msg_uri(group_id, msg_id), stamp, ctx.tier,
                         raw_id,
