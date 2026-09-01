@@ -36,7 +36,7 @@ from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.posture import record_privacy_posture
 from paperboy.config import profile_dir
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
-from paperboy.ids import namespaced_kind
+from paperboy.ids import channel_uri, namespaced_kind, user_uri
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
 from paperboy.store.peers import classify_peer, input_user_ref, upsert_peer
@@ -84,7 +84,7 @@ class ProfilesCollector:
         counts = {
             "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "triaged": 0, "empty": 0,
             "skipped": 0, "snapshots": 0, "enriched": 0, "refreshed": 0, "fresh_skipped": 0,
-            "photos": 0, "avatars": 0, "restricted_skipped": 0, "unavailable": 0,
+            "photos": 0, "photos_empty": 0, "avatars": 0, "restricted_skipped": 0, "unavailable": 0,
         }
 
         # A `PhaseStop` (FLOOD_WAIT above threshold, or a second consecutive
@@ -171,9 +171,11 @@ class ProfilesCollector:
     async def _triage(
         self, ctx: CollectContext, refs: list[tuple[str, dict]], counts: dict[str, int]
     ) -> set[str]:
-        """Returns the URIs this run's triage proved unusable (bisected down
-        to a lone `SkipAndRecord`) — `_enrich` must not re-spend budget on the
-        same stale provenance within the same run (round-3 review)."""
+        """Returns the URIs this run's triage proved unusable — bisected down
+        to a lone `SkipAndRecord` (stale provenance), or answered `UserEmpty`
+        (Telegram's definitive "this id is not visible to you") — so `_enrich`
+        never spends a `getFullUser` slot on a foregone conclusion within the
+        same run (round-3 and round-6 reviews)."""
         skipped_uris: set[str] = set()
         for start in range(0, len(refs), _GET_USERS_BATCH):
             batch = refs[start:start + _GET_USERS_BATCH]
@@ -206,9 +208,11 @@ class ProfilesCollector:
             await self._triage_batch(ctx, batch[mid:], counts, skipped_uris)
             return
         for user in users:
-            self._project_triaged(ctx, user, counts)
+            self._project_triaged(ctx, user, counts, skipped_uris)
 
-    def _project_triaged(self, ctx: CollectContext, user: dict, counts: dict[str, int]) -> None:
+    def _project_triaged(
+        self, ctx: CollectContext, user: dict, counts: dict[str, int], unusable_uris: set[str]
+    ) -> None:
         kind = (user.get("_") or "").lower()
         if kind not in ("user", "userempty"):
             # A non-success that must still be accounted for: in a triage-only
@@ -244,6 +248,7 @@ class ProfilesCollector:
         )
         if kind == "userempty":
             counts["empty"] += 1
+            unusable_uris.add(user_uri(user["id"]))
             return
         if self._project_user(ctx, user, raw_id, observed_at, METHOD_GET_USERS, counts) is not None:
             counts["triaged"] += 1
@@ -301,9 +306,12 @@ class ProfilesCollector:
 
     def _record_summary(self, ctx: CollectContext, counts: dict[str, int], *, pass_: str) -> None:
         """The run's convergence summary (spec §7.1). The enrichment POSITION
-        is derived from `users.enriched_at`, not stored here — an interrupted
-        run has enriched exactly those it wrote, so there is no cursor to
-        corrupt (plan D3)."""
+        is not stored here — it is the `profile_attempts` rotation key (plan
+        D3 as amended), so an interrupted run has attempted exactly what it
+        recorded and there is no cursor to corrupt. `pass` is `triage_only`
+        (no `--profiles`), `initial` while any usable candidate has never
+        been attempted, or `refresh` once the first pass over the population
+        is complete — from then on every slot re-fetches someone."""
         population = ctx.store.conn.execute(
             "SELECT count(*) FROM peers WHERE kind='user'"
         ).fetchone()[0]
@@ -317,6 +325,27 @@ class ProfilesCollector:
         })
 
     # ---- full enrichment (--profiles) -----------------------------------------
+
+    @staticmethod
+    def _pass_label(
+        ctx: CollectContext,
+        candidates: list[tuple[str, int, str | None, str | None]],
+        unusable_uris: set[str],
+        attempted_now: set[str],
+    ) -> str:
+        """`initial` while a USABLE candidate (resolvable, not proved unusable
+        by this run's triage) is still never-attempted; `refresh` otherwise —
+        the population's first pass is complete. Defined on the attempt key,
+        not on `enriched_at`: a permanently failing user has still been tried."""
+        for uri, _, _, attempted_at in candidates:
+            if (
+                attempted_at is None
+                and uri not in unusable_uris
+                and uri not in attempted_now
+                and input_user_ref(ctx.store, uri) is not None
+            ):
+                return "initial"
+        return "refresh"
 
     async def _enrich(
         self, ctx: CollectContext, counts: dict[str, int], triage_skipped_uris: set[str]
@@ -343,18 +372,20 @@ class ProfilesCollector:
         floor = ctx.settings.profile_refresh_after
         now = ctx.clock.now()
         spent = 0
-        pass_ = "initial"
+        candidates = self._enrichment_candidates(ctx)
+        attempted_now: set[str] = set()
         try:
-            for uri, user_id, enriched_at in self._enrichment_candidates(ctx):
+            for uri, user_id, enriched_at, _attempted_at in candidates:
                 if spent >= budget:
                     break
                 if uri in triage_skipped_uris:
                     continue
-                if enriched_at is not None:
-                    pass_ = "refresh"
-                    if floor is not None and _seconds_between(enriched_at, now) < floor:
-                        counts["fresh_skipped"] += 1
-                        continue
+                if (
+                    enriched_at is not None and floor is not None
+                    and _seconds_between(enriched_at, now) < floor
+                ):
+                    counts["fresh_skipped"] += 1
+                    continue
                 ref = input_user_ref(ctx.store, uri)
                 if ref is None:
                     # Already counted once in `_gather` — every `kind='user'`
@@ -371,6 +402,7 @@ class ProfilesCollector:
                 # an observation): monotonic within a run live and on replay,
                 # where a payload's own stamp could be far older.
                 record_profile_attempt(ctx.store, uri, ctx.clock.now(), "attempted")
+                attempted_now.add(uri)
                 try:
                     full = await ctx.gateway.get_full_user(ref)
                 except SkipAndRecord as exc:
@@ -419,12 +451,20 @@ class ProfilesCollector:
                 for chat in full.get("chats") or []:
                     # e.g. the personal channel (`personal_channel_id`): a
                     # full Channel object — a real pivot, worth a peer row.
-                    # `Vector<Chat>`'s union also legally carries `ChatEmpty`/
-                    # `ChatForbidden` (id + title only, no `access_hash`, no
-                    # `min`) — a full observation with no richness would
-                    # overwrite a known peer's identity columns with NULLs
-                    # under `upsert_peer`'s recency rule; skip them.
-                    if (chat.get("_") or "").lower().endswith(("empty", "forbidden")):
+                    # `Vector<Chat>`'s union also legally carries `chatEmpty`
+                    # (id only) and `chatForbidden` (id + title) — nothing to
+                    # project, and a full observation with no richness would
+                    # NULL a known peer's identity under `upsert_peer`'s
+                    # recency rule — and `channelForbidden`, which DOES carry
+                    # id + access_hash + title (a channel we are banned from):
+                    # worth a row when the channel is new to us, fill-only
+                    # otherwise (it has no `username` to offer).
+                    chat_kind = (chat.get("_") or "").lower()
+                    if chat_kind in ("chatempty", "chatforbidden"):
+                        continue
+                    if chat_kind == "channelforbidden" and ctx.store.conn.execute(
+                        "SELECT 1 FROM peers WHERE uri=?", (channel_uri(chat["id"]),)
+                    ).fetchone() is not None:
                         continue
                     self._upsert_peer_keeping_provenance(ctx, chat, raw_id, observed_at)
                 if self._project_user(
@@ -437,16 +477,24 @@ class ProfilesCollector:
                 record_profile_attempt(ctx.store, uri, ctx.clock.now(), "enriched")
                 await self._photos(ctx, uri, user_id, ref, counts)
         except PhaseStop as stop:
-            self._record_summary(ctx, counts, pass_=pass_)
+            self._record_summary(
+                ctx, counts,
+                pass_=self._pass_label(ctx, candidates, triage_skipped_uris, attempted_now),
+            )
             raise PhaseStop(*stop.args, counts=counts) from stop
         if spent >= budget:
             ctx.log.info(
                 "profiles: getFullUser budget (%d) spent this run; re-run to keep converging",
                 budget,
             )
-        self._record_summary(ctx, counts, pass_=pass_)
+        self._record_summary(
+                ctx, counts,
+                pass_=self._pass_label(ctx, candidates, triage_skipped_uris, attempted_now),
+            )
 
-    def _enrichment_candidates(self, ctx: CollectContext) -> list[tuple[str, int, str | None]]:
+    def _enrichment_candidates(
+        self, ctx: CollectContext
+    ) -> list[tuple[str, int, str | None, str | None]]:
         """Every discovered user, in spend order (spec §7/§7.1), keyed on the
         ROTATION key `profile_attempts.attempted_at` (plan D3 as amended) —
         `users.enriched_at` plays no part in the ORDER: it moves only on
@@ -475,6 +523,7 @@ class ProfilesCollector:
         rows = ctx.store.conn.execute(
             """
             SELECT p.uri AS uri, p.id AS id, u.enriched_at AS enriched_at,
+              a.attempted_at AS attempted_at,
               CASE
                 WHEN EXISTS (SELECT 1 FROM participants pa WHERE pa.uri = p.uri
                              AND pa.status IN ('admin', 'creator')
@@ -496,7 +545,7 @@ class ProfilesCollector:
             """,
             (ctx.channel_id, group_id, group_id, ctx.channel_id, group_id, group_id),
         ).fetchall()
-        return [(r["uri"], r["id"], r["enriched_at"]) for r in rows]
+        return [(r["uri"], r["id"], r["enriched_at"], r["attempted_at"]) for r in rows]
 
     async def _photos(
         self, ctx: CollectContext, uri: str, user_id: int, ref: dict, counts: dict[str, int]
@@ -524,7 +573,8 @@ class ProfilesCollector:
         media_root = profile_dir(ctx.settings, ctx.profile) / "media"
         for photo in photos.get("photos") or []:
             if (photo.get("_") or "").lower() != "photo":
-                continue  # PhotoEmpty
+                counts["photos_empty"] += 1  # `photoEmpty`: counted, never a row
+                continue
             upsert_user_photo(ctx.store, uri, photo, observed_at, raw_id)
             counts["photos"] += 1
             if restricted:
