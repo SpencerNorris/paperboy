@@ -50,11 +50,14 @@ async def join_or_skip(
     is a clean skip, distinguishable from "join_to_send set, --join not given".
 
     Extracted (Task 8) so `participants` can share it: `phase` names the
-    caller (`self.name`) in the `run_events` row and the log line.
+    caller (`self.name`) in the `run_events` row, the log line, AND the
+    returned reason string — a reason is a `stopped`/warning message the
+    OPERATOR reads, so it must name the phase that is actually running, not
+    hard-code "discussion" for every caller.
     """
     if not ctx.settings.allow_join:
         return (
-            f"discussion group {group_id}: join_to_send is set; "
+            f"{phase} group {group_id}: join_to_send is set; "
             "re-run with --join to join and read it"
         )
     try:
@@ -63,7 +66,7 @@ async def join_or_skip(
         ctx.log.warning(
             "%s: --join join of group %s was refused: %s", phase, group_id, exc
         )
-        return f"discussion group {group_id}: --join was given but joining failed"
+        return f"{phase} group {group_id}: --join was given but joining failed"
     record_run_event(
         ctx.store, ctx.channel_id, phase, "join",
         {"group_id": group_id, "method": "channels.joinChannel", "active": True},
