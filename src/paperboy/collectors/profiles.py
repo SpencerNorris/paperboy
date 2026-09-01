@@ -35,10 +35,10 @@ from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.posture import record_privacy_posture
 from paperboy.config import profile_dir
-from paperboy.ids import channel_uri, namespaced_kind, user_uri
+from paperboy.ids import namespaced_kind
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
-from paperboy.store.peers import input_user_ref, upsert_peer
+from paperboy.store.peers import classify_peer, input_user_ref, upsert_peer
 from paperboy.store.sync import set_state
 from paperboy.store.users import (
     add_user_snapshot,
@@ -89,28 +89,44 @@ class ProfilesCollector:
             counts["backfilled_peers"] += backfill_message_referenced_peers(ctx.store, channel_id)
         await record_privacy_posture(ctx, self.name)
 
-        refs = self._gather(ctx, counts)
-        await self._triage(ctx, refs, counts)
+        # A `PhaseStop` (FLOOD_WAIT above threshold, or a second consecutive
+        # one) can escape `_triage` or `_enrich` — `budget.Budget.call` raises
+        # it directly, with no `counts`, and only `_enrich` attaches its own
+        # (below) before re-raising. Either way the work already stored here
+        # must still be reported and summarised — `PhaseStop`'s contract
+        # (budget.py) — mirroring `DiscussionCollector.collect`.
+        try:
+            refs = self._gather(ctx, counts)
+            await self._triage(ctx, refs, counts)
 
-        if not ctx.settings.enrich_profiles:
-            budget = ctx.settings.profile_budget
-            ctx.log.warning(
-                ENRICHMENT_OFF_WARNING.format(
-                    n=counts["triaged"], budget=budget, minutes=round(budget / 60)
+            if not ctx.settings.enrich_profiles:
+                budget = ctx.settings.profile_budget
+                ctx.log.warning(
+                    ENRICHMENT_OFF_WARNING.format(
+                        n=counts["triaged"], budget=budget, minutes=round(budget / 60)
+                    )
                 )
-            )
-            record_run_event(
-                ctx.store, ctx.channel_id, self.name, "warning",
-                {
-                    "code": "profiles_enrichment_off",
-                    "triaged": counts["triaged"],
-                    "hint": "--profiles",
-                },
-            )
-            self._record_summary(ctx, counts, pass_="triage_only")
-            return CollectResult(name=self.name, counts=counts)
+                record_run_event(
+                    ctx.store, ctx.channel_id, self.name, "warning",
+                    {
+                        "code": "profiles_enrichment_off",
+                        "triaged": counts["triaged"],
+                        "hint": "--profiles",
+                    },
+                )
+                self._record_summary(ctx, counts, pass_="triage_only")
+                return CollectResult(name=self.name, counts=counts)
 
-        await self._enrich(ctx, counts)
+            await self._enrich(ctx, counts)
+        except PhaseStop as stop:
+            if not stop.counts:
+                # Raised below `_enrich`'s own wrap (i.e. from `_gather`/
+                # `_triage`, or straight out of `budget.Budget.call`) — it
+                # carries no counts of its own, so this is the only chance to
+                # attach what triage actually did before it escapes.
+                self._record_summary(ctx, counts, pass_="triage_only")
+                raise PhaseStop(*stop.args, counts=counts) from stop
+            raise
         return CollectResult(name=self.name, counts=counts)
 
     # ---- zero-RPC preamble ---------------------------------------------------
@@ -222,9 +238,16 @@ class ProfilesCollector:
         observation carrying no provenance of its own would — correctly, by
         the recency rule — overwrite the stub's `seen_in_chat`/`seen_in_msg`
         with NULLs, losing the only path back to `inputUserFromMessage`. Pass
-        the stored provenance through instead."""
-        kind = (obj.get("_") or "").lower()
-        uri = user_uri(obj["id"]) if kind.startswith("user") else channel_uri(obj["id"])
+        the stored provenance through instead.
+
+        The URI must be derived exactly the way `upsert_peer` itself derives
+        it — via `classify_peer` — not re-hand-rolled: a `Chat`/`ChatForbidden`/
+        `ChatEmpty` object (a legal member of `users.UserFull.chats`, a
+        `Vector<Chat>`) classifies as `chat`, not `channel`; a hand-rolled
+        `user_uri(...) if kind.startswith("user") else channel_uri(...)`
+        branch reads/writes the wrong peer row for one (round-2 review).
+        """
+        _, uri, _ = classify_peer(obj)
         row = ctx.store.conn.execute(
             "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (uri,)
         ).fetchone()
@@ -256,55 +279,84 @@ class ProfilesCollector:
     async def _enrich(self, ctx: CollectContext, counts: dict[str, int]) -> None:
         """Spend `profile_budget` `getFullUser` fetches on the highest-priority
         never-enriched users, then wrap to refreshing the stalest (spec §7.1).
-        A failed attempt still spends budget: the RPC was made."""
+        A failed attempt still spends budget: the RPC was made.
+
+        The whole loop is wrapped so a `PhaseStop` escaping mid-enrichment
+        (a `FLOOD_WAIT` above threshold, from `get_full_user`/`get_user_photos`/
+        `download_user_photo` — all reached from inside this loop) still
+        records the convergence summary and carries the counts collected so
+        far, rather than surfacing an empty result for a run that did real
+        work (`budget.PhaseStop`'s documented contract; mirrors
+        `DiscussionCollector.collect`'s `HistoryCollector` wrap).
+        """
         budget = ctx.settings.profile_budget
         floor = ctx.settings.profile_refresh_after
         now = ctx.clock.now()
         spent = 0
         pass_ = "initial"
-        for uri, user_id, enriched_at in self._enrichment_candidates(ctx):
-            if spent >= budget:
-                break
-            if enriched_at is not None:
-                pass_ = "refresh"
-                if floor is not None and _seconds_between(enriched_at, now) < floor:
-                    counts["fresh_skipped"] += 1
+        try:
+            for uri, user_id, enriched_at in self._enrichment_candidates(ctx):
+                if spent >= budget:
+                    break
+                if enriched_at is not None:
+                    pass_ = "refresh"
+                    if floor is not None and _seconds_between(enriched_at, now) < floor:
+                        counts["fresh_skipped"] += 1
+                        continue
+                ref = input_user_ref(ctx.store, uri)
+                if ref is None:
+                    # Already counted once in `_gather` — every `kind='user'`
+                    # peer passes through both, and nothing between the two
+                    # calls changes resolvability, so counting it again here
+                    # would inflate the population figure past `gathered`.
                     continue
-            ref = input_user_ref(ctx.store, uri)
-            if ref is None:
-                counts["unresolvable"] += 1
-                continue
-            spent += 1
-            try:
-                full = await ctx.gateway.get_full_user(ref)
-            except SkipAndRecord as exc:
-                ctx.log.warning("profiles: full profile skipped for %s: %s", uri, exc)
-                counts["skipped"] += 1
-                continue
-            observed_at = ctx.clock.for_payload(full)
-            raw_id = ctx.store.add_raw(
-                namespaced_kind("users", full, "UserFull"), full, ctx.tier,
-                {"channel_id": ctx.channel_id, "user_id": user_id, "method": METHOD_GET_FULL_USER},
-                observed_at=observed_at,
-            )
-            full_user = full.get("full_user") or {}
-            user = next((u for u in full.get("users", []) if u.get("id") == user_id), None)
-            if user is None:
-                # `users.UserFull` always carries the target in `users`
-                # (research Part 2 §1); a response without it is recorded raw
-                # but not projectable — counted, never guessed at.
-                counts["skipped"] += 1
-                continue
-            for chat in full.get("chats", []):
-                # e.g. the personal channel (`personal_channel_id`): a full
-                # Channel object — a real pivot, worth a peer row.
-                self._upsert_peer_keeping_provenance(ctx, chat, raw_id, observed_at)
-            if self._project_user(
-                ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts, full_user=full_user
-            ) is None:
-                continue
-            counts["refreshed" if enriched_at is not None else "enriched"] += 1
-            await self._photos(ctx, uri, user_id, ref, counts)
+                spent += 1
+                try:
+                    full = await ctx.gateway.get_full_user(ref)
+                except SkipAndRecord as exc:
+                    ctx.log.warning("profiles: full profile skipped for %s: %s", uri, exc)
+                    counts["skipped"] += 1
+                    continue
+                observed_at = ctx.clock.for_payload(full)
+                raw_id = ctx.store.add_raw(
+                    namespaced_kind("users", full, "UserFull"), full, ctx.tier,
+                    {
+                        "channel_id": ctx.channel_id, "user_id": user_id,
+                        "method": METHOD_GET_FULL_USER,
+                    },
+                    observed_at=observed_at,
+                )
+                full_user = full.get("full_user") or {}
+                user = next(
+                    (u for u in (full.get("users") or []) if u.get("id") == user_id), None
+                )
+                if user is None:
+                    # `users.UserFull` always carries the target in `users`
+                    # (research Part 2 §1); a response without it is recorded
+                    # raw but not projectable — counted, never guessed at.
+                    counts["skipped"] += 1
+                    continue
+                if not full_user or full_user.get("id") != user["id"]:
+                    # `upsert_user` raises on a mismatched/absent `full_user`
+                    # (store/users.py) — a malformed envelope is symmetric
+                    # with the missing-`user` case above: recorded raw,
+                    # counted, never guessed at, never a crashed run.
+                    counts["skipped"] += 1
+                    continue
+                for chat in full.get("chats") or []:
+                    # e.g. the personal channel (`personal_channel_id`): a
+                    # full Channel object — a real pivot, worth a peer row.
+                    self._upsert_peer_keeping_provenance(ctx, chat, raw_id, observed_at)
+                if self._project_user(
+                    ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts,
+                    full_user=full_user,
+                ) is None:
+                    continue
+                counts["refreshed" if enriched_at is not None else "enriched"] += 1
+                await self._photos(ctx, uri, user_id, ref, counts)
+        except PhaseStop as stop:
+            self._record_summary(ctx, counts, pass_=pass_)
+            raise PhaseStop(*stop.args, counts=counts) from stop
         if spent >= budget:
             ctx.log.info(
                 "profiles: getFullUser budget (%d) spent this run; re-run to keep converging",
@@ -396,6 +448,14 @@ class ProfilesCollector:
             counts["skipped"] += 1
             return
         if data is None:
+            # Server-side-unavailable (e.g. a stale file reference) rather
+            # than a raised `SkipAndRecord` — still worth a log line so the
+            # outcome isn't invisible, matching `media.py`'s identical
+            # `download_media` -> `None` case.
+            ctx.log.warning(
+                "profiles: avatar %s unavailable for %s (download returned no bytes)",
+                photo["id"], uri,
+            )
             return
         sha = hashlib.sha256(data).hexdigest()
         path = media_root / sha[:2] / f"{sha}.jpg"  # Telegram re-encodes avatars as JPEG
