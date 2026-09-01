@@ -1,3 +1,5 @@
+import pytest
+
 from paperboy.store.db import Store
 from paperboy.store.sync import add_range, get_state, missing_ids, set_state
 
@@ -53,3 +55,22 @@ def test_state_round_trip(tmp_path):
         assert get_state(st, "channel", "5") == {"pts": 42}
         set_state(st, "channel", "5", {"pts": 99})
         assert get_state(st, "channel", "5") == {"pts": 99}
+
+
+def test_record_profile_attempt_newest_wins_and_outcomes_are_constrained(tmp_path):
+    import sqlite3
+
+    from paperboy.store.sync import record_profile_attempt
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        record_profile_attempt(st, "tg:user:1", "2026-01-01T00:00:00+00:00", "attempted")
+        record_profile_attempt(
+            st, "tg:user:1", "2026-01-01T00:00:01+00:00", "skipped", "USER_ID_INVALID"
+        )
+        row = st.conn.execute("select * from profile_attempts").fetchone()
+        assert (row["uri"], row["attempted_at"], row["outcome"], row["detail"]) == (
+            "tg:user:1", "2026-01-01T00:00:01+00:00", "skipped", "USER_ID_INVALID",
+        )
+        assert st.conn.execute("select count(*) from profile_attempts").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            record_profile_attempt(st, "tg:user:2", "2026-01-01T00:00:02+00:00", "bogus")

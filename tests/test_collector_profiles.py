@@ -660,9 +660,9 @@ async def test_previously_failed_enrich_only_sorts_after_never_attempted(tmp_pat
     # Round-3 review (blocking finding #1, second half): a ref that fails
     # ONLY `getFullUser` (triage succeeds, so it is never in this run's
     # triage-skip set) must not consume every run's budget forever just
-    # because it is always highest-ranked. A durable `ProfileFetchSkipped`
-    # raw record, read back by `_enrichment_candidates`, sorts it behind a
-    # never-attempted candidate on the next run.
+    # because it is always highest-ranked. The `profile_attempts` row written
+    # where the budget was spent sorts it behind every never-attempted
+    # candidate on the next run.
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_population(st)
         settings = _settings(tmp_path, enrich_profiles=True, profile_budget=1)
@@ -677,10 +677,11 @@ async def test_previously_failed_enrich_only_sorts_after_never_attempted(tmp_pat
         # admin behind every never-attempted candidate, so the author (a
         # real, healthy user) gets the single slot instead of the admin
         # failing again. Run 3: same reasoning reaches the commenter.
-        assert seen == [[1], [2], [3]]
-        assert st.conn.execute(
-            "select count(*) from raw_records where kind='ProfileFetchSkipped'"
-        ).fetchone()[0] == 1  # the admin is never retried once healthier candidates remain
+        assert seen == [[1], [2], [3]]  # the admin is never retried while fresh candidates remain
+        attempt = st.conn.execute(
+            "select outcome, detail from profile_attempts where uri='tg:user:1'"
+        ).fetchone()
+        assert (attempt["outcome"], attempt["detail"]) == ("skipped", "USER_ID_INVALID")
         assert st.conn.execute(
             "select enriched_at from users where uri='tg:user:1'"
         ).fetchone()[0] is None
@@ -810,3 +811,144 @@ async def test_full_profile_disambiguates_a_hidden_photo(tmp_path):
         bundle = json.loads(fields_json)
         assert "common_chats_count" not in bundle["full_user"]
         assert "blocked" not in bundle["full_user"]
+
+
+def _malformed_envelope(user_id: int) -> dict:
+    return {"_": "UserFull", "full_user": None, "users": [_user(user_id)], "chats": None}
+
+
+@pytest.mark.asyncio
+async def test_refresh_pass_rotates_past_a_permanently_failing_user(tmp_path):
+    """Round-4 review (blocking): once everyone is enriched, the refresh pass
+    must be keyed on the last ATTEMPT, not on `enriched_at` (which only moves
+    on success) — or a user whose fetch now permanently fails is re-selected
+    at the head of every run and nobody else is ever refreshed."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        await ProfilesCollector().collect(
+            _ctx(st, _enrich_gw(), _settings(tmp_path, enrich_profiles=True, profile_budget=5))
+        )
+        seen: list[list[int]] = []
+        for _ in range(4):
+            gw = _enrich_gw()
+            gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")
+            await ProfilesCollector().collect(
+                _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=1))
+            )
+            seen.append(gw.full_user_calls)
+        assert seen == [[1], [2], [3], [4]]
+
+
+@pytest.mark.asyncio
+async def test_malformed_envelope_advances_the_rotation(tmp_path):
+    """Round-4 review (blocking): a spent slot that ends in the malformed-
+    envelope arm must still move the user behind everyone not yet attempted."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = _enrich_gw()
+            gw._fx["full_user"][1] = _malformed_envelope(1)
+            await ProfilesCollector().collect(
+                _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=1))
+            )
+            seen.append(gw.full_user_calls)
+        assert seen == [[1], [2], [3]]
+        assert st.conn.execute(
+            "select outcome from profile_attempts where uri='tg:user:1'"
+        ).fetchone()[0] == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_userempty_subject_advances_the_rotation(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        seen: list[list[int]] = []
+        for _ in range(3):
+            gw = _enrich_gw()
+            gw._fx["full_user"][1] = {
+                "_": "UserFull",
+                "full_user": {"_": "UserFull", "id": 1, "about": "bio 1"},
+                "chats": [], "users": [{"_": "UserEmpty", "id": 1}],
+            }
+            await ProfilesCollector().collect(
+                _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=1))
+            )
+            seen.append(gw.full_user_calls)
+        assert seen == [[1], [2], [3]]
+
+
+@pytest.mark.asyncio
+async def test_every_spent_slot_leaves_an_attempt_row(tmp_path):
+    """The invariant the chokepoint enforces: one `profile_attempts` row per
+    `getFullUser` call this run, with the arm's outcome — whatever the arm."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        gw = _enrich_gw()
+        gw._fx["full_user"][1] = SkipAndRecord("USER_ID_INVALID")
+        gw._fx["full_user"][2] = _malformed_envelope(2)
+        gw._fx["full_user"][3] = {
+            "_": "UserFull", "full_user": {"_": "UserFull", "id": 3}, "chats": [], "users": [],
+        }
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=5))
+        )
+        assert gw.full_user_calls == [1, 2, 3, 4, 5]
+        rows = {
+            r["uri"]: r["outcome"]
+            for r in st.conn.execute("select uri, outcome from profile_attempts")
+        }
+        assert rows == {
+            "tg:user:1": "skipped", "tg:user:2": "malformed", "tg:user:3": "malformed",
+            "tg:user:4": "enriched", "tg:user:5": "enriched",
+        }
+        assert len(rows) == len(gw.full_user_calls)
+        assert res.counts["skipped"] == 3 and res.counts["enriched"] == 2
+        assert st.conn.execute(
+            "select count(*) from raw_records where kind='ProfileFetchSkipped'"
+        ).fetchone()[0] == 0  # a failed attempt is scheduling state, not a raw observation
+
+
+@pytest.mark.asyncio
+async def test_unexpected_get_users_result_is_counted_and_recorded(tmp_path):
+    """Round-4 review (minor): an unexpected `getUsers` discriminator left no
+    count, no log and no raw record, breaking `gathered == triaged + empty +
+    skipped + unresolvable`. The replay placeholder is counted but never
+    written to raw (it is not an observation)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 11)
+        _seed_stub(st, 12, msg=201)
+        gw = _gw({11: {"_": "ReplayUnknownUser", "id": 11}, 12: {"_": "SomethingOdd", "id": 12}})
+        res = await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path)))
+        c = res.counts
+        assert (c["gathered"], c["skipped"], c["triaged"]) == (2, 2, 0)
+        assert c["gathered"] == c["triaged"] + c["empty"] + c["skipped"] + c["unresolvable"]
+        kinds = [r[0] for r in st.conn.execute(
+            "select kind from raw_records "
+            "where json_extract(context_json, '$.method')='users.getUsers'"
+        )]
+        assert kinds == ["SomethingOdd"]
+
+
+@pytest.mark.asyncio
+async def test_phase_stop_mid_bisection_keeps_responses_already_received(tmp_path):
+    """Round-4 review (minor, raw-first): a `PhaseStop` raised by a later
+    sub-batch must not discard the `User` objects earlier sub-batches
+    already returned — they are recorded raw and projected as they arrive."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for i in (1, 2, 3, 4):
+            _seed_stub(st, i, msg=i)
+        # [1,2,3,4] fails on 3 -> [1,2] answers -> [3,4] fails on 3 -> [3] skipped -> [4] FLOOD
+        gw = _gw({1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"),
+                  4: PhaseStop("FLOOD_WAIT 900")})
+        with pytest.raises(PhaseStop):
+            await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path)))
+        assert gw.users_calls == [[1, 2, 3, 4], [1, 2], [3, 4], [3], [4]]
+        projected = {r[0] for r in st.conn.execute("select uri from users")}
+        assert projected == {"tg:user:1", "tg:user:2"}
+        assert st.conn.execute(
+            "select count(*) from raw_records where kind='User' "
+            "and json_extract(context_json, '$.method')='users.getUsers'"
+        ).fetchone()[0] == 2
