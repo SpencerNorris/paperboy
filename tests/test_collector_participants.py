@@ -16,6 +16,7 @@ from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
 from paperboy.store.messages import upsert_message
 from paperboy.store.peers import upsert_peer
+from paperboy.store.sync import set_state
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
 
@@ -36,7 +37,10 @@ def _ctx(st, gw, settings=None, tier="stranger"):
     )
 
 
-def _seed_channel(st: Store, *, linked: int | None = GROUP_ID, kind: str = "broadcast") -> None:
+def _seed_channel(
+    st: Store, *, linked: int | None = GROUP_ID, kind: str = "broadcast",
+    linked_flags: dict | None = None,
+) -> None:
     raw_id = st.add_raw(
         "ChatFull", {"_": "ChatFull", "full_chat": {"id": CHANNEL_ID}}, "stranger",
         {"channel_id": CHANNEL_ID}, observed_at=T0,
@@ -49,11 +53,9 @@ def _seed_channel(st: Store, *, linked: int | None = GROUP_ID, kind: str = "broa
         chan, raw_id, T0,
     )
     if linked:
-        upsert_peer(
-            st,
-            {"_": "Channel", "id": linked, "access_hash": 4242, "title": "G", "megagroup": True},
-            raw_id, T0, seen_in_chat=None, seen_in_msg=None,
-        )
+        peer = {"_": "Channel", "id": linked, "access_hash": 4242, "title": "G", "megagroup": True}
+        peer.update(linked_flags or {})
+        upsert_peer(st, peer, raw_id, T0, seen_in_chat=None, seen_in_msg=None)
 
 
 def _group_full(count: int = 3, *, left: bool = True, hidden: bool = False, users=()) -> dict:
@@ -74,6 +76,10 @@ def _user(uid: int, **extra) -> dict:
 def _member(uid: int, **extra) -> dict:
     return {"_": "ChannelParticipant", "user_id": uid, "date": JOINED + uid, "rank": None,
             "subscription_until_date": None, **extra}
+
+
+def _self_participant(uid: int) -> dict:
+    return {"_": "ChannelParticipantSelf", "user_id": uid, "date": JOINED, "inviter_id": None}
 
 
 def _page(*participants: dict, count: int | None = None, users=None) -> dict:
@@ -382,6 +388,18 @@ def _seed_group_comment(
                 seen_in_chat=GROUP_ID, seen_in_msg=msg_id)
 
 
+def _seed_group_comment_no_peer(st: Store, msg_id: int, user_id: int) -> None:
+    """Like `_seed_group_comment`, but WITHOUT the peer stub — `from_uri`
+    still makes the author an oracle candidate (the query reads `messages`
+    directly), but with no `peers`/`users` row at all `input_user_ref` has
+    nothing to build a ref from: an unresolvable candidate."""
+    m = {"_": "Message", "id": msg_id, "message": "c", "date": 1767322445,
+         "from_id": {"_": "PeerUser", "user_id": user_id},
+         "peer_id": {"_": "PeerChannel", "channel_id": GROUP_ID}}
+    raw_id = st.add_raw("Message", m, "stranger", {"channel_id": GROUP_ID}, observed_at=T0)
+    upsert_message(st, GROUP_ID, m, raw_id, T0, "stranger")
+
+
 def _answer(uid: int) -> dict:
     return {
         "_": "ChannelParticipant", "participant": _member(uid), "chats": [],
@@ -463,10 +481,11 @@ async def test_oracle_wall_ends_the_oracle_loop_for_that_group(tmp_path):
 async def test_oracle_confirmed_members_count_toward_enumerated(tmp_path):
     """A positive oracle answer writes the SAME kind of confirmed-member row
     (`participants`, `member_of`) as a roster page, so it must count toward
-    the run's `enumerated` total too -- found running the Leg 3 DoD smoke:
-    the shortfall warning (built from the same, oracle-mutated `enumerated`
-    set) disagreed with `res.counts["enumerated"]`, which stopped counting
-    before the oracle ran."""
+    the run's `enumerated` total too -- found running the Leg 3 DoD smoke.
+    The shortfall warning stays scoped to the roster PAGE alone (spec §6.3;
+    round-2 review) -- it must not silently switch to the oracle-mutated
+    set, which would make it disagree with the `roster` event and the
+    `participant_snapshots` row for the very same run."""
     with Store.open(tmp_path / "p.sqlite") as st:
         _seed_channel(st)
         _seed_group_comment(st, 301, 21)
@@ -477,7 +496,48 @@ async def test_oracle_confirmed_members_count_toward_enumerated(tmp_path):
         res = await ParticipantsCollector().collect(_ctx(st, gw))
         assert res.counts["oracle"] == 1
         assert res.counts["enumerated"] == 2, "the roster's 1 + the oracle's confirmed 21"
-        assert res.stopped is not None and "2 of 3" in res.stopped
+        # the warning/roster accounting stays roster-page-only: 1 (not 2) of 3
+        assert res.stopped is not None and "1 of 3" in res.stopped
+        roster_event = json.loads(st.conn.execute(
+            "select detail_json from run_events where kind='roster'").fetchone()[0])
+        warning_event = json.loads(st.conn.execute(
+            "select detail_json from run_events where kind='warning'").fetchone()[0])
+        snapshot = st.conn.execute(
+            "select enumerated from participant_snapshots where group_id=? and uri is null",
+            (GROUP_ID,)).fetchone()
+        assert roster_event["enumerated"] == warning_event["enumerated"] == snapshot["enumerated"]
+
+
+@pytest.mark.asyncio
+async def test_oracle_completing_the_roster_never_claims_a_complete_roster_is_short(tmp_path):
+    """Boundary the previous fix (dd01185) missed by one case: when the
+    roster PAGE alone found 1 of a declared 2 and the oracle confirms the
+    other 1, the run's total IS complete (2 of 2) -- but the shortfall
+    warning must never say so while still telling the operator to spend the
+    tool's one documented write for a roster that is, by its own numbers,
+    already done. It reports the roster-page figure (1 of 2) instead, which
+    stays self-consistent with the `roster` event and the roster snapshot."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 301, 21)
+        gw = _gw(
+            [_page(_member(2), count=2)],
+            full_channel_by_id={GROUP_ID: _group_full(2)},
+            participant={GROUP_ID: {21: _answer(21)}},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.counts["oracle"] == 1
+        assert res.counts["enumerated"] == 2  # the run DID find everyone, combined
+        assert res.stopped is not None
+        assert "2 of 2" not in res.stopped  # never claim complete while still warning
+        roster_event = json.loads(st.conn.execute(
+            "select detail_json from run_events where kind='roster'").fetchone()[0])
+        warning_event = json.loads(st.conn.execute(
+            "select detail_json from run_events where kind='warning'").fetchone()[0])
+        snapshot = st.conn.execute(
+            "select enumerated from participant_snapshots where group_id=? and uri is null",
+            (GROUP_ID,)).fetchone()
+        assert roster_event["enumerated"] == warning_event["enumerated"] == snapshot["enumerated"]
 
 
 @pytest.mark.asyncio
@@ -607,3 +667,312 @@ async def test_reaction_list_wall_is_a_recorded_skip(tmp_path):
         res = await ParticipantsCollector().collect(_ctx(st, gw))
         assert gw.reactions_calls == [(GROUP_ID, 402, None)]  # the wall ends the vector
         assert res.counts["skipped"] == 1 and res.stopped is None
+
+
+@pytest.mark.asyncio
+async def test_a_complete_roster_including_self_reports_no_shortfall(tmp_path):
+    """`true_count` (Telegram's own `channelParticipants.count`) includes the
+    collecting account when it is a member, but `write_participant` refuses
+    to store self (issue #12) so self can never land in `enumerated` the
+    same way. Left unreconciled, a completely enumerated roster with self as
+    one of its members reports a permanent phantom shortfall of exactly 1 on
+    every run — structural, not transient (correctness round-2 review)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        set_state(st, "account", "self", {"uri": "tg:user:1", "id": 1})
+        _seed_channel(st)
+        page = _page(_member(2), _member(3), _self_participant(1), count=3)
+        gw = _gw([page], full_channel_by_id={GROUP_ID: _group_full(3)})
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.stopped is None
+        roster = st.conn.execute(
+            "select enumerated, true_count from participant_snapshots "
+            "where group_id=? and uri is null", (GROUP_ID,)).fetchone()
+        assert (roster["enumerated"], roster["true_count"]) == (3, 3)
+        assert st.conn.execute(
+            "select count(*) from participants where uri='tg:user:1'"
+        ).fetchone()[0] == 0  # self is still never a stored subject (#12)
+        assert st.conn.execute(
+            "select count(*) from users where uri='tg:user:1'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_linked_broadcast_peer_is_never_enumerated_or_joined(tmp_path):
+    """`channelFull.linked_chat_id` is bidirectional (research
+    sources/mtproto-channel-messages.md:154): from a discussion SUPERGROUP it
+    points back at its BROADCAST channel. That broadcast's subscriber roster
+    is never enumerable below admin regardless of which side of the link
+    discovered it — enumerating it, or joining it under --join, would
+    violate the module's own zero-enumeration-RPC promise for broadcasts."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, linked=GROUP_ID, kind="megagroup")
+        broadcast_full = {
+            "_": "ChatFull",
+            "full_chat": {"_": "channelFull", "id": GROUP_ID, "participants_count": 50000,
+                          "pts": 1, "can_view_participants": True, "participants_hidden": False},
+            "chats": [{"_": "Channel", "id": GROUP_ID, "access_hash": 4242, "title": "B",
+                       "broadcast": True, "left": True}],
+            "users": [],
+        }
+        gw = _gw([_page(_member(2))], full_channel_by_id={GROUP_ID: broadcast_full})
+        res = await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert not any(c[0] == GROUP_ID for c in gw.participants_calls)
+        # the TARGET (a megagroup with unknown membership) is legitimately
+        # joined under --join (`_maybe_join`'s documented "membership
+        # unknown" branch) — what must NEVER happen is the LINKED BROADCAST
+        # being joined, so check the join audit trail by group, not the
+        # gateway's blanket join_channel call count.
+        joins = [
+            json.loads(r[0])["group_id"]
+            for r in st.conn.execute("select detail_json from run_events where kind='join'")
+        ]
+        assert GROUP_ID not in joins
+        walled = [json.loads(r[0]) for r in st.conn.execute(
+            "select payload_json from raw_records where kind='RosterWalled' order by id")]
+        assert any(w["group_id"] == GROUP_ID and "broadcast" in w["reason"] for w in walled)
+        assert res.counts["walled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_hidden_linked_roster_is_walled_before_any_enumeration_rpc(tmp_path):
+    """spec §6.1: an owner-hidden roster (`participants_hidden` /
+    `can_view_participants`) is exactly as structural a wall as a broadcast
+    peer — walled with zero enumeration RPC, not discovered the expensive
+    way via a `CHAT_ADMIN_REQUIRED` on the first page."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        gw = _gw([_page(_member(2))], full_channel_by_id={GROUP_ID: _group_full(hidden=True)})
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.participants_calls == []
+        walled = [json.loads(r[0]) for r in st.conn.execute(
+            "select payload_json from raw_records where kind='RosterWalled' order by id")]
+        assert any(
+            w["group_id"] == GROUP_ID and "participants_hidden" in w["reason"] for w in walled
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_hidden_megagroup_target_is_walled_from_its_own_stored_flags(tmp_path):
+    """The same §6.1 wall applies to the TARGET's own roster when its stored
+    `channels.flags_json` (from an earlier `channel` phase observation)
+    already carries `participants_hidden` — zero enumeration RPC, exactly
+    like the linked group's own preflight wall (`_roster_wall_reason` is
+    shared by both paths)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        raw_id = st.add_raw(
+            "ChatFull", {"_": "ChatFull", "full_chat": {"id": CHANNEL_ID}}, "stranger",
+            {"channel_id": CHANNEL_ID}, observed_at=T0,
+        )
+        chan = {"_": "Channel", "id": CHANNEL_ID, "access_hash": 9, "title": "C",
+                "username": "c", "megagroup": True}
+        upsert_channel(
+            st, {"_": "channelFull", "id": CHANNEL_ID, "pts": 1, "linked_chat_id": None,
+                 "participants_count": 10, "participants_hidden": True,
+                 "can_view_participants": False},
+            chan, raw_id, T0,
+        )
+        gw = FakeGateway({
+            "participants": {CHANNEL_ID: {"channelParticipantsRecent": [_page(_member(2))]}},
+        })
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert gw.participants_calls == []
+        walled = [json.loads(r[0]) for r in st.conn.execute(
+            "select payload_json from raw_records where kind='RosterWalled' order by id")]
+        assert any(
+            w["group_id"] == CHANNEL_ID and "participants_hidden" in w["reason"] for w in walled
+        )
+        assert res.stopped is None
+
+
+@pytest.mark.asyncio
+async def test_reaction_list_peer_write_is_fill_only_and_never_overwrites_authorship(tmp_path):
+    """A reaction is not a documented `inputPeerFromMessage` context (research
+    §8.7 lists author, forward header and mention) — a user's reaction to
+    someone else's message must never replace their authorship provenance,
+    mirroring `store.reactions.backfill_recent_reactions`'s own fill-only
+    rule for the zero-RPC vector (correctness round-2 review)."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 301, 21)  # user 21 authored 301 -> provenance (77, 301)
+        _seed_group_comment(st, 401, 2, reactions=reacted)  # someone else's message, reacted
+        gw = _gw(
+            [_page(_member(2), count=1)],
+            reactions={GROUP_ID: {401: {
+                "_": "MessageReactionsList", "count": 1, "chats": [], "next_offset": None,
+                "users": [_user(21)],
+                "reactions": [
+                    {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 21},
+                     "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "🔥"}},
+                ],
+            }}},
+        )
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        peer = st.conn.execute(
+            "select seen_in_chat, seen_in_msg from peers where uri='tg:user:21'"
+        ).fetchone()
+        assert (peer["seen_in_chat"], peer["seen_in_msg"]) == (GROUP_ID, 301)
+        # the reaction is still recorded as an edge — only the provenance write is fill-only
+        assert ("tg:user:21", "reacted_to", "tg:msg:77/401") in {
+            (e[0], e[1], e[2])
+            for e in st.conn.execute("select subject_uri, predicate, object_uri from edges")
+        }
+
+
+@pytest.mark.asyncio
+async def test_reaction_list_peer_write_still_fills_provenance_for_a_new_peer(tmp_path):
+    """The fill-only guard must not regress the ordinary case: a reactor with
+    NO prior provenance still gets the reaction's `(chat, msg)` recorded."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 401, 2, reactions=reacted)
+        gw = _gw(
+            [_page(_member(2), count=1)],
+            reactions={GROUP_ID: {401: {
+                "_": "MessageReactionsList", "count": 1, "chats": [], "next_offset": None,
+                "users": [_user(31)],
+                "reactions": [
+                    {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 31},
+                     "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "🔥"}},
+                ],
+            }}},
+        )
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        peer = st.conn.execute(
+            "select seen_in_chat, seen_in_msg from peers where uri='tg:user:31'"
+        ).fetchone()
+        assert (peer["seen_in_chat"], peer["seen_in_msg"]) == (GROUP_ID, 401)
+
+
+@pytest.mark.asyncio
+async def test_linked_group_honours_join_to_send_like_discussion_does(tmp_path):
+    """The linked group is shared with `discussion`, whose own docstring
+    states that reading it requires membership once `join_to_send` is set
+    (issue #20). A roster read is not exempt from that just because it is
+    not a message read — honour the same flag the same way, for the SAME
+    group, instead of silently reading it un-joined regardless."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st, linked_flags={"join_to_send": True})
+        gw = _gw([_page(_member(2))])
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert all(c[0] != GROUP_ID for c in gw.participants_calls)
+        assert gw.calls.count("get_full_channel") == 0
+        assert gw.calls.count("join_channel") == 0
+        assert res.stopped is not None and "join_to_send" in res.stopped
+        assert "participants group" in res.stopped  # named for THIS phase, not "discussion"
+
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st, linked_flags={"join_to_send": True})
+        gw = _gw(
+            [_page(_member(2), count=1)],
+            full_channel_by_id={GROUP_ID: _group_full(left=False)},
+        )
+        res = await ParticipantsCollector().collect(_ctx(st, gw, _settings(allow_join=True)))
+        assert gw.calls.count("join_channel") == 1  # joined once, via the needs_join gate
+        assert gw.calls.count("get_full_channel") == 1
+        assert gw.participants_calls[0] == (GROUP_ID, "channelParticipantsRecent", 0)
+        assert res.counts["rosters"] == 1
+        assert st.conn.execute(
+            "select count(*) from run_events where kind='join'"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_broadcast_targets_own_recent_reactions_sample_is_swept(tmp_path):
+    """The zero-RPC `recent_reactions` sample on a BROADCAST's own posts is
+    free — it costs no RPC and is not the walled `getMessageReactionsList`
+    vector — so it must not be dropped just because the target itself is
+    never enumerated via `getParticipants` (correctness round-2 review)."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+        "recent_reactions": [
+            {"_": "MessagePeerReaction", "peer_id": {"_": "PeerUser", "user_id": 51},
+             "date": 1767322500, "reaction": {"_": "ReactionEmoji", "emoticon": "👍"}},
+        ],
+    }
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)  # target is a broadcast (default kind)
+        post = {"_": "Message", "id": 900, "message": "post", "date": 1767322000,
+                "peer_id": {"_": "PeerChannel", "channel_id": CHANNEL_ID}, "reactions": reacted}
+        raw_id = st.add_raw("Message", post, "stranger", {"channel_id": CHANNEL_ID}, observed_at=T0)
+        upsert_message(st, CHANNEL_ID, post, raw_id, T0, "stranger")
+        gw = _gw()
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.counts["reactors"] == 1
+        assert ("tg:user:51", "reacted_to", "tg:msg:5/900") in {
+            (e["subject_uri"], e["predicate"], e["object_uri"])
+            for e in st.conn.execute("select subject_uri, predicate, object_uri from edges")
+        }
+
+
+@pytest.mark.asyncio
+async def test_reaction_list_pagination_is_hard_capped_against_a_repeating_offset(tmp_path):
+    """Unlike `_page` (three independent stop conditions: empty page, short
+    page, no-new-members), a reaction list's only natural stop is a falsy
+    `next_offset` — a server that always returns one would otherwise spin
+    forever, growing the DB unbounded."""
+    reacted = {
+        "_": "MessageReactions", "results": [{"_": "ReactionCount", "count": 1, "reaction": {}}],
+    }
+    pages = [
+        {"_": "MessageReactionsList", "count": 0, "chats": [], "users": [],
+         "reactions": [], "next_offset": f"p{i}"}
+        for i in range(60)
+    ]
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 401, 2, reactions=reacted)
+        gw = _gw([_page(_member(2), count=1)], reactions={GROUP_ID: {401: pages}})
+        res = await ParticipantsCollector().collect(_ctx(st, gw))
+        assert res.counts["reaction_lists"] == 50  # capped (`_REACTIONS_MAX_PAGES`), not 60
+        assert res.stopped is None
+
+
+@pytest.mark.asyncio
+async def test_oracle_budget_is_spent_on_resolvable_candidates_not_wasted_on_dead_ones(tmp_path):
+    """The budget slices AFTER filtering to resolvable `input_user_ref`s, not
+    before: an unresolvable candidate must never occupy a budget slot the
+    same `ORDER BY uri` query would otherwise hand to someone the oracle can
+    actually ask — and, unfixed, that starvation is PERMANENT (the dead
+    candidate sorts first on every future run too, since it never gets
+    written to `participants` either)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment_no_peer(st, 300, 20)  # authored, but unresolvable: no peer row
+        _seed_group_comment(st, 301, 21)  # authored AND resolvable via inputUserFromMessage
+        gw = _gw(
+            [_page(_member(2), count=3)],
+            participant={GROUP_ID: {21: _answer(21)}},
+        )
+        res = await ParticipantsCollector().collect(
+            _ctx(st, gw, _settings(participant_oracle_budget=1))
+        )
+        assert gw.participant_calls == [(GROUP_ID, 21)]
+        assert res.counts["oracle"] == 1
+
+
+@pytest.mark.asyncio
+async def test_user_snapshot_method_matches_the_producing_rpc(tmp_path):
+    """`user_snapshots.method` is both provenance and the dedupe partition
+    (`add_user_snapshot` keys on `(uri, method)`) — each vector must record
+    the RPC that actually produced the observation, not share one
+    hard-coded value (correctness round-2 review)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_group_comment(st, 301, 21)
+        gw = _gw(
+            [_page(_member(2), count=3)],
+            participant={GROUP_ID: {21: _answer(21)}},
+        )
+        await ParticipantsCollector().collect(_ctx(st, gw))
+        methods = {
+            r["uri"]: r["method"]
+            for r in st.conn.execute("select uri, method from user_snapshots")
+        }
+        assert methods["tg:user:2"] == "channels.getParticipants"
+        assert methods["tg:user:21"] == "channels.getParticipant"

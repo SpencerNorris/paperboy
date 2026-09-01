@@ -47,6 +47,7 @@ from paperboy.store.participants import (
     add_participant_snapshot,
     add_roster_snapshot,
     membership_edges,
+    participant_row,
     project_join_service_messages,
     upsert_participant,
     write_participant,
@@ -58,14 +59,21 @@ from paperboy.store.reactions import (
     fetched_reaction_lists,
     reacted_message_ids,
 )
+from paperboy.store.sync import is_self
 from paperboy.store.users import add_user_snapshot, target_user_facts, upsert_user
 from paperboy.targets import Target
 
 _PAGE_SIZE = 200  # Telegram's page size, not a total cap (spec §6.3)
 _REACTIONS_PAGE = 100
+# Hard per-message cap on `messages.getMessageReactionsList` pages: unlike
+# `_page` (three independent stop conditions), a `next_offset` that never
+# falls falsy has nothing else bounding it — a server that repeats a
+# non-empty offset would otherwise spin forever, growing the DB unbounded.
+_REACTIONS_MAX_PAGES = 50
 METHOD_GET_PARTICIPANTS = "channels.getParticipants"
 METHOD_GET_PARTICIPANT = "channels.getParticipant"
 METHOD_REACTIONS = "messages.getMessageReactionsList"
+METHOD_GET_FULL_CHANNEL = "channels.getFullChannel"
 # Admin-only sub-methods: detected via rights and SKIPPED, never attempted (spec §6.5).
 _ADMIN_ONLY_METHODS = (
     "channels.getAdminLog", "premium.getBoostsList", "messages.getChatInviteImporters",
@@ -78,17 +86,40 @@ JOIN_SHORTFALL_WARNING = (
     "audited write)"
 )
 
+_REASON_BROADCAST = (
+    "broadcast_channel: subscriber roster is never enumerable below admin "
+    "(CHAT_ADMIN_REQUIRED for every filter)"
+)
+_REASON_HIDDEN = "participants_hidden: roster not viewable"
+
+
+def _roster_wall_reason(flags: dict) -> str | None:
+    """spec §6.1/§6.2: a roster that is structurally never enumerable below
+    admin — a BROADCAST peer's subscriber list (`channelFull.linked_chat_id`
+    is bidirectional: a group's own link points back at its broadcast, not
+    only the broadcast->group direction — research
+    sources/mtproto-channel-messages.md:154), or a group whose owner has
+    hidden participants (`participants_hidden` / `can_view_participants`) —
+    walls with ZERO enumeration RPC. Shared by the target's own roster and
+    the linked group's preflight so both paths agree on one check."""
+    if flags.get("broadcast") and not flags.get("megagroup"):
+        return _REASON_BROADCAST
+    if flags.get("participants_hidden") or flags.get("can_view_participants") is False:
+        return _REASON_HIDDEN
+    return None
+
 
 @dataclass
 class _Roster:
     """One enumerable group: the linked discussion group, or the target itself
-    when it is a supergroup. `stamp`/`source_raw_id` are the ChatFull
-    observation that established the flags — every zero-RPC row derived
-    from this roster is stamped from them, never from "now" (plan D5)."""
+    when it is a supergroup — never a broadcast peer or a hidden roster, both
+    walled by `_roster_wall_reason` before construction. `stamp`/
+    `source_raw_id` are the ChatFull observation that established the flags —
+    every zero-RPC row derived from this roster is stamped from them, never
+    from "now" (plan D5)."""
 
     group_id: int
     input_channel: dict
-    flags: dict
     true_count: int | None
     stamp: str
     source_raw_id: int | None
@@ -128,9 +159,8 @@ class ParticipantsCollector:
             # §6.2: the broadcast channel's OWN subscriber roster is never
             # enumerable — skip IT (recorded, zero RPC), not the collector.
             self._record_walled(
-                ctx, ctx.channel_id, "broadcast_channel: subscriber roster is never enumerable "
-                "below admin (CHAT_ADMIN_REQUIRED for every filter)",
-                chan["participants_count"], run_stamp, counts,
+                ctx, ctx.channel_id, _REASON_BROADCAST, chan["participants_count"], run_stamp,
+                counts,
             )
         linked = linked_group(ctx)
         if isinstance(linked, str):
@@ -145,11 +175,14 @@ class ParticipantsCollector:
             ctx.log.info("participants: %s", linked)
 
         # Zero-RPC vectors first — they read only the store, so they run even
-        # when the session gate below refuses enumeration.
-        group_ids = ([ctx.channel_id] if target_is_group else []) + (
-            [] if isinstance(linked, str) else [linked[0]]
-        )
-        for group_id in group_ids:
+        # when the session gate below refuses enumeration. The TARGET's own
+        # id is swept unconditionally (its posts still carry a free
+        # `recent_reactions` sample even when the target is a broadcast whose
+        # subscriber roster and RPC-based reaction-list vector are both
+        # walled) — only the RPC-based roster/oracle/reaction vectors below
+        # stay GROUP-only.
+        zero_rpc_ids = [ctx.channel_id] + ([] if isinstance(linked, str) else [linked[0]])
+        for group_id in zero_rpc_ids:
             self._zero_rpc_vectors(ctx, group_id, counts)
 
         # The gate comes BEFORE the first RPC against any group (spec §6.1) —
@@ -168,18 +201,45 @@ class ParticipantsCollector:
         await record_privacy_posture(ctx, self.name)
 
         rosters: list[_Roster] = []
-        if target_is_group:
-            rosters.append(_Roster(
-                ctx.channel_id, ctx.input_channel, json.loads(chan["flags_json"] or "{}"),
-                chan["participants_count"], run_stamp, chan["source_raw_id"], None,
-            ))
-        if not isinstance(linked, str):
-            group_id, input_channel, _needs_join = linked
-            roster = await self._preflight_group(ctx, group_id, input_channel, run_stamp, counts)
-            if roster is not None:
-                rosters.append(roster)
-
         stopped: list[str] = []
+        if target_is_group:
+            target_flags = json.loads(chan["flags_json"] or "{}")
+            target_wall = _roster_wall_reason(target_flags)
+            if target_wall is not None:
+                # §6.1/§6.2: a megagroup TARGET can be just as structurally
+                # walled (hidden participants) as a broadcast — recorded with
+                # zero enumeration RPC exactly like the linked group's own
+                # preflight wall, rather than discovering it the expensive
+                # way via a `CHAT_ADMIN_REQUIRED` on the first page.
+                self._record_walled(
+                    ctx, ctx.channel_id, target_wall, chan["participants_count"], run_stamp,
+                    counts,
+                )
+            else:
+                rosters.append(_Roster(
+                    ctx.channel_id, ctx.input_channel,
+                    chan["participants_count"], run_stamp, chan["source_raw_id"], None,
+                ))
+        if not isinstance(linked, str):
+            group_id, input_channel, needs_join = linked
+            proceed = True
+            if needs_join:
+                # `join_to_send` is honoured the same way `discussion` treats
+                # it for the SAME group (its docstring: reading it then
+                # requires membership) — a roster read is not exempt from
+                # that just because it is not a message read.
+                skip = await join_or_skip(ctx, self.name, group_id, input_channel)
+                if skip is not None:
+                    ctx.log.warning("participants: %s", skip)
+                    stopped.append(skip)
+                    proceed = False
+            if proceed:
+                roster = await self._preflight_group(
+                    ctx, group_id, input_channel, run_stamp, counts,
+                )
+                if roster is not None:
+                    rosters.append(roster)
+
         for roster in rosters:
             reason = await self._enumerate(ctx, roster, counts)
             if reason:
@@ -193,8 +253,12 @@ class ParticipantsCollector:
         counts: dict[str, int],
     ) -> _Roster | None:
         """§6.1: `can_view_participants` / `participants_hidden` live on the
-        GROUP's channelFull, which no phase has fetched before. Also projects
-        the group into `channels` (+ snapshot) and its vectors into peers."""
+        GROUP's channelFull, which no phase has fetched before — a hidden
+        roster, or a peer that turns out to be a BROADCAST (`linked_chat_id`
+        is bidirectional: a discussion group's own link points back at its
+        broadcast), walls with zero further RPC via `_roster_wall_reason`.
+        Also projects the group into `channels` (+ snapshot) and its vectors
+        into peers."""
         try:
             full = await ctx.gateway.get_full_channel(input_channel)
         except SkipAndRecord as exc:
@@ -235,10 +299,19 @@ class ParticipantsCollector:
             )
         for obj in chats:
             upsert_peer(ctx.store, obj, raw_id, observed_at, seen_in_chat=None, seen_in_msg=None)
-        self._project_users_vector(ctx, full, raw_id, observed_at, counts)
+        self._project_users_vector(
+            ctx, full, raw_id, observed_at, counts, METHOD_GET_FULL_CHANNEL,
+        )
+        flags = channel_flags(full_chat, chan or {})
+        wall = _roster_wall_reason(flags)
+        if wall is not None:
+            self._record_walled(
+                ctx, group_id, wall, full_chat.get("participants_count"), observed_at, counts,
+            )
+            return None
         return _Roster(
-            group_id, input_channel, channel_flags(full_chat, chan or {}),
-            full_chat.get("participants_count"), observed_at, raw_id, chan,
+            group_id, input_channel, full_chat.get("participants_count"), observed_at, raw_id,
+            chan,
         )
 
     async def _session_gate(self, ctx: CollectContext) -> str | None:
@@ -315,13 +388,14 @@ class ParticipantsCollector:
         counts["rosters"] += 1
         joined = await self._maybe_join(ctx, roster)
         enumerated: set[str] = set()
+        self_seen = False
         last_stamp, last_raw = roster.stamp, roster.source_raw_id
         true_count = roster.true_count
         walled: str | None = None
         filters = [FILTER_RECENT] + ([FILTER_ADMINS, FILTER_BOTS] if joined else [])
         for filter_ in filters:
             try:
-                count, last_stamp, last_raw = await self._page(
+                count, last_stamp, last_raw, page_self_seen = await self._page(
                     ctx, roster, filter_, enumerated, counts, last_stamp, last_raw
                 )
             except SkipAndRecord as exc:
@@ -333,45 +407,61 @@ class ParticipantsCollector:
                     )
                     counts["skipped"] += 1
                 continue
+            self_seen = self_seen or page_self_seen
             if count is not None and filter_ is FILTER_RECENT:
                 true_count = count  # an Admins/Bots page's `count` is only its own filter's
+        # `roster_enumerated`: what THIS run's roster PAGES alone found —
+        # captured now, before the oracle mutates `enumerated` below, and
+        # used for every roster-page-scoped consumer (the walled/snapshot
+        # row, the `roster` event, the shortfall predicate, its warning text
+        # and its event) so all of them agree on one number (round-2 review:
+        # the predicate and the rendered warning previously read the set at
+        # two different points and could disagree). Self is never written to
+        # `participants` (issue #12) so `write_participant` drops it from
+        # `enumerated`, but Telegram's own `true_count` DOES include self
+        # when self is a member — added back in here, or a completely
+        # enumerated roster reports a permanent phantom shortfall of
+        # exactly 1 on every run after any --join.
+        roster_enumerated = len(enumerated) + (1 if self_seen else 0)
         if walled is not None:
             self._record_walled(
-                ctx, group_id, walled, true_count, last_stamp, counts, enumerated=len(enumerated)
+                ctx, group_id, walled, true_count, last_stamp, counts,
+                enumerated=roster_enumerated,
             )
         else:
             add_roster_snapshot(
-                ctx.store, group_id, last_stamp, enumerated=len(enumerated),
+                ctx.store, group_id, last_stamp, enumerated=roster_enumerated,
                 true_count=true_count, reason=None, source_raw_id=last_raw,
             )
         record_run_event(
             ctx.store, ctx.channel_id, self.name, "roster",
-            {"group_id": group_id, "enumerated": len(enumerated), "true_count": true_count,
+            {"group_id": group_id, "enumerated": roster_enumerated, "true_count": true_count,
              "walled": walled, "joined": joined},
         )
         counts["true_count"] += true_count or 0
 
-        partial = walled is not None or (true_count is not None and len(enumerated) < true_count)
+        partial = (
+            walled is not None or (true_count is not None and roster_enumerated < true_count)
+        )
         if partial:
             await self._oracle(ctx, roster, enumerated, counts)
         await self._reactions(ctx, roster, counts)
-        # AFTER the oracle: a positive oracle answer adds the SAME kind of
-        # confirmed-member row (`participants`, `member_of`) as a roster
-        # page, so it must count toward `enumerated` too -- otherwise this
-        # count and the shortfall warning below (which reads the same
-        # mutated `enumerated` set) would disagree about how many members
-        # this run actually confirmed.
+        # A positive oracle answer adds the SAME kind of confirmed-member row
+        # (`participants`, `member_of`) as a roster page, so it counts
+        # toward the RUN's total too — deliberately NOT toward
+        # `roster_enumerated` above, which stays roster-page-only (spec
+        # §6.3: an accounting row for the roster RPC alone).
         counts["enumerated"] += len(enumerated)
         if not partial or joined:
             return None
         warning = JOIN_SHORTFALL_WARNING.format(
-            enumerated=len(enumerated), total=true_count if true_count is not None else "?",
+            enumerated=roster_enumerated, total=true_count if true_count is not None else "?",
             group_id=group_id,
         )
         ctx.log.warning(warning)
         record_run_event(
             ctx.store, ctx.channel_id, self.name, "warning",
-            {"code": "roster_partial", "group_id": group_id, "enumerated": len(enumerated),
+            {"code": "roster_partial", "group_id": group_id, "enumerated": roster_enumerated,
              "true_count": true_count, "walled": walled, "hint": "--join"},
         )
         return warning
@@ -394,12 +484,15 @@ class ParticipantsCollector:
     async def _page(
         self, ctx: CollectContext, roster: _Roster, filter_: dict, enumerated: set[str],
         counts: dict[str, int], last_stamp: str, last_raw: int | None,
-    ) -> tuple[int | None, str, int | None]:
+    ) -> tuple[int | None, str, int | None, bool]:
         """Page one filter until the server stops adding members: an empty
         or short page, or a page that adds nothing new (a capped server
-        repeats itself). Returns `(count, stamp, raw_id)` of the last page."""
+        repeats itself). Returns `(count, stamp, raw_id, self_seen)` — the
+        last page's, except `self_seen`, which is True if ANY page across
+        this filter carried the collecting account as a participant."""
         offset = 0
         count: int | None = None
+        self_seen = False
         while True:
             page = await ctx.gateway.get_participants(
                 roster.input_channel, filter_, offset, _PAGE_SIZE, 0
@@ -414,29 +507,41 @@ class ParticipantsCollector:
                 break
             if page.get("count") is not None:
                 count = page["count"]
-            new = self._project_page(
+            new, page_self_seen = self._project_page(
                 ctx, roster.group_id, page, last_raw, last_stamp, enumerated, counts
             )
+            self_seen = self_seen or page_self_seen
             got = len(page.get("participants") or [])
             if got == 0 or new == 0 or got < _PAGE_SIZE:
                 break
             offset += got
-        return count, last_stamp, last_raw
+        return count, last_stamp, last_raw, self_seen
 
     def _project_page(
         self, ctx: CollectContext, group_id: int, page: dict, raw_id: int, stamp: str,
         enumerated: set[str], counts: dict[str, int],
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Spec §6.5 for one page: participants rows + snapshots, member_of/
-        admin_of edges, and the free full `User` objects. Returns how many
-        participants were NEW to this run's enumerated set."""
-        self._project_users_vector(ctx, page, raw_id, stamp, counts)
+        admin_of edges, and the free full `User` objects. Returns
+        `(new, self_seen)`: how many participants were NEW to this run's
+        `enumerated` set, and whether the collecting account itself appeared
+        as a participant on this page — `write_participant` refuses to store
+        self (issue #12), so that fact would otherwise vanish rather than
+        being reported back to the caller, which needs it to reconcile
+        against Telegram's own `count` (spec-6.4 boundary; round-2 review)."""
+        self._project_users_vector(ctx, page, raw_id, stamp, counts, METHOD_GET_PARTICIPANTS)
         for chat in page.get("chats") or []:
             upsert_peer(ctx.store, chat, raw_id, stamp, seen_in_chat=None, seen_in_msg=None)
         new = 0
+        self_seen = False
         for participant in page.get("participants") or []:
-            facts = upsert_participant(ctx.store, group_id, participant, raw_id, stamp)
+            facts = participant_row(participant)
             if facts is None:
+                continue  # unknown constructor — never guessed at
+            if is_self(ctx.store, facts.uri):
+                self_seen = True
+                continue
+            if write_participant(ctx.store, group_id, facts, raw_id, stamp) is None:
                 continue
             counts["participants"] += 1
             if facts.uri not in enumerated:
@@ -447,14 +552,20 @@ class ParticipantsCollector:
                 ctx.store, group_id, facts, stamp, ctx.tier, raw_id,
                 {"source": "roster", "status": facts.status},
             )
-        return new
+        return new, self_seen
 
     def _project_users_vector(
-        self, ctx: CollectContext, envelope: dict, raw_id: int, stamp: str, counts: dict[str, int]
+        self, ctx: CollectContext, envelope: dict, raw_id: int, stamp: str, counts: dict[str, int],
+        method: str,
     ) -> None:
         """Roster RPCs enrich DURING discovery (spec §3): every full `User` in
         the response's `users` vector lands in `users` (+ snapshot) and
-        `peers` (provenance preserved) for free."""
+        `peers` (provenance preserved) for free. `method` is the RPC that
+        produced `envelope` — `user_snapshots.method` is both provenance and
+        the dedupe partition (`add_user_snapshot` keys on `(uri, method)`),
+        so each of the four call sites (the group preflight, roster pages,
+        the oracle, reaction lists) must pass its own, not share one
+        hard-coded value."""
         for user in envelope.get("users") or []:
             if (user.get("_") or "").lower() != "user":
                 continue
@@ -464,8 +575,7 @@ class ParticipantsCollector:
                 continue
             counts["users"] += 1
             add_user_snapshot(
-                ctx.store, uri, stamp, ctx.tier, METHOD_GET_PARTICIPANTS,
-                {"user": target_user_facts(user)}, raw_id,
+                ctx.store, uri, stamp, ctx.tier, method, {"user": target_user_facts(user)}, raw_id,
             )
 
     async def _oracle(
@@ -494,11 +604,23 @@ class ParticipantsCollector:
             """,
             (group_id, group_id, group_id),
         ).fetchall()
-        candidates = [r["uri"] for r in rows if r["uri"] not in enumerated][:budget]
-        for uri in candidates:
+        # Resolve to an `input_user_ref` and drop the budget onto THAT
+        # filtered list, not the raw uri list: slicing first (as before)
+        # let an unresolvable candidate occupy a budget slot forever — the
+        # same `ORDER BY uri` query re-selects it in the same position every
+        # run, and the oracle never reaches anyone past it.
+        candidates: list[tuple[str, dict]] = []
+        for r in rows:
+            uri = r["uri"]
+            if uri in enumerated:
+                continue
             ref = input_user_ref(ctx.store, uri)
             if ref is None:
                 continue
+            candidates.append((uri, ref))
+            if len(candidates) >= budget:
+                break
+        for uri, ref in candidates:
             try:
                 answer = await ctx.gateway.get_participant(roster.input_channel, ref)
             except SkipAndRecord as exc:
@@ -524,7 +646,7 @@ class ParticipantsCollector:
                 namespaced_kind("channels", answer, "ChannelParticipant"), answer, ctx.tier,
                 {"channel_id": group_id, "user_id": ref["user_id"]}, observed_at=stamp,
             )
-            self._project_users_vector(ctx, answer, raw_id, stamp, counts)
+            self._project_users_vector(ctx, answer, raw_id, stamp, counts, METHOD_GET_PARTICIPANT)
             facts = upsert_participant(
                 ctx.store, group_id, answer.get("participant") or {}, raw_id, stamp
             )
@@ -555,7 +677,7 @@ class ParticipantsCollector:
         candidates = [m for m in reacted_message_ids(ctx.store, group_id) if m not in done][:budget]
         for msg_id in candidates:
             offset: str | None = None
-            while True:
+            for _ in range(_REACTIONS_MAX_PAGES):
                 try:
                     result = await ctx.gateway.get_message_reactions_list(
                         roster.input_channel, msg_id, offset=offset, limit=_REACTIONS_PAGE
@@ -573,14 +695,28 @@ class ParticipantsCollector:
                     observed_at=stamp,
                 )
                 counts["reaction_lists"] += 1
-                self._project_users_vector(ctx, result, raw_id, stamp, counts)
+                self._project_users_vector(ctx, result, raw_id, stamp, counts, METHOD_REACTIONS)
                 for reaction in result.get("reactions") or []:
                     subject = peer_ref_uri(reaction.get("peer_id"))
                     stub = peer_stub(reaction.get("peer_id"))
                     if subject is None or stub is None:
                         continue
+                    # Fill-only provenance, mirroring the zero-RPC vector's
+                    # own rule (store/reactions.py): a reaction is not a
+                    # documented `inputPeerFromMessage` context (research
+                    # §8.7 lists author, forward header and mention), so it
+                    # must never replace stronger provenance a message
+                    # authorship already recorded for this same peer.
+                    known = ctx.store.conn.execute(
+                        "SELECT seen_in_chat, seen_in_msg FROM peers WHERE uri=?", (subject,)
+                    ).fetchone()
+                    known_chat = known["seen_in_chat"] if known is not None else None
+                    known_msg = known["seen_in_msg"] if known is not None else None
+                    fill = known_chat is None or known_msg is None
                     if upsert_peer(
-                        ctx.store, stub, raw_id, stamp, seen_in_chat=group_id, seen_in_msg=msg_id
+                        ctx.store, stub, raw_id, stamp,
+                        seen_in_chat=group_id if fill else known_chat,
+                        seen_in_msg=msg_id if fill else known_msg,
                     ) is None:
                         continue  # the collecting account reacted (#12)
                     if add_edge_once(
@@ -593,3 +729,9 @@ class ParticipantsCollector:
                 offset = result.get("next_offset")
                 if not offset:
                     break
+            else:
+                ctx.log.warning(
+                    "participants: reaction list for group %s message %s exceeded %d pages "
+                    "without ending — stopping this message",
+                    group_id, msg_id, _REACTIONS_MAX_PAGES,
+                )
