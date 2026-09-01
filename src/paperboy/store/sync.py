@@ -45,7 +45,9 @@ def record_profile_attempt(
     the RPC answers — and the arm that finishes the attempt replaces it, so an
     arm that forgets to report still advanced the queue. Newest stamp wins:
     an older stamp never moves the key backwards (every caller stamps with
-    `ctx.clock.now()`, which is monotonic within a run live AND on replay)."""
+    `ctx.clock.now()` — monotonic on replay, and live barring a wall-clock
+    step; a step backwards between an attempt's two writes can at worst leave
+    `outcome='attempted'` on the row, which affects no scheduling)."""
     store.conn.execute(
         "INSERT INTO profile_attempts (uri, attempted_at, outcome, detail) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(uri) DO UPDATE SET attempted_at = excluded.attempted_at, "

@@ -1022,3 +1022,97 @@ def test_replay_placeholder_name_is_shared_with_the_gateway_seam():
     from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 
     assert REPLAY_UNKNOWN_USER_KIND == "ReplayUnknownUser"
+
+
+@pytest.mark.asyncio
+async def test_channel_forbidden_in_chats_vector_is_a_fill_only_peer(tmp_path):
+    """Round-6 review: `channelForbidden` carries id + access_hash + title
+    (a channel we are banned from — e.g. the target's personal channel), so
+    it deserves a peers row when new to us; a known channel keeps its richer
+    identity (the forbidden object has no username to offer)."""
+    forbidden = {"_": "ChannelForbidden", "id": 777, "access_hash": 7, "title": "Banned Here"}
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {
+            **_full(1), "chats": [forbidden, {"_": "ChatForbidden", "id": 888, "title": "x"},
+                                  {"_": "ChatEmpty", "id": 889}],
+        }
+        await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, enrich_profiles=True)))
+        row = st.conn.execute(
+            "select access_hash, title from peers where uri='tg:channel:777'"
+        ).fetchone()
+        assert (row["access_hash"], row["title"]) == (7, "Banned Here")
+        assert st.conn.execute(
+            "select count(*) from peers where uri in ('tg:chat:888', 'tg:chat:889')"
+        ).fetchone()[0] == 0
+    with Store.open(tmp_path / "q.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        known = {"_": "Channel", "id": 777, "access_hash": 7, "title": "Known", "username": "known"}
+        rid = st.add_raw("Channel", known, "stranger", None)
+        upsert_peer(st, known, rid, T0, seen_in_chat=None, seen_in_msg=None)
+        gw = _enrich_gw(ids=(1,))
+        gw._fx["full_user"][1] = {**_full(1), "chats": [forbidden]}
+        await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, enrich_profiles=True)))
+        row = st.conn.execute(
+            "select username, title from peers where uri='tg:channel:777'"
+        ).fetchone()
+        assert (row["username"], row["title"]) == ("known", "Known")  # fill-only
+
+
+@pytest.mark.asyncio
+async def test_user_empty_triage_answer_does_not_spend_an_enrichment_slot(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        _seed_stub(st, 2, msg=201)
+        gw = FakeGateway({"users": {1: _user(1)}, "full_user": {1: _full(1), 2: _full(2)}})
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=2))
+        )
+        assert gw.full_user_calls == [1]  # 2 answered UserEmpty at triage: a foregone conclusion
+        assert res.counts["empty"] == 1 and res.counts["enriched"] == 1
+        assert st.conn.execute(
+            "select count(*) from profile_attempts where uri='tg:user:2'"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_pass_label_is_refresh_once_every_usable_candidate_was_attempted(tmp_path):
+    """Round-6 review: with enriched and never-enriched candidates interleaved,
+    `pass` is defined on the attempt key — `initial` while a usable candidate
+    was never tried, `refresh` once the population's first pass is complete
+    (an unresolvable stub can never be tried and does not hold it back)."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_population(st)
+        _seed_stub(st, 6, chat=None, msg=None)  # unresolvable forever
+        await ProfilesCollector().collect(
+            _ctx(st, _enrich_gw(), _settings(tmp_path, enrich_profiles=True, profile_budget=3))
+        )
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["pass"] == "initial"  # 4 and 5 never tried
+        gw = _enrich_gw()
+        gw._fx["full_user"][4] = SkipAndRecord("USER_ID_INVALID")
+        await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True, profile_budget=2))
+        )
+        assert gw.full_user_calls == [4, 5]
+        summary = get_state(st, "profiles", str(CHANNEL_ID))
+        assert summary is not None and summary["pass"] == "refresh"  # everyone usable was tried
+
+
+@pytest.mark.asyncio
+async def test_photo_empty_in_history_is_counted(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        history = _photos(701)
+        history["photos"].append({"_": "PhotoEmpty", "id": 0})
+        gw = _enrich_gw(ids=(1,), user_photos={1: history}, avatar={701: b"jpeg"})
+        res = await ProfilesCollector().collect(
+            _ctx(st, gw, _settings(tmp_path, enrich_profiles=True))
+        )
+        assert (res.counts["photos"], res.counts["photos_empty"]) == (1, 1)
+        assert st.conn.execute("select count(*) from user_photos").fetchone()[0] == 1
