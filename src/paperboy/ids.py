@@ -167,6 +167,52 @@ def parse_tme_link(url: str) -> tuple[str, str] | None:
     return ("username", first)
 
 
+def iso_or_none(value: datetime | int | str | None) -> str | None:
+    """`to_iso` for the three shapes a TL `date` reaches a projection in:
+    an aware `datetime` (Telethon's `to_dict()`), epoch seconds (hand-authored
+    fixtures), or already-ISO text (a replayed raw record). `None` passes
+    through — absence is data here (spec §4.3), never an error."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return to_iso(value)
+
+
+# `Peer*`/`InputPeer*` discriminator -> (stub constructor tag, id field).
+# Basic groups (`PeerChat`) are deliberately absent: paperboy targets
+# channel-typed peers and a `Chat` stub has no min/provenance story.
+_PEER_STUB_KIND = {
+    "peeruser": ("User", "user_id"), "inputpeeruser": ("User", "user_id"),
+    "peerchannel": ("Channel", "channel_id"), "inputpeerchannel": ("Channel", "channel_id"),
+}
+
+
+def peer_stub(ref: dict | None) -> dict | None:
+    """A minimal `min` peer object for a bare `Peer*` reference (a message's
+    `from_id`, a forward header's `from_id`, a `recent_repliers` entry, a
+    reaction's `peer_id`), or `None` for anything else. One mapping shared by
+    every producer of message-referenced stubs so they all agree."""
+    if not ref:
+        return None
+    mapped = _PEER_STUB_KIND.get((ref.get("_") or "").lower())
+    if mapped is None:
+        return None
+    tag, id_field = mapped
+    peer_id = ref.get(id_field)
+    return None if peer_id is None else {"_": tag, "id": peer_id, "min": True}
+
+
+def namespaced_kind(namespace: str, payload: dict, default: str) -> str:
+    """The raw-record kind for an RPC-result ENVELOPE. Telethon's `to_dict()`
+    emits the bare class name, so `users.UserFull` (the envelope) and
+    `UserFull` (its inner object) both serialise as `"UserFull"` — replay
+    keys off `kind`, so envelopes are stamped with their TL namespace
+    explicitly. A payload whose `_` is already dotted is returned as-is."""
+    kind = payload.get("_") or default
+    return kind if "." in kind else f"{namespace}.{kind}"
+
+
 def to_iso(dt: datetime | int) -> str:
     """Normalize a timezone-aware datetime or an epoch-seconds int to UTC ISO-8601 text."""
     if isinstance(dt, datetime):

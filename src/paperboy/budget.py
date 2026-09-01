@@ -73,6 +73,10 @@ class Budget:
     sync callable (called and ignored, for tests that just want to record
     calls) or an async one like `asyncio.sleep` (awaited) — `Budget` detects
     which by checking whether the call returns an awaitable.
+
+    `method_intervals` overrides the pace for specific methods
+    (`--profile-interval` → `users.getFullUser`/`photos.getUserPhotos`);
+    flood cooldowns and the run cap apply regardless.
     """
 
     def __init__(
@@ -83,12 +87,14 @@ class Budget:
         clock: _Clock | None = None,
         sleeper: Callable[[float], object] | None = None,
         min_interval: float = DEFAULT_MIN_INTERVAL_SECONDS,
+        method_intervals: dict[str, float] | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self._clock: _Clock = clock or _RealClock()
         self._sleeper: Callable[[float], object] = sleeper or self._default_sleep
         self._min_interval = min_interval
+        self._method_intervals: dict[str, float] = dict(method_intervals or {})
         self._count = 0
         self._last_call: dict[str, float] = {}
 
@@ -141,11 +147,12 @@ class Budget:
             )
         self._count += 1
 
+        interval = self._method_intervals.get(method, self._min_interval)
         last = self._last_call.get(method)
         if last is not None:
             delta = self._clock.time() - last
-            if delta < self._min_interval:
-                await self._sleep(self._min_interval - delta)
+            if delta < interval:
+                await self._sleep(interval - delta)
 
         cooldown = self._active_cooldown_seconds(method)
         if cooldown:

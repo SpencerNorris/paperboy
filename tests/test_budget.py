@@ -175,3 +175,84 @@ async def test_min_interval_paces_repeat_calls_to_same_method(tmp_path):
         # out the per-method minimum interval before proceeding.
         await b.call("m", ok)
         assert slept and slept[0] > 0
+
+
+def test_user_id_invalid_classifies_as_skip_globally():
+    # `users.getFullUser`/`users.getUsers` on a stale `inputUserFromMessage`
+    # provenance can answer USER_ID_INVALID (research Part 2 §1): one user's
+    # enrichment is skipped, the sweep continues — never a raw crash.
+    # USER_ID_INVALID has no other caller in this codebase (only user-input
+    # RPCs can raise it), so — unlike CHANNEL_INVALID below — classifying it
+    # globally via `classify` is safe.
+    from telethon.errors import UserIdInvalidError
+
+    assert classify(UserIdInvalidError(None)) == Disposition.SKIP
+
+
+def test_channel_invalid_does_not_classify_as_skip_globally():
+    # CHANNEL_INVALID is deliberately NOT in `classify`'s global skip list
+    # (errors.py module docstring): `classify` has no per-method scope, and
+    # the same classification would also swallow CHANNEL_INVALID from
+    # `channels.getFullChannel`/`updates.getChannelDifference` on the
+    # collection target itself, which must surface as a real failure, not be
+    # silently skipped. The stale-`inputUserFromMessage` case (spec §5 case
+    # 2) is instead handled locally by `TelethonGateway.get_users`/
+    # `get_full_user` (see tests for those), which catch it and raise
+    # `SkipAndRecord` themselves.
+    from telethon.errors import ChannelInvalidError
+
+    with pytest.raises(ChannelInvalidError):
+        classify(ChannelInvalidError(None))
+
+
+@pytest.mark.asyncio
+async def test_per_method_interval_paces_only_that_method(tmp_path):
+    class Clock:
+        t = 1000.0
+
+        def time(self):
+            return self.t
+
+    clock = Clock()
+    slept: list[float] = []
+    s = load_settings("default", {})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        b = Budget(
+            s, st, clock=clock, sleeper=lambda x: slept.append(x), min_interval=1.0,
+            method_intervals={"users.getFullUser": 2.5},
+        )
+
+        async def ok():
+            return 1
+
+        await b.call("users.getFullUser", ok)
+        clock.t += 0.5
+        await b.call("users.getFullUser", ok)  # 0.5s since last -> sleep 2.0 (the METHOD interval)
+        await b.call("messages.getHistory", ok)  # first call of that method: no sleep
+        clock.t += 0.2
+        await b.call("messages.getHistory", ok)  # default 1.0 interval -> sleep 0.8
+        assert slept == [2.0, pytest.approx(0.8)]
+
+
+@pytest.mark.asyncio
+async def test_per_method_interval_composes_with_flood_handling(tmp_path):
+    # `--profile-interval` never bypasses flood handling: a short FLOOD_WAIT on
+    # a paced method is still recorded and slept, then retried once.
+    s = load_settings("default", {})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        slept: list[float] = []
+        b = Budget(
+            s, st, sleeper=lambda x: slept.append(x),
+            method_intervals={"users.getFullUser": 2.0},
+        )
+        calls = {"n": 0}
+
+        async def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FakeFlood(3)
+            return "ok"
+
+        assert await b.call("users.getFullUser", flaky) == "ok"
+        assert 3 in slept
+        assert st.conn.execute("select count(*) from flood_log").fetchone()[0] == 1

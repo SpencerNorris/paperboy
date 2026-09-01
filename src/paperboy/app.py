@@ -31,6 +31,17 @@ class ConfigError(Exception):
     """Missing credentials/config the operator must fix (not a bug to catch and hide)."""
 
 
+PROFILE_PACED_METHODS = ("users.getFullUser", "photos.getUserPhotos")
+
+
+def profile_method_intervals(settings: Settings) -> dict[str, float]:
+    """`--profile-interval` (spec §7.2) as `Budget.method_intervals`: it paces
+    the two per-user profile RPCs only, THROUGH the budget chokepoint."""
+    if settings.profile_interval is None:
+        return {}
+    return dict.fromkeys(PROFILE_PACED_METHODS, settings.profile_interval)
+
+
 def resolve_api_id(settings: Settings, profile: str) -> int:
     """`api_id` is not a secret (spec §9) — env/config is the documented
     source (`PAPERBOY_API_ID`). As a convenience for operators who already
@@ -119,7 +130,7 @@ async def build_gateway(
     Telethon, the keychain, or the network.
     """
     client = build_client(settings, secrets, profile)
-    budget = Budget(settings, store)
+    budget = Budget(settings, store, method_intervals=profile_method_intervals(settings))
     await client.connect()
     return TelethonGateway(client, budget)
 
