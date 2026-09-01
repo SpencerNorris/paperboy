@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 
 from paperboy.clock import ReplayClock
@@ -238,9 +239,25 @@ async def reproject(
 
     counts = {
         t: (
-            source.conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0],
+            _table_count(source.conn, t),
             out_store.conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0],
         )
         for t in REPROJECT_TABLES
     }
     return ReprojectSummary(phases_seen, results, counts)
+
+
+def _table_count(conn: sqlite3.Connection, table: str) -> int:
+    """Row count of `table` in a SOURCE connection, or 0 if the table doesn't
+    exist there yet. The source is strictly read-only (never migrated —
+    `ReplaySource`'s own docstring), so an archive captured before a table's
+    migration landed (e.g. a pre-person-layer archive has no `users`) must
+    read as 0 rows, not crash this purely-diagnostic summary — the same
+    schema-evolution tolerance `ReplaySource.__init__`'s `_has_run_id` check
+    already applies to `raw_records.run_id`."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+    if not exists:
+        return 0
+    return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
