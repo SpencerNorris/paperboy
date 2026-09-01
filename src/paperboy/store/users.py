@@ -30,9 +30,12 @@ neither clobber a newer enrichment nor be lost behind a newer triage.
 
 The avatar is the one field both levels observe; it is triage-owned only
 until the row's first enrichment, then enrichment-owned (see `upsert_user`),
-which keeps the projection order-independent. `bot_json` is level-keyed
-(`{"user": {...}, "full": {...}}`), each level replaced by its own
-observations, so cleared flags never linger.
+which keeps the projection order-independent ACROSS the two levels. Within
+the triage level, the `min`/full composition keeps ADR-0005 §6's documented
+richness-vs-recency residual (#38's shape): a `min` `apply_min_photo` write
+and an older full `photo` can still land in either order until the row is
+enriched. `bot_json` is level-keyed (`{"user": {...}, "full": {...}}`), each
+level replaced by its own observations, so cleared flags never linger.
 
 Facts about US (`contact`, `bot_can_edit`, `blocked`, `common_chats_count`,
 ...) are stripped at ONE chokepoint — `target_user_facts` /
