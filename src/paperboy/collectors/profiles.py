@@ -83,21 +83,25 @@ class ProfilesCollector:
         counts = {
             "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "triaged": 0, "empty": 0,
             "skipped": 0, "snapshots": 0, "enriched": 0, "refreshed": 0, "fresh_skipped": 0,
-            "photos": 0, "avatars": 0, "restricted_skipped": 0,
+            "photos": 0, "avatars": 0, "restricted_skipped": 0, "unavailable": 0,
         }
-        for channel_id in self._scope_channels(ctx):
-            counts["backfilled_peers"] += backfill_message_referenced_peers(ctx.store, channel_id)
-        await record_privacy_posture(ctx, self.name)
 
         # A `PhaseStop` (FLOOD_WAIT above threshold, or a second consecutive
-        # one) can escape `_triage` or `_enrich` — `budget.Budget.call` raises
-        # it directly, with no `counts`, and only `_enrich` attaches its own
-        # (below) before re-raising. Either way the work already stored here
-        # must still be reported and summarised — `PhaseStop`'s contract
-        # (budget.py) — mirroring `DiscussionCollector.collect`.
+        # one) can escape the backfill/posture calls just as readily as
+        # `_triage`/`_enrich` — `record_privacy_posture` reaches a budgeted
+        # `account.getPrivacy` (round-3 review) — so both live inside the try:
+        # the work already stored here must still be reported and summarised
+        # — `PhaseStop`'s contract (budget.py) — mirroring
+        # `DiscussionCollector.collect`.
         try:
+            for channel_id in self._scope_channels(ctx):
+                counts["backfilled_peers"] += backfill_message_referenced_peers(
+                    ctx.store, channel_id
+                )
+            await record_privacy_posture(ctx, self.name)
+
             refs = self._gather(ctx, counts)
-            await self._triage(ctx, refs, counts)
+            triage_skipped_uris = await self._triage(ctx, refs, counts)
 
             if not ctx.settings.enrich_profiles:
                 budget = ctx.settings.profile_budget
@@ -117,7 +121,7 @@ class ProfilesCollector:
                 self._record_summary(ctx, counts, pass_="triage_only")
                 return CollectResult(name=self.name, counts=counts)
 
-            await self._enrich(ctx, counts)
+            await self._enrich(ctx, counts, triage_skipped_uris)
         except PhaseStop as stop:
             if not stop.counts:
                 # Raised below `_enrich`'s own wrap (i.e. from `_gather`/
@@ -165,14 +169,23 @@ class ProfilesCollector:
 
     async def _triage(
         self, ctx: CollectContext, refs: list[tuple[str, dict]], counts: dict[str, int]
-    ) -> None:
+    ) -> set[str]:
+        """Returns the URIs this run's triage proved unusable (bisected down
+        to a lone `SkipAndRecord`) — `_enrich` must not re-spend budget on the
+        same stale provenance within the same run (round-3 review)."""
+        skipped_uris: set[str] = set()
         for start in range(0, len(refs), _GET_USERS_BATCH):
             batch = refs[start:start + _GET_USERS_BATCH]
-            for user in await self._get_users_resilient(ctx, batch, counts):
+            for user in await self._get_users_resilient(ctx, batch, counts, skipped_uris):
                 self._project_triaged(ctx, user, counts)
+        return skipped_uris
 
     async def _get_users_resilient(
-        self, ctx: CollectContext, batch: list[tuple[str, dict]], counts: dict[str, int]
+        self,
+        ctx: CollectContext,
+        batch: list[tuple[str, dict]],
+        counts: dict[str, int],
+        skipped_uris: set[str],
     ) -> list[dict]:
         """One stale `from_msg` provenance fails the whole `getUsers` vector;
         bisect to isolate it rather than losing the batch (plan D13)."""
@@ -182,10 +195,11 @@ class ProfilesCollector:
             if len(batch) == 1:
                 ctx.log.warning("profiles: triage skipped for %s: %s", batch[0][0], exc)
                 counts["skipped"] += 1
+                skipped_uris.add(batch[0][0])
                 return []
             mid = len(batch) // 2
-            head = await self._get_users_resilient(ctx, batch[:mid], counts)
-            tail = await self._get_users_resilient(ctx, batch[mid:], counts)
+            head = await self._get_users_resilient(ctx, batch[:mid], counts, skipped_uris)
+            tail = await self._get_users_resilient(ctx, batch[mid:], counts, skipped_uris)
             return head + tail
 
     def _project_triaged(self, ctx: CollectContext, user: dict, counts: dict[str, int]) -> None:
@@ -276,10 +290,18 @@ class ProfilesCollector:
 
     # ---- full enrichment (--profiles) -----------------------------------------
 
-    async def _enrich(self, ctx: CollectContext, counts: dict[str, int]) -> None:
+    async def _enrich(
+        self, ctx: CollectContext, counts: dict[str, int], triage_skipped_uris: set[str]
+    ) -> None:
         """Spend `profile_budget` `getFullUser` fetches on the highest-priority
         never-enriched users, then wrap to refreshing the stalest (spec §7.1).
-        A failed attempt still spends budget: the RPC was made.
+        A failed attempt still spends budget: the RPC was made — EXCEPT a URI
+        this same run's triage already proved unusable (`triage_skipped_uris`):
+        its stale `(seen_in_chat, seen_in_msg)` provenance produces the
+        identical `ChannelInvalidError` at `getFullUser`, so retrying it here
+        would waste the whole budget on a foregone conclusion and starve
+        every lower-priority candidate — already counted `skipped` by triage,
+        never spent, never double-counted (round-3 review).
 
         The whole loop is wrapped so a `PhaseStop` escaping mid-enrichment
         (a `FLOOD_WAIT` above threshold, from `get_full_user`/`get_user_photos`/
@@ -298,6 +320,8 @@ class ProfilesCollector:
             for uri, user_id, enriched_at in self._enrichment_candidates(ctx):
                 if spent >= budget:
                     break
+                if uri in triage_skipped_uris:
+                    continue
                 if enriched_at is not None:
                     pass_ = "refresh"
                     if floor is not None and _seconds_between(enriched_at, now) < floor:
@@ -316,6 +340,7 @@ class ProfilesCollector:
                 except SkipAndRecord as exc:
                     ctx.log.warning("profiles: full profile skipped for %s: %s", uri, exc)
                     counts["skipped"] += 1
+                    self._record_enrich_skip(ctx, user_id, exc)
                     continue
                 observed_at = ctx.clock.for_payload(full)
                 raw_id = ctx.store.add_raw(
@@ -336,16 +361,25 @@ class ProfilesCollector:
                     # raw but not projectable — counted, never guessed at.
                     counts["skipped"] += 1
                     continue
-                if not full_user or full_user.get("id") != user["id"]:
-                    # `upsert_user` raises on a mismatched/absent `full_user`
-                    # (store/users.py) — a malformed envelope is symmetric
-                    # with the missing-`user` case above: recorded raw,
-                    # counted, never guessed at, never a crashed run.
+                if (user.get("_") or "").lower() != "user" or not full_user \
+                        or full_user.get("id") != user["id"]:
+                    # `upsert_user` raises on a non-`User` subject (`Vector<User>`'s
+                    # union includes `userEmpty`) or a mismatched/absent
+                    # `full_user` — a malformed envelope is symmetric with the
+                    # missing-`user` case above: recorded raw, counted, never
+                    # guessed at, never a crashed run.
                     counts["skipped"] += 1
                     continue
                 for chat in full.get("chats") or []:
                     # e.g. the personal channel (`personal_channel_id`): a
                     # full Channel object — a real pivot, worth a peer row.
+                    # `Vector<Chat>`'s union also legally carries `ChatEmpty`/
+                    # `ChatForbidden` (id + title only, no `access_hash`, no
+                    # `min`) — a full observation with no richness would
+                    # overwrite a known peer's identity columns with NULLs
+                    # under `upsert_peer`'s recency rule; skip them.
+                    if (chat.get("_") or "").lower().endswith(("empty", "forbidden")):
+                        continue
                     self._upsert_peer_keeping_provenance(ctx, chat, raw_id, observed_at)
                 if self._project_user(
                     ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts,
@@ -364,12 +398,35 @@ class ProfilesCollector:
             )
         self._record_summary(ctx, counts, pass_=pass_)
 
+    def _record_enrich_skip(self, ctx: CollectContext, user_id: int, exc: Exception) -> None:
+        """A durable negative observation (the project's raw-first convention
+        for negative results — precedent: the synthetic `AvatarDownload` kind
+        above, `RosterWalled`/`UserNotParticipant` in the participants
+        collector) — so a ref that fails `getFullUser` for a reason
+        `_triage` never saw (e.g. privacy-gated, not merely stale provenance)
+        still leaves a durable trace. `_enrichment_candidates` reads it back
+        to sort a previously-failed user after one never attempted, bounding
+        the retry loop ACROSS runs rather than only within one (round-3
+        review)."""
+        payload = {"_": "ProfileFetchSkipped", "user_id": user_id, "reason": str(exc)}
+        observed_at = ctx.clock.for_payload(payload)
+        ctx.store.add_raw(
+            "ProfileFetchSkipped", payload, ctx.tier,
+            {"channel_id": ctx.channel_id, "user_id": user_id, "method": METHOD_GET_FULL_USER},
+            observed_at=observed_at,
+        )
+
     def _enrichment_candidates(self, ctx: CollectContext) -> list[tuple[str, int, str | None]]:
         """Every discovered user, in spend order (spec §7/§7.1): never-enriched
-        first — admins → authors → commenters → others, then `uri` for
-        determinism (replay must make the same choices) — then already-
-        enriched users stalest first (the refresh wrap). A user with no
-        `users` row yet (its triage batch failed) still gets a turn:
+        first — admins → authors → commenters → others OF THIS TARGET (the
+        rank-0/1/2 arms are all scoped to `ctx.channel_id`/its linked group —
+        a sibling target sharing this profile DB must rank as "other", never
+        pre-empt this target's own people, round-3 review), with a user whose
+        last `getFullUser` attempt recorded a `ProfileFetchSkipped` durable
+        skip (see `_record_enrich_skip`) sorted after one never attempted —
+        then `uri` for determinism (replay must make the same choices) — then
+        already-enriched users stalest first (the refresh wrap). A user with
+        no `users` row yet (its triage batch failed) still gets a turn:
         `getFullUser` triages as a side effect."""
         assert ctx.channel_id is not None
         scope = self._scope_channels(ctx)
@@ -379,18 +436,26 @@ class ProfilesCollector:
             SELECT p.uri AS uri, p.id AS id, u.enriched_at AS enriched_at,
               CASE
                 WHEN EXISTS (SELECT 1 FROM participants pa WHERE pa.uri = p.uri
-                             AND pa.status IN ('admin', 'creator')) THEN 0
+                             AND pa.status IN ('admin', 'creator')
+                             AND (pa.group_id = ? OR (? IS NOT NULL AND pa.group_id = ?))
+                             ) THEN 0
                 WHEN EXISTS (SELECT 1 FROM messages m WHERE m.from_uri = p.uri
                              AND m.channel_id = ?) THEN 1
                 WHEN ? IS NOT NULL AND EXISTS (SELECT 1 FROM messages m WHERE m.from_uri = p.uri
                                                AND m.channel_id = ?) THEN 2
                 ELSE 3
-              END AS rank
+              END AS rank,
+              (SELECT MAX(observed_at) FROM raw_records
+                 WHERE kind = 'ProfileFetchSkipped'
+                   AND CAST(json_extract(context_json, '$.user_id') AS INTEGER) = p.id
+              ) AS last_failed_at
             FROM peers p LEFT JOIN users u ON u.uri = p.uri
             WHERE p.kind = 'user'
-            ORDER BY (u.enriched_at IS NOT NULL), u.enriched_at, rank, p.uri
+            ORDER BY (u.enriched_at IS NOT NULL),
+                     (u.enriched_at IS NULL AND last_failed_at IS NOT NULL),
+                     u.enriched_at, rank, p.uri
             """,
-            (ctx.channel_id, group_id, group_id),
+            (ctx.channel_id, group_id, group_id, ctx.channel_id, group_id, group_id),
         ).fetchall()
         return [(r["uri"], r["id"], r["enriched_at"]) for r in rows]
 
@@ -449,13 +514,14 @@ class ProfilesCollector:
             return
         if data is None:
             # Server-side-unavailable (e.g. a stale file reference) rather
-            # than a raised `SkipAndRecord` — still worth a log line so the
-            # outcome isn't invisible, matching `media.py`'s identical
-            # `download_media` -> `None` case.
+            # than a raised `SkipAndRecord` — still worth a log line AND a
+            # count so the outcome isn't invisible, matching `media.py`'s
+            # identical `download_media` -> `None` case.
             ctx.log.warning(
                 "profiles: avatar %s unavailable for %s (download returned no bytes)",
                 photo["id"], uri,
             )
+            counts["unavailable"] += 1
             return
         sha = hashlib.sha256(data).hexdigest()
         path = media_root / sha[:2] / f"{sha}.jpg"  # Telegram re-encodes avatars as JPEG
