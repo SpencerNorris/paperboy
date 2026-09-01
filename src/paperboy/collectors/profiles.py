@@ -102,7 +102,7 @@ class ProfilesCollector:
             await record_privacy_posture(ctx, self.name)
 
             refs = self._gather(ctx, counts)
-            triage_skipped_uris = await self._triage(ctx, refs, counts)
+            unusable_uris = await self._triage(ctx, refs, counts)
 
             if not ctx.settings.enrich_profiles:
                 budget = ctx.settings.profile_budget
@@ -122,7 +122,7 @@ class ProfilesCollector:
                 self._record_summary(ctx, counts, pass_="triage_only")
                 return CollectResult(name=self.name, counts=counts)
 
-            await self._enrich(ctx, counts, triage_skipped_uris)
+            await self._enrich(ctx, counts, unusable_uris)
         except PhaseStop as stop:
             if not stop.counts:
                 # Raised below `_enrich`'s own wrap (i.e. from `_gather`/
@@ -348,17 +348,19 @@ class ProfilesCollector:
         return "refresh"
 
     async def _enrich(
-        self, ctx: CollectContext, counts: dict[str, int], triage_skipped_uris: set[str]
+        self, ctx: CollectContext, counts: dict[str, int], unusable_uris: set[str]
     ) -> None:
         """Spend `profile_budget` `getFullUser` fetches on the highest-priority
         never-enriched users, then wrap to refreshing the stalest (spec §7.1).
         A failed attempt still spends budget: the RPC was made — EXCEPT a URI
-        this same run's triage already proved unusable (`triage_skipped_uris`):
-        its stale `(seen_in_chat, seen_in_msg)` provenance produces the
-        identical `ChannelInvalidError` at `getFullUser`, so retrying it here
-        would waste the whole budget on a foregone conclusion and starve
-        every lower-priority candidate — already counted `skipped` by triage,
-        never spent, never double-counted (round-3 review).
+        this same run's triage already proved unusable (`unusable_uris`) —
+        either its stale `(seen_in_chat, seen_in_msg)` provenance produced a
+        `SkipAndRecord` at `getUsers` (the identical `CHANNEL_INVALID` would
+        follow at `getFullUser`), or triage answered `UserEmpty` (Telegram's
+        definitive "not visible to you", which `getFullUser` cannot improve
+        on) — so retrying here would waste the budget on a foregone
+        conclusion and starve every lower-priority candidate; already counted
+        by triage, never spent, never double-counted (round-3/round-6 reviews).
 
         The whole loop is wrapped so a `PhaseStop` escaping mid-enrichment
         (a `FLOOD_WAIT` above threshold, from `get_full_user`/`get_user_photos`/
@@ -374,11 +376,15 @@ class ProfilesCollector:
         spent = 0
         candidates = self._enrichment_candidates(ctx)
         attempted_now: set[str] = set()
+
+        def label() -> str:
+            return self._pass_label(ctx, candidates, unusable_uris, attempted_now)
+
         try:
             for uri, user_id, enriched_at, _attempted_at in candidates:
                 if spent >= budget:
                     break
-                if uri in triage_skipped_uris:
+                if uri in unusable_uris:
                     continue
                 if (
                     enriched_at is not None and floor is not None
@@ -477,20 +483,14 @@ class ProfilesCollector:
                 record_profile_attempt(ctx.store, uri, ctx.clock.now(), "enriched")
                 await self._photos(ctx, uri, user_id, ref, counts)
         except PhaseStop as stop:
-            self._record_summary(
-                ctx, counts,
-                pass_=self._pass_label(ctx, candidates, triage_skipped_uris, attempted_now),
-            )
+            self._record_summary(ctx, counts, pass_=label())
             raise PhaseStop(*stop.args, counts=counts) from stop
         if spent >= budget:
             ctx.log.info(
                 "profiles: getFullUser budget (%d) spent this run; re-run to keep converging",
                 budget,
             )
-        self._record_summary(
-                ctx, counts,
-                pass_=self._pass_label(ctx, candidates, triage_skipped_uris, attempted_now),
-            )
+        self._record_summary(ctx, counts, pass_=label())
 
     def _enrichment_candidates(
         self, ctx: CollectContext
