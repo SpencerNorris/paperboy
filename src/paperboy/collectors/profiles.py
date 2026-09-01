@@ -39,7 +39,7 @@ from paperboy.ids import namespaced_kind
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
 from paperboy.store.peers import classify_peer, input_user_ref, upsert_peer
-from paperboy.store.sync import set_state
+from paperboy.store.sync import record_profile_attempt, set_state
 from paperboy.store.users import (
     add_user_snapshot,
     set_user_photo_sha,
@@ -176,37 +176,62 @@ class ProfilesCollector:
         skipped_uris: set[str] = set()
         for start in range(0, len(refs), _GET_USERS_BATCH):
             batch = refs[start:start + _GET_USERS_BATCH]
-            for user in await self._get_users_resilient(ctx, batch, counts, skipped_uris):
-                self._project_triaged(ctx, user, counts)
+            await self._triage_batch(ctx, batch, counts, skipped_uris)
         return skipped_uris
 
-    async def _get_users_resilient(
+    async def _triage_batch(
         self,
         ctx: CollectContext,
         batch: list[tuple[str, dict]],
         counts: dict[str, int],
         skipped_uris: set[str],
-    ) -> list[dict]:
+    ) -> None:
         """One stale `from_msg` provenance fails the whole `getUsers` vector;
-        bisect to isolate it rather than losing the batch (plan D13)."""
+        bisect to isolate it rather than losing the batch (plan D13). Every
+        sub-batch that DOES answer is recorded and projected before the next
+        one is asked, so a `PhaseStop` (a `FLOOD_WAIT` above threshold)
+        part-way through a bisection never discards responses already
+        received — raw-first holds on the abort path too (round-4 review)."""
         try:
-            return await ctx.gateway.get_users([ref for _, ref in batch])
+            users = await ctx.gateway.get_users([ref for _, ref in batch])
         except SkipAndRecord as exc:
             if len(batch) == 1:
                 ctx.log.warning("profiles: triage skipped for %s: %s", batch[0][0], exc)
                 counts["skipped"] += 1
                 skipped_uris.add(batch[0][0])
-                return []
+                return
             mid = len(batch) // 2
-            head = await self._get_users_resilient(ctx, batch[:mid], counts, skipped_uris)
-            tail = await self._get_users_resilient(ctx, batch[mid:], counts, skipped_uris)
-            return head + tail
+            await self._triage_batch(ctx, batch[:mid], counts, skipped_uris)
+            await self._triage_batch(ctx, batch[mid:], counts, skipped_uris)
+            return
+        for user in users:
+            self._project_triaged(ctx, user, counts)
 
     def _project_triaged(self, ctx: CollectContext, user: dict, counts: dict[str, int]) -> None:
         kind = (user.get("_") or "").lower()
         if kind not in ("user", "userempty"):
-            # `ReplayUnknownUser`: the original run never observed this id —
-            # nothing to project (reproject D4.1's analogue).
+            # A non-success that must still be accounted for (`gathered ==
+            # triaged + empty + skipped + unresolvable`). `ReplayUnknownUser`
+            # is the expected replay placeholder for an id the original run
+            # never got an answer for (reproject D4.1's analogue — the
+            # original counted it `skipped` too) and is never written to raw:
+            # it is not an observation. Anything else IS something the
+            # gateway returned — record it raw and say so.
+            counts["skipped"] += 1
+            if kind == "replayunknownuser":
+                return
+            ctx.log.warning(
+                "profiles: unexpected getUsers result %r for id %s — skipped",
+                user.get("_"), user.get("id"),
+            )
+            ctx.store.add_raw(
+                user.get("_") or "Unknown", user, ctx.tier,
+                {
+                    "channel_id": ctx.channel_id, "method": METHOD_GET_USERS,
+                    "user_id": user.get("id"),
+                },
+                observed_at=ctx.clock.for_payload(user),
+            )
             return
         observed_at = ctx.clock.for_payload(user)
         raw_id = ctx.store.add_raw(
@@ -335,12 +360,19 @@ class ProfilesCollector:
                     # would inflate the population figure past `gathered`.
                     continue
                 spent += 1
+                # THE attempt chokepoint (plan D3 as amended): the rotation
+                # key advances here, before any outcome is known, so no arm
+                # below — present or future — can spend a slot without
+                # moving this user behind everyone not yet attempted.
+                record_profile_attempt(ctx.store, uri, ctx.clock.now(), "attempted")
                 try:
                     full = await ctx.gateway.get_full_user(ref)
                 except SkipAndRecord as exc:
                     ctx.log.warning("profiles: full profile skipped for %s: %s", uri, exc)
                     counts["skipped"] += 1
-                    self._record_enrich_skip(ctx, user_id, exc)
+                    record_profile_attempt(
+                        ctx.store, uri, ctx.clock.now(), "skipped", str(exc)
+                    )
                     continue
                 observed_at = ctx.clock.for_payload(full)
                 raw_id = ctx.store.add_raw(
@@ -360,6 +392,10 @@ class ProfilesCollector:
                     # (research Part 2 §1); a response without it is recorded
                     # raw but not projectable — counted, never guessed at.
                     counts["skipped"] += 1
+                    record_profile_attempt(
+                        ctx.store, uri, observed_at, "malformed",
+                        "subject missing from users vector",
+                    )
                     continue
                 if (user.get("_") or "").lower() != "user" or not full_user \
                         or full_user.get("id") != user["id"]:
@@ -369,6 +405,10 @@ class ProfilesCollector:
                     # missing-`user` case above: recorded raw, counted, never
                     # guessed at, never a crashed run.
                     counts["skipped"] += 1
+                    record_profile_attempt(
+                        ctx.store, uri, observed_at, "malformed",
+                        "non-User subject or missing/mismatched full_user",
+                    )
                     continue
                 for chat in full.get("chats") or []:
                     # e.g. the personal channel (`personal_channel_id`): a
@@ -385,8 +425,10 @@ class ProfilesCollector:
                     ctx, user, raw_id, observed_at, METHOD_GET_FULL_USER, counts,
                     full_user=full_user,
                 ) is None:
+                    record_profile_attempt(ctx.store, uri, observed_at, "not_projected")
                     continue
                 counts["refreshed" if enriched_at is not None else "enriched"] += 1
+                record_profile_attempt(ctx.store, uri, observed_at, "enriched")
                 await self._photos(ctx, uri, user_id, ref, counts)
         except PhaseStop as stop:
             self._record_summary(ctx, counts, pass_=pass_)
@@ -398,36 +440,26 @@ class ProfilesCollector:
             )
         self._record_summary(ctx, counts, pass_=pass_)
 
-    def _record_enrich_skip(self, ctx: CollectContext, user_id: int, exc: Exception) -> None:
-        """A durable negative observation (the project's raw-first convention
-        for negative results — precedent: the synthetic `AvatarDownload` kind
-        above, `RosterWalled`/`UserNotParticipant` in the participants
-        collector) — so a ref that fails `getFullUser` for a reason
-        `_triage` never saw (e.g. privacy-gated, not merely stale provenance)
-        still leaves a durable trace. `_enrichment_candidates` reads it back
-        to sort a previously-failed user after one never attempted, bounding
-        the retry loop ACROSS runs rather than only within one (round-3
-        review)."""
-        payload = {"_": "ProfileFetchSkipped", "user_id": user_id, "reason": str(exc)}
-        observed_at = ctx.clock.for_payload(payload)
-        ctx.store.add_raw(
-            "ProfileFetchSkipped", payload, ctx.tier,
-            {"channel_id": ctx.channel_id, "user_id": user_id, "method": METHOD_GET_FULL_USER},
-            observed_at=observed_at,
-        )
-
     def _enrichment_candidates(self, ctx: CollectContext) -> list[tuple[str, int, str | None]]:
-        """Every discovered user, in spend order (spec §7/§7.1): never-enriched
-        first — admins → authors → commenters → others OF THIS TARGET (the
-        rank-0/1/2 arms are all scoped to `ctx.channel_id`/its linked group —
-        a sibling target sharing this profile DB must rank as "other", never
-        pre-empt this target's own people, round-3 review), with a user whose
-        last `getFullUser` attempt recorded a `ProfileFetchSkipped` durable
-        skip (see `_record_enrich_skip`) sorted after one never attempted —
-        then `uri` for determinism (replay must make the same choices) — then
-        already-enriched users stalest first (the refresh wrap). A user with
-        no `users` row yet (its triage batch failed) still gets a turn:
-        `getFullUser` triages as a side effect."""
+        """Every discovered user, in spend order (spec §7/§7.1), keyed on the
+        ROTATION key `profile_attempts.attempted_at` (plan D3 as amended) —
+        not on `users.enriched_at`, which moves only on success and would pin
+        a permanently-failing user to the head of every run:
+
+        1. never enriched, never attempted — admins → authors → commenters →
+           others OF THIS TARGET (the rank arms are scoped to `ctx.channel_id`
+           and its linked group; a sibling target sharing this profile DB
+           ranks as "other", never pre-empting this target's own people),
+           then `uri` for determinism (replay must make the same choices);
+        2. never enriched, attempted before — least recently attempted first,
+           so a failed fetch is retried only after every fresh candidate has
+           had its turn;
+        3. enriched — the refresh wrap, least recently attempted first (every
+           successful enrichment is also an attempt, so with no failures this
+           is exactly "stalest enrichment first").
+
+        A user with no `users` row yet (its triage batch failed) still gets a
+        turn: `getFullUser` triages as a side effect."""
         assert ctx.channel_id is not None
         scope = self._scope_channels(ctx)
         group_id = scope[1] if len(scope) > 1 else None
@@ -444,16 +476,15 @@ class ProfilesCollector:
                 WHEN ? IS NOT NULL AND EXISTS (SELECT 1 FROM messages m WHERE m.from_uri = p.uri
                                                AND m.channel_id = ?) THEN 2
                 ELSE 3
-              END AS rank,
-              (SELECT MAX(observed_at) FROM raw_records
-                 WHERE kind = 'ProfileFetchSkipped'
-                   AND CAST(json_extract(context_json, '$.user_id') AS INTEGER) = p.id
-              ) AS last_failed_at
-            FROM peers p LEFT JOIN users u ON u.uri = p.uri
+              END AS rank
+            FROM peers p
+              LEFT JOIN users u ON u.uri = p.uri
+              LEFT JOIN profile_attempts a ON a.uri = p.uri
             WHERE p.kind = 'user'
             ORDER BY (u.enriched_at IS NOT NULL),
-                     (u.enriched_at IS NULL AND last_failed_at IS NOT NULL),
-                     u.enriched_at, rank, p.uri
+                     (a.attempted_at IS NOT NULL),
+                     COALESCE(a.attempted_at, u.enriched_at),
+                     rank, p.uri
             """,
             (ctx.channel_id, group_id, group_id, ctx.channel_id, group_id, group_id),
         ).fetchall()
