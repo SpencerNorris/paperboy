@@ -28,6 +28,30 @@ def test_phase_status_reads_store(tmp_path):
         assert phase_status(st, "history") == "0 messages"
 
 
+def test_phase_status_reads_the_person_layer(tmp_path):
+    # Person-layer wiring (plan Task 11) — `participants` counts the roster,
+    # `profiles` counts both triaged and fully-`enriched_at` users. Neither
+    # branch is exercised by `test_phase_status_reads_store` above; a wrong
+    # table/column name here would be swallowed by `phase_status`'s own
+    # best-effort `except Exception: return ""` and read as a silent no-op
+    # heartbeat rather than a failure, so it needs its own direct assertion.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        st.conn.execute(
+            "INSERT INTO users (uri, id, tier, enriched_at, first_seen, last_seen) "
+            "VALUES ('tg:user:1', 1, 'stranger', NULL, 't', 't')"
+        )
+        st.conn.execute(
+            "INSERT INTO users (uri, id, tier, enriched_at, first_seen, last_seen) "
+            "VALUES ('tg:user:2', 2, 'stranger', 't', 't', 't')"
+        )
+        st.conn.execute(
+            "INSERT INTO participants (group_id, uri, status, first_seen, last_seen) "
+            "VALUES (77, 'tg:user:1', 'member', 't', 't')"
+        )
+        assert phase_status(st, "participants") == "1 members"
+        assert phase_status(st, "profiles") == "2 users · 1 enriched"
+
+
 @pytest.mark.asyncio
 async def test_progress_logs_phase_start_and_end(tmp_path, caplog):
     with Store.open(tmp_path / "p.sqlite") as st:
