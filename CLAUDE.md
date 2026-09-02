@@ -20,8 +20,13 @@ transcript). `watch` and `lookup` are Phase 2 stubs. `paperboy reproject`
 credentials — see `docs/features/reproject.md`) shipped on `feat/reproject`;
 its run-structure redesign (`raw_records.run_id`, replay once per historical
 run — see `docs/adr/0005-run-structure.md`) has landed on top of it.
-Phase 2 collectors: `discussion`/`graph`/`media`/`web` are implemented;
-`participants`/`profiles` are not started.
+Phase 2 collectors: `discussion`/`graph`/`media`/`web`/`participants`/`profiles`
+are implemented — the person layer shipped on `feat/person-layer` (#41): the
+`participants` roster collector and the `profiles` enrichment collector, both
+default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
+`user_snapshots`/`user_photos`/`participants`/`participant_snapshots` tables
+(migration `0004_people.sql`) and reproject-replay support. See
+`docs/features/person-layer.md` and `docs/adr/0006-person-layer-storage.md`.
 
 ## Read these first
 
@@ -49,6 +54,10 @@ Phase 2 collectors: `discussion`/`graph`/`media`/`web` are implemented;
 - **`pts` is the sync primitive** (`updates.getChannelDifference`), not
   `last_message_id`; messages are versioned (`message_revisions`), deletions
   are tombstones, counters are time series.
+- Profile richness lives in `users`/`user_snapshots`, **never** in `peers`
+  (keeps the `upsert_peer` #38/#39 lattice untouched); tri-state fields are
+  `present | absent | hidden_from_you` in `field_states_json`, and "no photo"
+  is never recorded as a fact (ADR-0006).
 - `min` peers are stored with `(seen_in_chat, seen_in_msg)` provenance and
   fetched via `inputUserFromMessage`; optional user fields are tri-state
   (present / not-set / hidden-from-you) — never record "no photo".
