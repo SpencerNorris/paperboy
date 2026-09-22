@@ -317,3 +317,65 @@ async def test_media_without_since_reports_zero_out_of_window(tmp_path):
         res = await MediaCollector().collect(_ctx(st, gw, settings))
     assert res.counts["downloaded"] == 1
     assert res.counts["out_of_window"] == 0
+
+
+def _sized_doc(msg_id, size, **kw):
+    m = _doc_msg(msg_id, doc_id=msg_id, **kw)
+    m["media"]["document"]["size"] = size
+    return m
+
+
+@pytest.mark.asyncio
+async def test_media_msgs_downloads_only_listed_messages(tmp_path):
+    settings = load_settings("default", {"data_dir": tmp_path, "media_msgs": [2, 9]})
+    gw = FakeGateway({"media": {1: b"a", 2: b"b", 3: b"c"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        for i in (1, 2, 3):
+            _seed(st, _doc_msg(i, doc_id=i))
+        res = await MediaCollector().collect(_ctx(st, gw, settings))
+    assert gw.download_media_calls == [2]
+    assert res.counts["downloaded"] == 1
+    assert res.counts["not_selected"] == 2
+
+
+@pytest.mark.asyncio
+async def test_media_max_mb_skips_oversized_before_downloading(tmp_path, caplog):
+    settings = load_settings("default", {"data_dir": tmp_path, "media_max_mb": 1})
+    gw = FakeGateway({"media": {1: b"small", 2: b"big"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        _seed(st, _sized_doc(1, 1_000_000))       # exactly 1 MB: allowed
+        _seed(st, _sized_doc(2, 1_000_001))       # over the cap: skipped, never fetched
+        with caplog.at_level(logging.INFO):
+            res = await MediaCollector().collect(_ctx(st, gw, settings))
+    assert gw.download_media_calls == [1]
+    assert res.counts["too_large"] == 1
+    assert res.counts["downloaded"] == 1
+    assert "msg 2" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_media_max_mb_uses_largest_photo_size(tmp_path):
+    settings = load_settings("default", {"data_dir": tmp_path, "media_max_mb": 1})
+    photo = _photo_msg(1)
+    photo["media"]["photo"]["sizes"] = [
+        {"_": "PhotoSize", "type": "m", "size": 30_000},
+        {"_": "PhotoSizeProgressive", "type": "y", "sizes": [20_000, 2_500_000]},
+    ]
+    gw = FakeGateway({"media": {1: b"p"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        _seed(st, photo)
+        res = await MediaCollector().collect(_ctx(st, gw, settings))
+    assert gw.download_media_calls == []
+    assert res.counts["too_large"] == 1
+
+
+@pytest.mark.asyncio
+async def test_media_max_mb_downloads_when_size_unknown(tmp_path):
+    # No size in the stored dict: we can't prove it's too big, so fetch it.
+    settings = load_settings("default", {"data_dir": tmp_path, "media_max_mb": 1})
+    gw = FakeGateway({"media": {1: b"x"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        _seed(st, _doc_msg(1))
+        res = await MediaCollector().collect(_ctx(st, gw, settings))
+    assert gw.download_media_calls == [1]
+    assert res.counts["too_large"] == 0

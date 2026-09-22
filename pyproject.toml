@@ -14,6 +14,7 @@ dependencies = [
   "structlog>=24",
   "rich>=13",
   "pysocks>=1.7",
+  "cryptg>=0.6.0",
 ]
 
 [project.scripts]

@@ -1,3 +1,4 @@
+import pytest
 from typer.testing import CliRunner
 
 from paperboy import app as composition
@@ -375,3 +376,16 @@ def test_collect_media_since_rejects_bad_value(tmp_path):
     )
     assert result.exit_code != 0
     assert "media-since" in result.output
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"), [("--media-msgs", "abc"), ("--media-max-mb", "0")]
+)
+def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_badsel", "--media", flag, value, "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code != 0
+    assert flag.lstrip("-") in result.output
