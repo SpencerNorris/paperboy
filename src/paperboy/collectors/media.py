@@ -116,11 +116,34 @@ class MediaCollector:
 
         content_index = self._load_content_index(ctx, channel_id)
 
+        base_where = "channel_id=? AND media_kind IS NOT NULL AND deleted_at IS NULL"
+        params: tuple = (channel_id,)
+        where = base_where
+        counts["out_of_window"] = 0
+        since = ctx.settings.media_since
+        if since is not None:
+            # `--media-since` (issue #52). `messages.date` is stored as
+            # `to_iso()` text (`YYYY-MM-DDTHH:MM:SS+00:00`) and `parse_since`
+            # yields a whole-second UTC cutoff of the same shape, so a string
+            # comparison orders correctly. A NULL date can't be placed in the
+            # window and is excluded — counted as out_of_window, not dropped.
+            cutoff = since.isoformat()
+            where = f"{base_where} AND date >= ?"
+            params = (channel_id, cutoff)
+            counts["out_of_window"] = ctx.store.conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE {base_where} "
+                "AND (date IS NULL OR date < ?)",
+                (channel_id, cutoff),
+            ).fetchone()[0]
+            ctx.log.info(
+                "media: window since %s — %d media message(s) before it skipped",
+                cutoff, counts["out_of_window"],
+            )
+
         rows = ctx.store.conn.execute(
             "SELECT uri, msg_id, media_kind, media_json, first_seen FROM messages "
-            "WHERE channel_id=? AND media_kind IS NOT NULL AND deleted_at IS NULL "
-            "ORDER BY msg_id",
-            (channel_id,),
+            f"WHERE {where} ORDER BY msg_id",
+            params,
         ).fetchall()
 
         for row in rows:

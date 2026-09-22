@@ -332,3 +332,46 @@ def test_export_without_prior_collect_exits_nonzero(tmp_path):
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result.exit_code != 0
+
+
+def test_collect_media_since_skips_older_media(tmp_path, monkeypatch):
+    fx = _fixtures()
+    fx["history"] = [
+        {
+            "_": "message", "id": 1, "message": "", "date": 1767322445,  # 2026-01-02
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 1, "access_hash": 1, "mime_type": "text/plain",
+                    "attributes": [{"_": "DocumentAttributeFilename", "file_name": "a.txt"}],
+                },
+            },
+        }
+    ]
+    fx["media"] = {1: b"hello"}
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(fx)
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_since", "--media",
+         "--media-since", "2026-03-22", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "out_of_window" in result.stdout
+    assert not any((tmp_path / "clitest_since" / "media").rglob("*.txt"))
+
+
+def test_collect_media_since_rejects_bad_value(tmp_path):
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_badsince", "--media",
+         "--media-since", "whenever", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code != 0
+    assert "media-since" in result.output

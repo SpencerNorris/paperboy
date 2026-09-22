@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from paperboy import app as composition
-from paperboy.config import Settings, load_settings, parse_duration, profile_dir
+from paperboy.config import Settings, load_settings, parse_duration, parse_since, profile_dir
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
@@ -165,6 +166,11 @@ def collect(
         None, "--profile-refresh-after",
         help="Skip re-enriching users enriched more recently than this (e.g. 7d, 12h, 30m).",
     ),
+    media_since: str = typer.Option(
+        None, "--media-since",
+        help="With --media: only download media for posts dated at/after this — a "
+             "duration back from now (180d) or an ISO date (2026-03-22, UTC).",
+    ),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -188,6 +194,11 @@ def collect(
             overrides["profile_refresh_after"] = parse_duration(profile_refresh_after)
         except ValueError as exc:
             raise typer.BadParameter(str(exc), param_hint="--profile-refresh-after") from None
+    if media_since is not None:
+        try:
+            overrides["media_since"] = parse_since(media_since, datetime.now(UTC))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--media-since") from None
     if unsafe:
         overrides["unsafe"] = True
     settings = load_settings(profile, overrides)
