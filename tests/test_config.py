@@ -3,7 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from paperboy.config import Settings, load_settings, parse_duration, parse_since, profile_dir
+from paperboy.config import (
+    Settings,
+    load_settings,
+    parse_duration,
+    parse_msg_ids,
+    parse_since,
+    profile_dir,
+)
 
 
 def test_env_override(monkeypatch):
@@ -108,3 +115,15 @@ def test_media_since_setting_defaults_to_none():
     assert load_settings("default", {}).media_since is None
     cutoff = datetime(2026, 3, 22, tzinfo=UTC) - timedelta(0)
     assert load_settings("default", {"media_since": cutoff}).media_since == cutoff
+
+
+def test_parse_msg_ids_lists_and_ranges():
+    assert parse_msg_ids("8554") == [8554]
+    assert parse_msg_ids("8665, 8554,8600-8602") == [8554, 8600, 8601, 8602, 8665]
+    assert parse_msg_ids("5,5,4-5") == [4, 5]
+
+
+def test_parse_msg_ids_rejects_garbage():
+    for bad in ("", "abc", "5-", "9-3", "0", "-4", "1,,2"):
+        with pytest.raises(ValueError):
+            parse_msg_ids(bad)

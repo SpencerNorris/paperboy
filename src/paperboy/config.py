@@ -55,6 +55,29 @@ def parse_since(text: str, now: datetime) -> datetime:
     return cutoff.astimezone(UTC).replace(microsecond=0)
 
 
+_MSG_ID_ITEM_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def parse_msg_ids(text: str) -> list[int]:
+    """A `--media-msgs` value → sorted, de-duplicated message ids (issue #55).
+
+    Comma-separated ids and inclusive ranges: `8554,8600-8602`. Ids are
+    positive; a range must run low→high. Anything else is a `ValueError` —
+    a typo must fail loudly, never silently select nothing.
+    """
+    ids: set[int] = set()
+    for item in text.split(","):
+        match = _MSG_ID_ITEM_RE.match(item.strip())
+        if match is None:
+            raise ValueError(f"not a message id or range: {item!r} (expected e.g. 8554,8600-8602)")
+        low = int(match.group(1))
+        high = int(match.group(2)) if match.group(2) else low
+        if low < 1 or high < low:
+            raise ValueError(f"bad message id range: {item!r}")
+        ids.update(range(low, high + 1))
+    return sorted(ids)
+
+
 # Repo-relative by default so collected data lands in `./data/` next to the
 # code, not somewhere on the filesystem you have to hunt for. `./data` is
 # gitignored. Override with `PAPERBOY_DATA_DIR` (absolute or `~`-relative) to
@@ -112,6 +135,11 @@ class Settings(BaseSettings):
     # `--media-since` (issue #52): only download media for messages dated at or
     # after this aware-UTC cutoff. None = no window (every stored message).
     media_since: datetime | None = None
+    # `--media-msgs` (issue #55): download media only for these message ids.
+    media_msgs: list[int] | None = None
+    # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
+    # stored message, exceeds this many MB (10^6 bytes). None = no cap.
+    media_max_mb: int | None = Field(default=None, ge=1)
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 

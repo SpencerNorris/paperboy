@@ -17,7 +17,14 @@ from rich.console import Console
 from rich.table import Table
 
 from paperboy import app as composition
-from paperboy.config import Settings, load_settings, parse_duration, parse_since, profile_dir
+from paperboy.config import (
+    Settings,
+    load_settings,
+    parse_duration,
+    parse_msg_ids,
+    parse_since,
+    profile_dir,
+)
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
@@ -171,6 +178,14 @@ def collect(
         help="With --media: only download media for posts dated at/after this — a "
              "duration back from now (180d) or an ISO date (2026-03-22, UTC).",
     ),
+    media_msgs: str = typer.Option(
+        None, "--media-msgs",
+        help="With --media: only download media for these message ids, e.g. 8554,8600-8602.",
+    ),
+    media_max_mb: int = typer.Option(
+        None, "--media-max-mb", min=1,
+        help="With --media: skip any file larger than this many MB (size as Telegram records it).",
+    ),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -199,6 +214,13 @@ def collect(
             overrides["media_since"] = parse_since(media_since, datetime.now(UTC))
         except ValueError as exc:
             raise typer.BadParameter(str(exc), param_hint="--media-since") from None
+    if media_msgs is not None:
+        try:
+            overrides["media_msgs"] = parse_msg_ids(media_msgs)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--media-msgs") from None
+    if media_max_mb is not None:
+        overrides["media_max_mb"] = media_max_mb
     if unsafe:
         overrides["unsafe"] = True
     settings = load_settings(profile, overrides)
