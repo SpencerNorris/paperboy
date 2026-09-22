@@ -10,6 +10,7 @@ right precedence for free by passing CLI overrides as kwargs.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
@@ -27,6 +28,32 @@ def parse_duration(text: str) -> int:
         raise ValueError(f"not a duration: {text!r} (expected e.g. 7d, 12h, 30m, 45s)")
     value, unit = match.groups()
     return int(value) * _DURATION_UNITS[unit]
+
+def parse_since(text: str, now: datetime) -> datetime:
+    """A `--media-since` value → an absolute, aware UTC cutoff (issue #52).
+
+    Accepts a duration relative to `now` (`180d`, `12h`, any `parse_duration`
+    form) or an ISO-8601 date / datetime (`2026-03-22`,
+    `2026-03-22T06:00:00+02:00`). A naive datetime is read as UTC, never local
+    time, so the same flag means the same window on any machine. The result is
+    truncated to whole seconds so its `isoformat()` has the exact shape of the
+    stored `messages.date` strings, keeping the SQL string comparison sound.
+    """
+    text = text.strip()
+    try:
+        cutoff = now - timedelta(seconds=parse_duration(text))
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError(
+                f"not a duration or ISO date: {text!r} (expected e.g. 180d or 2026-03-22)"
+            ) from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        cutoff = parsed
+    return cutoff.astimezone(UTC).replace(microsecond=0)
+
 
 # Repo-relative by default so collected data lands in `./data/` next to the
 # code, not somewhere on the filesystem you have to hunt for. `./data` is
@@ -82,6 +109,9 @@ class Settings(BaseSettings):
     enrich_profiles: bool = False
     profile_interval: float | None = Field(default=None, ge=0)
     profile_refresh_after: int | None = Field(default=None, ge=0)  # seconds
+    # `--media-since` (issue #52): only download media for messages dated at or
+    # after this aware-UTC cutoff. None = no window (every stored message).
+    media_since: datetime | None = None
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 

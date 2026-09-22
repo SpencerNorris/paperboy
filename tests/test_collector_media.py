@@ -284,3 +284,36 @@ async def test_media_skip_and_record_skips_one_file_and_continues(tmp_path):
         assert res.counts["skipped"] == 1
         assert res.counts["downloaded"] == 1
         assert st.conn.execute("select count(*) as n from media").fetchone()["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_media_since_downloads_only_messages_at_or_after_cutoff(tmp_path, caplog):
+    from datetime import UTC, datetime
+
+    old, new = 1767322445, 1774224000  # 2026-01-02T02:54:05Z, 2026-03-23T00:00:00Z
+    settings = load_settings(
+        "default", {"data_dir": tmp_path, "media_since": datetime(2026, 3, 22, tzinfo=UTC)}
+    )
+    gw = FakeGateway({"media": {1: b"old bytes", 2: b"new bytes"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        _seed(st, _doc_msg(1, doc_id=1, date=old))
+        _seed(st, _doc_msg(2, doc_id=2, date=new))
+        with caplog.at_level(logging.INFO):
+            res = await MediaCollector().collect(_ctx(st, gw, settings))
+        assert gw.download_media_calls == [2]
+        assert res.counts["downloaded"] == 1
+        assert res.counts["out_of_window"] == 1
+        uris = [r[0] for r in st.conn.execute("SELECT message_uri FROM media")]
+        assert uris == [f"tg:msg:{CHANNEL_ID}/2"]
+    assert "2026-03-22T00:00:00+00:00" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_media_without_since_reports_zero_out_of_window(tmp_path):
+    settings = _settings(tmp_path)
+    gw = FakeGateway({"media": {1: b"x"}})
+    with Store.open(tmp_path / "db.sqlite") as st:
+        _seed(st, _doc_msg(1))
+        res = await MediaCollector().collect(_ctx(st, gw, settings))
+    assert res.counts["downloaded"] == 1
+    assert res.counts["out_of_window"] == 0

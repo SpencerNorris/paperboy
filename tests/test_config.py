@@ -1,8 +1,9 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from paperboy.config import Settings, load_settings, parse_duration, profile_dir
+from paperboy.config import Settings, load_settings, parse_duration, parse_since, profile_dir
 
 
 def test_env_override(monkeypatch):
@@ -79,3 +80,31 @@ def test_parse_duration_units():
     for bad in ("", "7x", "-1d", "d"):
         with pytest.raises(ValueError):
             parse_duration(bad)
+
+
+def test_parse_since_duration_is_relative_to_now():
+    now = datetime(2026, 9, 22, 12, 30, 45, 999, tzinfo=UTC)
+    # Truncated to whole seconds so the cutoff's ISO form matches stored dates.
+    assert parse_since("180d", now) == datetime(2026, 3, 26, 12, 30, 45, tzinfo=UTC)
+    assert parse_since("12h", now) == datetime(2026, 9, 22, 0, 30, 45, tzinfo=UTC)
+
+
+def test_parse_since_absolute_date_and_datetime_are_utc():
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    assert parse_since("2026-03-22", now) == datetime(2026, 3, 22, tzinfo=UTC)
+    assert parse_since("2026-03-22T06:00:00+02:00", now) == datetime(2026, 3, 22, 4, tzinfo=UTC)
+    # A naive datetime is taken as UTC, never local time.
+    assert parse_since("2026-03-22T06:00:00", now) == datetime(2026, 3, 22, 6, tzinfo=UTC)
+
+
+def test_parse_since_rejects_garbage():
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    for bad in ("", "soon", "7x", "2026-13-01", "-5d"):
+        with pytest.raises(ValueError):
+            parse_since(bad, now)
+
+
+def test_media_since_setting_defaults_to_none():
+    assert load_settings("default", {}).media_since is None
+    cutoff = datetime(2026, 3, 22, tzinfo=UTC) - timedelta(0)
+    assert load_settings("default", {"media_since": cutoff}).media_since == cutoff
