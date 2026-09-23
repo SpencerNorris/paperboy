@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from typer.testing import CliRunner
 
@@ -367,15 +369,28 @@ def test_collect_media_since_skips_older_media(tmp_path, monkeypatch):
     assert not any((tmp_path / "clitest_since" / "media").rglob("*.txt"))
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain_output(result) -> str:
+    """CLI output with ANSI styling stripped. CI runners force colour and
+    Typer's error panel otherwise wraps/truncates long option names."""
+    return _ANSI.sub("", result.output)
+
+
+# Wide, colourless terminal for assertions on Typer's error panel text.
+_WIDE_ENV = {"COLUMNS": "200", "TERMINAL_WIDTH": "200", "NO_COLOR": "1"}
+
+
 def test_collect_media_since_rejects_bad_value(tmp_path):
     result = runner.invoke(
         app,
         ["collect", "@x", "--profile", "clitest_badsince", "--media",
          "--media-since", "whenever", "--unsafe"],
-        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
     )
     assert result.exit_code != 0
-    assert "media-since" in result.output
+    assert "media-since" in _plain_output(result)
 
 
 @pytest.mark.parametrize(
@@ -385,7 +400,7 @@ def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     result = runner.invoke(
         app,
         ["collect", "@x", "--profile", "clitest_badsel", "--media", flag, value, "--unsafe"],
-        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
     )
     assert result.exit_code != 0
-    assert flag.lstrip("-") in result.output
+    assert flag.lstrip("-") in _plain_output(result)
