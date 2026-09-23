@@ -62,6 +62,27 @@ def _content_key(media: dict) -> tuple[str, int] | None:
     return None
 
 
+def _recorded_size(media: dict) -> int | None:
+    """The byte size Telegram recorded for this media, if the stored dict has
+    one — `document.size`, or for a photo its largest size variant (the one
+    `download_media` fetches): the max over each `PhotoSize.size` and each
+    `PhotoSizeProgressive.sizes` entry. `None` when no size is recorded, so a
+    `--media-max-mb` cap never skips a file it can't prove is too big.
+    """
+    kind = (media.get("_") or "").lower()
+    if kind == "messagemediadocument":
+        size = (media.get("document") or {}).get("size")
+        return size if isinstance(size, int) else None
+    if kind == "messagemediaphoto":
+        candidates: list[int] = []
+        for variant in (media.get("photo") or {}).get("sizes") or []:
+            if isinstance(variant.get("size"), int):
+                candidates.append(variant["size"])
+            candidates.extend(v for v in variant.get("sizes") or [] if isinstance(v, int))
+        return max(candidates) if candidates else None
+    return None
+
+
 def _document_attrs(media: dict) -> tuple[str | None, str | None, list | None]:
     """`(mime_type, file_name, attributes)` for a `messageMediaDocument`."""
     doc = media.get("document") or {}
@@ -116,12 +137,62 @@ class MediaCollector:
 
         content_index = self._load_content_index(ctx, channel_id)
 
+        base_where = "channel_id=? AND media_kind IS NOT NULL AND deleted_at IS NULL"
+        params: tuple = (channel_id,)
+        where = base_where
+        counts["out_of_window"] = 0
+        counts["not_selected"] = 0
+        counts["too_large"] = 0
+        since = ctx.settings.media_since
+        if since is not None:
+            # `--media-since` (issue #52). `messages.date` is stored as
+            # `to_iso()` text (`YYYY-MM-DDTHH:MM:SS+00:00`) and `parse_since`
+            # yields a whole-second UTC cutoff of the same shape, so a string
+            # comparison orders correctly. A NULL date can't be placed in the
+            # window and is excluded — counted as out_of_window, not dropped.
+            cutoff = since.isoformat()
+            where = f"{base_where} AND date >= ?"
+            params = (channel_id, cutoff)
+            counts["out_of_window"] = ctx.store.conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE {base_where} "
+                "AND (date IS NULL OR date < ?)",
+                (channel_id, cutoff),
+            ).fetchone()[0]
+            ctx.log.info(
+                "media: window since %s — %d media message(s) before it skipped",
+                cutoff, counts["out_of_window"],
+            )
+
         rows = ctx.store.conn.execute(
             "SELECT uri, msg_id, media_kind, media_json, first_seen FROM messages "
-            "WHERE channel_id=? AND media_kind IS NOT NULL AND deleted_at IS NULL "
-            "ORDER BY msg_id",
-            (channel_id,),
+            f"WHERE {where} ORDER BY msg_id",
+            params,
         ).fetchall()
+
+        selected = ctx.settings.media_msgs
+        if selected is not None:
+            # `--media-msgs` (issue #55). Filtered in Python, not as a SQL
+            # `IN (...)`, so an arbitrarily long id list never hits SQLite's
+            # bound-parameter limit. Ids with no stored media simply match
+            # nothing; they are logged so a typo'd id is visible.
+            wanted = set(selected)
+            in_window = len(rows)
+            rows = [r for r in rows if r["msg_id"] in wanted]
+            counts["not_selected"] = in_window - len(rows)
+            missing = sorted(wanted - {r["msg_id"] for r in rows})
+            ctx.log.info(
+                "media: %d selected message(s) have media to fetch; %d other(s) not selected",
+                len(rows), counts["not_selected"],
+            )
+            if missing:
+                ctx.log.warning(
+                    "media: %d selected id(s) have no stored, in-window media: %s",
+                    len(missing), missing,
+                )
+        max_bytes = (
+            ctx.settings.media_max_mb * 1_000_000
+            if ctx.settings.media_max_mb is not None else None
+        )
 
         for row in rows:
             media = json.loads(row["media_json"]) if row["media_json"] else {}
@@ -138,6 +209,17 @@ class MediaCollector:
                 # observation, not "now".
                 self._record_custody(ctx, path, sha, row["uri"], row["first_seen"])
                 counts["duplicates"] += 1
+                continue
+
+            size = _recorded_size(media)
+            if max_bytes is not None and size is not None and size > max_bytes:
+                # `--media-max-mb` (issue #53): decided from the size Telegram
+                # recorded, before a single byte is fetched.
+                ctx.log.info(
+                    "media: skipping msg %s: %.1f MB exceeds --media-max-mb %d",
+                    row["msg_id"], size / 1e6, ctx.settings.media_max_mb,
+                )
+                counts["too_large"] += 1
                 continue
 
             try:
