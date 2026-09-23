@@ -448,7 +448,7 @@
   },
   {
    "channel_id": 5,
-   "detail_json": "{\"counts\": {\"avatars\": 0, \"backfilled_peers\": 0, \"empty\": 0, \"enriched\": 0, \"fresh_skipped\": 0, \"gathered\": 0, \"photos\": 0, \"photos_empty\": 0, \"refreshed\": 0, \"restricted_skipped\": 0, \"skipped\": 0, \"snapshots\": 0, \"triaged\": 0, \"unavailable\": 0, \"unresolvable\": 0}, \"stopped\": null}",
+   "detail_json": "{\"counts\": {\"avatars\": 0, \"backfilled_peers\": 0, \"dead_ref_skipped\": 0, \"empty\": 0, \"enriched\": 0, \"fresh_skipped\": 0, \"gathered\": 0, \"photos\": 0, \"photos_empty\": 0, \"refreshed\": 0, \"restricted_skipped\": 0, \"self_skipped\": 0, \"skipped\": 0, \"snapshots\": 0, \"triaged\": 0, \"unavailable\": 0, \"unresolvable\": 0}, \"stopped\": null}",
    "id": 8,
    "kind": "complete",
    "observed_at": "2026-01-01T00:00:00+00:00",
