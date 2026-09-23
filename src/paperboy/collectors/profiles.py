@@ -100,7 +100,7 @@ class ProfilesCollector:
             )
         counts = {
             "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "dead_ref_skipped": 0,
-            "triaged": 0, "empty": 0,
+            "self_skipped": 0, "triaged": 0, "empty": 0,
             "skipped": 0, "snapshots": 0, "enriched": 0, "refreshed": 0, "fresh_skipped": 0,
             "photos": 0, "photos_empty": 0, "avatars": 0, "restricted_skipped": 0, "unavailable": 0,
         }
@@ -270,7 +270,7 @@ class ProfilesCollector:
         if kind not in ("user", "userempty"):
             # A non-success that must still be accounted for: in a triage-only
             # run `gathered == triaged + empty + skipped + unresolvable
-            # + dead_ref_skipped`
+            # + dead_ref_skipped + self_skipped`
             # (`counts["skipped"]` also accumulates enrichment/photo/avatar
             # skips under --profiles, so the identity is triage-only).
             # `REPLAY_UNKNOWN_USER_KIND` is the seam's placeholder for an id
@@ -306,6 +306,11 @@ class ProfilesCollector:
             return
         if self._project_user(ctx, user, raw_id, observed_at, METHOD_GET_USERS, counts) is not None:
             counts["triaged"] += 1
+        else:
+            # The collecting account: fetched with everyone else (it is a
+            # gathered peer) but never projected (`upsert_user` refuses it).
+            # Counted so the triage books balance (issue #54 live smoke).
+            counts["self_skipped"] += 1
 
     def _project_user(
         self,

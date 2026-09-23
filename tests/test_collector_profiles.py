@@ -1147,7 +1147,7 @@ def _ctx_at(st, gw, settings, now: str):
 def _balanced(counts: dict[str, int]) -> bool:
     return counts["gathered"] == (
         counts["triaged"] + counts["empty"] + counts["skipped"]
-        + counts["unresolvable"] + counts["dead_ref_skipped"]
+        + counts["unresolvable"] + counts["dead_ref_skipped"] + counts["self_skipped"]
     )
 
 
@@ -1237,3 +1237,20 @@ async def test_dead_ref_skip_also_keeps_the_user_out_of_enrichment(tmp_path):
         gw = _gw(users, full_user=full)
         await ProfilesCollector().collect(_ctx_at(st, gw, settings, DAY1))
         assert 3 not in gw.full_user_calls
+
+
+@pytest.mark.asyncio
+async def test_collecting_account_in_triage_is_counted_so_the_books_balance(tmp_path):
+    # Live finding (issue #54 smoke): the collecting account is a gathered user;
+    # triage fetches it but deliberately never projects it, and nothing counted
+    # that outcome — so `gathered` exceeded the sum of the outcome counts by one.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for i in (1, 2):
+            _seed_stub(st, i, msg=i)
+        set_state(st, "account", "self", {"uri": "tg:user:2", "id": 2})
+        res = await ProfilesCollector().collect(
+            _ctx_at(st, _gw({1: _user(1), 2: _user(2)}), _settings(tmp_path), T0)
+        )
+        assert res.counts["triaged"] == 1 and res.counts["self_skipped"] == 1
+        assert _balanced(res.counts)
