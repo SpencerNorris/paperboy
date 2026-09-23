@@ -276,6 +276,21 @@ def collect(
         table.add_row(r.name, str(r.counts), r.stopped or "-")
     console.print(table)
 
+    # Issue #56: if the target itself could not be used — the `channel` phase
+    # was skipped or stopped (a deleted/renamed handle, a private channel) —
+    # nothing was collected, so exit non-zero for scripts and queues. A later
+    # phase stopping leaves the exit code alone: the target was usable.
+    channel_result = next((r for r in results if r.name == "channel"), None)
+    if channel_result is not None and channel_result.stopped is not None:
+        how = {"skip": "was skipped", "phase_stop": "stopped", "hard_stop": "hit a hard stop"}.get(
+            channel_result.stopped, f"stopped ({channel_result.stopped})"
+        )
+        console.print(
+            f"[red]{target}: the channel phase {how} — nothing was collected.[/] "
+            "See the warning above for the reason."
+        )
+        raise typer.Exit(code=1)
+
 
 async def _run_collect(
     settings, secrets, profile, store, target, phase_list, log, media, web
