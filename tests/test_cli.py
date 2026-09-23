@@ -404,3 +404,49 @@ def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     )
     assert result.exit_code != 0
     assert flag.lstrip("-") in _plain_output(result)
+
+
+def test_collect_exits_nonzero_when_the_target_itself_cannot_be_used(tmp_path, monkeypatch):
+    # Issue #56: a deleted/renamed handle (or a private channel) skips the
+    # `channel` phase. Nothing is collected, so `collect` must say so and exit
+    # non-zero — scripts and queues rely on the exit code — without a traceback.
+    from paperboy.budget import SkipAndRecord
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        gw = FakeGateway(_fixtures())
+
+        async def resolve(target_value: str) -> dict:
+            raise SkipAndRecord("The username is not in use by anyone else yet")
+
+        gw.resolve = resolve  # type: ignore[method-assign]
+        return gw
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@gone_channel", "--profile", "clitest_gone", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    out = _plain_output(result)
+    assert result.exit_code == 1, out
+    assert "nothing was collected" in out
+    assert "Traceback" not in out
+
+
+def test_collect_exits_zero_when_the_channel_phase_succeeds(tmp_path, monkeypatch):
+    # Guard for the non-zero rule above: it keys on the `channel` phase only,
+    # so a normal run over a usable target still exits 0.
+    fx = _fixtures()
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(fx)
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_ok", "--phases", "channel,history", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    assert result.exit_code == 0, _plain_output(result)
