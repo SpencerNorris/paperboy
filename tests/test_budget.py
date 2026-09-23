@@ -256,3 +256,15 @@ async def test_per_method_interval_composes_with_flood_handling(tmp_path):
         assert await b.call("users.getFullUser", flaky) == "ok"
         assert 3 in slept
         assert st.conn.execute("select count(*) from flood_log").fetchone()[0] == 1
+
+
+def test_unresolvable_username_classifies_as_skip():
+    # Issue #56: `contacts.resolveUsername` on a handle that no longer exists
+    # (deleted/renamed channel) raised straight through `classify` as an
+    # unrecognised error and crashed `collect` with a traceback. It is the
+    # documented "this target isn't there" answer — the same class of outcome
+    # as ChannelPrivateError — so the channel phase is skipped and recorded.
+    from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
+
+    assert classify(UsernameNotOccupiedError(None)) == Disposition.SKIP
+    assert classify(UsernameInvalidError(None)) == Disposition.SKIP
