@@ -12,6 +12,9 @@
 3. Gather every `kind='user'` peer; build each one's input-user ref
    (`store.peers.input_user_ref`) — a `min` stub is reachable ONLY via
    `inputUserFromMessage` from its stored `(seen_in_chat, seen_in_msg)`.
+   A ref that triage already proved dead (bisected down to a lone failure)
+   is held back for `DEAD_REF_COOLDOWN_SECONDS` unless the ref itself has
+   changed (issue #54) — otherwise every run re-pays the bisection.
 4. Triage — batched `users.getUsers` (≤100/call, bisected on failure — plan
    D13): cheap identity for everyone, always. Writes `users` +
    `user_snapshots`, and the full object into `peers` with the stub's
@@ -37,10 +40,11 @@ from paperboy.collectors.posture import record_privacy_posture
 from paperboy.config import profile_dir
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import channel_uri, namespaced_kind, user_uri
+from paperboy.store.db import dumps
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
 from paperboy.store.peers import input_user_ref, upsert_full_peer
-from paperboy.store.sync import record_profile_attempt, set_state
+from paperboy.store.sync import clear_state, get_state, record_profile_attempt, set_state
 from paperboy.store.users import (
     add_user_snapshot,
     set_user_photo_sha,
@@ -58,6 +62,14 @@ METHOD_GET_USERS = "users.getUsers"
 METHOD_GET_FULL_USER = "users.getFullUser"
 METHOD_GET_USER_PHOTOS = "photos.getUserPhotos"
 
+# Issue #54: a ref proven dead by triage bisection is not re-sent for this
+# long. Keyed on the exact ref (`_ref_key`), so fresh provenance for the same
+# user (a newer message, a full object with a real access_hash) is tried at
+# once; a stale ref past the cooldown is tried once more, in case the failure
+# was transient. Stored in `sync_state(DEAD_REF_SCOPE, <user uri>)`.
+DEAD_REF_SCOPE = "profiles_dead_ref"
+DEAD_REF_COOLDOWN_SECONDS = 7 * 86400
+
 ENRICHMENT_OFF_WARNING = (
     "profiles: triaged {n} people (basic names/handles); full enrichment (bios, photos, "
     "last-seen, …) not run — pass --profiles to enrich them (~1 getFullUser/s, bounded by "
@@ -67,6 +79,11 @@ ENRICHMENT_OFF_WARNING = (
 
 def _seconds_between(earlier: str, later: str) -> float:
     return (datetime.fromisoformat(later) - datetime.fromisoformat(earlier)).total_seconds()
+
+
+def _ref_key(ref: dict) -> str:
+    """Canonical identity of an input-user ref (sorted-key JSON)."""
+    return dumps(ref)
 
 
 class ProfilesCollector:
@@ -82,7 +99,8 @@ class ProfilesCollector:
                 "(channel phase did not complete)"
             )
         counts = {
-            "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "triaged": 0, "empty": 0,
+            "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "dead_ref_skipped": 0,
+            "triaged": 0, "empty": 0,
             "skipped": 0, "snapshots": 0, "enriched": 0, "refreshed": 0, "fresh_skipped": 0,
             "photos": 0, "photos_empty": 0, "avatars": 0, "restricted_skipped": 0, "unavailable": 0,
         }
@@ -101,8 +119,11 @@ class ProfilesCollector:
                 )
             await record_privacy_posture(ctx, self.name)
 
-            refs = self._gather(ctx, counts)
+            refs, dead_uris = self._gather(ctx, counts)
             unusable_uris = await self._triage(ctx, refs, counts)
+            # A held-back dead ref is as unusable for enrichment as one this
+            # run's triage just proved dead — don't spend a budget slot on it.
+            unusable_uris |= dead_uris
 
             if not ctx.settings.enrich_profiles:
                 budget = ctx.settings.profile_budget
@@ -149,16 +170,25 @@ class ProfilesCollector:
 
     # ---- gather + triage -------------------------------------------------------
 
-    def _gather(self, ctx: CollectContext, counts: dict[str, int]) -> list[tuple[str, dict]]:
+    def _gather(
+        self, ctx: CollectContext, counts: dict[str, int]
+    ) -> tuple[list[tuple[str, dict]], set[str]]:
+        """`(refs to triage, uris held back as known-dead refs)`."""
         rows = ctx.store.conn.execute(
             "SELECT uri FROM peers WHERE kind='user' ORDER BY uri"
         ).fetchall()
         refs: list[tuple[str, dict]] = []
+        dead: set[str] = set()
+        now = ctx.clock.now()
         for row in rows:
             counts["gathered"] += 1
             ref = input_user_ref(ctx.store, row["uri"])
             if ref is None:
                 counts["unresolvable"] += 1  # spec §5 case 3: recorded, never guessed
+                continue
+            if self._is_known_dead(ctx, row["uri"], ref, now):
+                counts["dead_ref_skipped"] += 1
+                dead.add(row["uri"])
                 continue
             refs.append((row["uri"], ref))
         if counts["unresolvable"]:
@@ -166,7 +196,23 @@ class ProfilesCollector:
                 "profiles: %d of %d users unresolvable (no full object, no usable provenance)",
                 counts["unresolvable"], counts["gathered"],
             )
-        return refs
+        if counts["dead_ref_skipped"]:
+            ctx.log.info(
+                "profiles: %d of %d users held back — their ref failed triage within the "
+                "last %d days and has not changed (issue #54)",
+                counts["dead_ref_skipped"], counts["gathered"],
+                DEAD_REF_COOLDOWN_SECONDS // 86400,
+            )
+        return refs, dead
+
+    @staticmethod
+    def _is_known_dead(ctx: CollectContext, uri: str, ref: dict, now: str) -> bool:
+        marker = get_state(ctx.store, DEAD_REF_SCOPE, uri)
+        return (
+            marker is not None
+            and marker.get("ref") == _ref_key(ref)
+            and _seconds_between(marker["failed_at"], now) < DEAD_REF_COOLDOWN_SECONDS
+        )
 
     async def _triage(
         self, ctx: CollectContext, refs: list[tuple[str, dict]], counts: dict[str, int]
@@ -199,14 +245,21 @@ class ProfilesCollector:
             users = await ctx.gateway.get_users([ref for _, ref in batch])
         except SkipAndRecord as exc:
             if len(batch) == 1:
-                ctx.log.warning("profiles: triage skipped for %s: %s", batch[0][0], exc)
+                uri, ref = batch[0]
+                ctx.log.warning("profiles: triage skipped for %s: %s", uri, exc)
                 counts["skipped"] += 1
-                skipped_uris.add(batch[0][0])
+                skipped_uris.add(uri)
+                set_state(ctx.store, DEAD_REF_SCOPE, uri, {
+                    "ref": _ref_key(ref), "failed_at": ctx.clock.now(), "detail": str(exc),
+                })
                 return
             mid = len(batch) // 2
             await self._triage_batch(ctx, batch[:mid], counts, skipped_uris)
             await self._triage_batch(ctx, batch[mid:], counts, skipped_uris)
             return
+        # The whole batch answered: none of these refs is dead any more.
+        for uri, _ in batch:
+            clear_state(ctx.store, DEAD_REF_SCOPE, uri)
         for user in users:
             self._project_triaged(ctx, user, counts, skipped_uris)
 
@@ -216,7 +269,8 @@ class ProfilesCollector:
         kind = (user.get("_") or "").lower()
         if kind not in ("user", "userempty"):
             # A non-success that must still be accounted for: in a triage-only
-            # run `gathered == triaged + empty + skipped + unresolvable`
+            # run `gathered == triaged + empty + skipped + unresolvable
+            # + dead_ref_skipped`
             # (`counts["skipped"]` also accumulates enrichment/photo/avatar
             # skips under --profiles, so the identity is triage-only).
             # `REPLAY_UNKNOWN_USER_KIND` is the seam's placeholder for an id
