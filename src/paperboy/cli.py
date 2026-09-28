@@ -240,12 +240,7 @@ def collect(
         if phase_list and p in phase_list
     ]
     if phase_list is not None and _dependent_phases and "channel" not in phase_list:
-        # `channel` populates `CollectContext.input_channel`/`channel_id` (the
-        # channel's numeric id + access_hash) for every later collector in
-        # *this run* — it is per-process context, not reloaded from
-        # `channels` even if a prior run already stored that channel, since
-        # `access_hash` can rotate and isn't persisted. Selecting `history`
-        # `history`/`graph`/`media` each need `input_channel`/`channel_id`
+        # The dependent phases need `CollectContext.input_channel`/`channel_id`
         # (the channel's numeric id + access_hash), which the `channel` phase
         # sets for every later collector in the SAME run — it's per-process
         # context, not reloaded from the store (access_hash can rotate and
@@ -278,17 +273,34 @@ def collect(
 
     # Issue #56: if the target itself could not be used — the `channel` phase
     # was skipped or stopped (a deleted/renamed handle, a private channel) —
-    # nothing was collected, so exit non-zero for scripts and queues. A later
-    # phase stopping leaves the exit code alone: the target was usable.
+    # exit non-zero for scripts and queues. A later phase stopping leaves the
+    # exit code alone: the target was usable.
     channel_result = next((r for r in results if r.name == "channel"), None)
     if channel_result is not None and channel_result.stopped is not None:
         how = {"skip": "was skipped", "phase_stop": "stopped", "hard_stop": "hit a hard stop"}.get(
             channel_result.stopped, f"stopped ({channel_result.stopped})"
         )
-        console.print(
-            f"[red]{target}: the channel phase {how} — nothing was collected.[/] "
-            "See the warning above for the reason."
-        )
+        # Some phases don't need the channel: `web` works from the handle
+        # alone and can still archive a deleted channel's t.me/s and Wayback
+        # pages. Name any phase that reported non-zero counts rather than
+        # claiming nothing was collected; the exit code stays 1 either way.
+        others = [r for r in results if r.name != "channel" and any(r.counts.values())]
+        if others:
+            detail = "; ".join(f"{r.name} {r.counts}" for r in others)
+            log.warning(
+                "collect: channel phase %s; other phases reported: %s",
+                channel_result.stopped, detail,
+            )
+            console.print(
+                f"[red]{target}: the channel phase {how} — the target itself couldn't be "
+                f"used.[/] Other phases still reported: {detail}. "
+                "See the warning above for the reason."
+            )
+        else:
+            console.print(
+                f"[red]{target}: the channel phase {how} — nothing was collected.[/] "
+                "See the warning above for the reason."
+            )
         raise typer.Exit(code=1)
 
 

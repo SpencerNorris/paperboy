@@ -450,3 +450,39 @@ def test_collect_exits_zero_when_the_channel_phase_succeeds(tmp_path, monkeypatc
         env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
     )
     assert result.exit_code == 0, _plain_output(result)
+
+
+def test_collect_reports_other_phases_when_the_channel_phase_is_skipped(tmp_path, monkeypatch):
+    # Review finding on #56: `web` works from the handle alone, so it can still
+    # archive a deleted channel's t.me/s and Wayback pages after `channel` was
+    # skipped. The exit code stays 1 (the target itself was unusable), but the
+    # message must not claim "nothing was collected" — it names what was.
+    import paperboy.cli as cli_mod
+    from paperboy.collectors.base import CollectResult
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(_fixtures())
+
+    async def fake_collect_channel(*args, **kwargs):
+        del args, kwargs
+        return [
+            CollectResult(name="channel", counts={}, stopped="skip"),
+            CollectResult(name="participants", counts={"enumerated": 0}),
+            CollectResult(name="web", counts={"tme_posts": 3, "wayback_rows": 12}),
+        ]
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    monkeypatch.setattr(cli_mod, "collect_channel", fake_collect_channel)
+    result = runner.invoke(
+        app,
+        ["collect", "@gone_channel", "--profile", "clitest_gone_web", "--web", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    out = _plain_output(result)
+    assert result.exit_code == 1, out
+    assert "nothing was collected" not in out
+    assert "web" in out and "tme_posts" in out
+    # An all-zero phase saved nothing and is not listed as having collected.
+    assert "participants {" not in out
+    assert "Traceback" not in out
