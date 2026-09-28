@@ -16,8 +16,9 @@ build/
 .env
 .env.*
 config.local.*
-/data/            # default data dir (SQLite DB, logs, media) — repo-relative
-data/             # any other data/ dir
+# Any data/ dir, including the repo-relative default (SQLite DB, logs, media).
+# No trailing comments on pattern lines: git treats them as part of the pattern (#42).
+data/
 paperboy-data/
 *.sqlite
 *.sqlite-wal
