@@ -10,6 +10,7 @@ right precedence for free by passing CLI overrides as kwargs.
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
@@ -27,6 +28,55 @@ def parse_duration(text: str) -> int:
         raise ValueError(f"not a duration: {text!r} (expected e.g. 7d, 12h, 30m, 45s)")
     value, unit = match.groups()
     return int(value) * _DURATION_UNITS[unit]
+
+def parse_since(text: str, now: datetime) -> datetime:
+    """A `--media-since` value → an absolute, aware UTC cutoff (issue #52).
+
+    Accepts a duration relative to `now` (`180d`, `12h`, any `parse_duration`
+    form) or an ISO-8601 date / datetime (`2026-03-22`,
+    `2026-03-22T06:00:00+02:00`). A naive datetime is read as UTC, never local
+    time, so the same flag means the same window on any machine. The result is
+    truncated to whole seconds so its `isoformat()` has the exact shape of the
+    stored `messages.date` strings, keeping the SQL string comparison sound.
+    """
+    text = text.strip()
+    try:
+        cutoff = now - timedelta(seconds=parse_duration(text))
+    except ValueError:
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError(
+                f"not a duration or ISO date: {text!r} (expected e.g. 180d or 2026-03-22)"
+            ) from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        cutoff = parsed
+    return cutoff.astimezone(UTC).replace(microsecond=0)
+
+
+_MSG_ID_ITEM_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+
+
+def parse_msg_ids(text: str) -> list[int]:
+    """A `--media-msgs` value → sorted, de-duplicated message ids (issue #55).
+
+    Comma-separated ids and inclusive ranges: `8554,8600-8602`. Ids are
+    positive; a range must run low→high. Anything else is a `ValueError` —
+    a typo must fail loudly, never silently select nothing.
+    """
+    ids: set[int] = set()
+    for item in text.split(","):
+        match = _MSG_ID_ITEM_RE.match(item.strip())
+        if match is None:
+            raise ValueError(f"not a message id or range: {item!r} (expected e.g. 8554,8600-8602)")
+        low = int(match.group(1))
+        high = int(match.group(2)) if match.group(2) else low
+        if low < 1 or high < low:
+            raise ValueError(f"bad message id range: {item!r}")
+        ids.update(range(low, high + 1))
+    return sorted(ids)
+
 
 # Repo-relative by default so collected data lands in `./data/` next to the
 # code, not somewhere on the filesystem you have to hunt for. `./data` is
@@ -82,6 +132,14 @@ class Settings(BaseSettings):
     enrich_profiles: bool = False
     profile_interval: float | None = Field(default=None, ge=0)
     profile_refresh_after: int | None = Field(default=None, ge=0)  # seconds
+    # `--media-since` (issue #52): only download media for messages dated at or
+    # after this aware-UTC cutoff. None = no window (every stored message).
+    media_since: datetime | None = None
+    # `--media-msgs` (issue #55): download media only for these message ids.
+    media_msgs: list[int] | None = None
+    # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
+    # stored message, exceeds this many MB (10^6 bytes). None = no cap.
+    media_max_mb: int | None = Field(default=None, ge=1)
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 
