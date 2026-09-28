@@ -20,6 +20,11 @@ def get_state(store: Store, scope: str, key: str) -> dict | None:
     return json.loads(row["value_json"]) if row else None
 
 
+def clear_state(store: Store, scope: str, key: str) -> None:
+    """Delete one `sync_state` entry; a no-op when it is absent."""
+    store.conn.execute("DELETE FROM sync_state WHERE scope=? AND key=?", (scope, key))
+
+
 def set_state(store: Store, scope: str, key: str, value: dict) -> None:
     store.conn.execute(
         "INSERT INTO sync_state(scope, key, value_json) VALUES (?, ?, ?) "
@@ -34,6 +39,27 @@ def set_state(store: Store, scope: str, key: str, value: dict) -> None:
 
 
 _UNSET = object()
+
+
+def record_profile_attempt(
+    store: Store, uri: str, attempted_at: str, outcome: str, detail: str | None = None
+) -> None:
+    """The `profiles` collector's rotation key (`profile_attempts`): the newest
+    `users.getFullUser` attempt for `uri`, whatever its outcome. The collector
+    writes `outcome='attempted'` the moment a budget slot is spent — before
+    the RPC answers — and the arm that finishes the attempt replaces it, so an
+    arm that forgets to report still advanced the queue. Newest stamp wins:
+    an older stamp never moves the key backwards (every caller stamps with
+    `ctx.clock.now()` — monotonic on replay, and live barring a wall-clock
+    step; a step backwards between an attempt's two writes can at worst leave
+    `outcome='attempted'` on the row, which affects no scheduling)."""
+    store.conn.execute(
+        "INSERT INTO profile_attempts (uri, attempted_at, outcome, detail) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(uri) DO UPDATE SET attempted_at = excluded.attempted_at, "
+        "outcome = excluded.outcome, detail = excluded.detail "
+        "WHERE excluded.attempted_at >= profile_attempts.attempted_at",
+        (uri, attempted_at, outcome, detail),
+    )
 
 
 def self_uri(store: Store) -> str | None:

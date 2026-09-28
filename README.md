@@ -22,7 +22,8 @@ share one store and one set of guardrails.
 | Raw-TL preservation + normalized projections + FTS5 | ✅ |
 | JSONL export | ✅ |
 | Opsec preflight (`paperboy doctor`) | ✅ |
-| Media download, comment threads, people & profiles, forward/mention/similar-channel graph, web-archive snapshots, `watch`, phone `lookup` | 🔜 Phase 2 |
+| Comment threads, people & profiles (the person layer), forward/mention/similar-channel graph, media download, web-archive snapshots | ✅ Phase 2 |
+| `watch`, phone `lookup` | 🔜 Phase 2 (not yet implemented) |
 
 ## Requirements
 
@@ -136,7 +137,9 @@ The collecting account's own record is scrubbed from exports.
 |---|---|
 | `paperboy auth` | Interactive login; saves the session to the Keychain. |
 | `paperboy doctor` | Opsec preflight; blocks `collect` on failure unless `--unsafe`. |
-| `paperboy collect TARGET [--phases …] [--unsafe] [--profile P]` | Collect channel metadata + history. |
+| `paperboy collect TARGET [--phases …] [--unsafe] [--profile P]` | Collect channel metadata, history, the linked group's roster, and per-user profiles. |
+| `paperboy collect TARGET --media [--media-since 180d\|2026-03-22] [--media-msgs 8554,8600-8602] [--media-max-mb N]` | Also download message media (opt-in). `--media-since` limits it to posts dated at/after a cutoff (a duration back from now, or an ISO date in UTC); `--media-msgs` to chosen message ids; `--media-max-mb` skips any file Telegram records as larger than N MB, before downloading. Large channels can hold hundreds of GB of video, so scope it. |
+| `paperboy collect TARGET --profiles [--profile-budget N]` | Also run full profile enrichment (`getFullUser`, photo history, avatars) — the expensive opt-in on top of the always-on `getUsers` triage. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
 | `paperboy export TARGET --format jsonl --out DIR [--profile P]` | Export to JSONL. |
 | `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. |

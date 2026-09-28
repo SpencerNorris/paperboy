@@ -51,6 +51,11 @@ def phase_status(store: Store, phase: str) -> str:
             return f"{count('SELECT count(*) FROM messages')} messages"
         if phase == "graph":
             return f"{count('SELECT count(*) FROM edges')} edges"
+        if phase == "participants":
+            return f"{count('SELECT count(*) FROM participants')} members"
+        if phase == "profiles":
+            enriched = count("SELECT count(*) FROM users WHERE enriched_at IS NOT NULL")
+            return f"{count('SELECT count(*) FROM users')} users · {enriched} enriched"
         if phase == "media":
             files = count("SELECT count(*) FROM media")
             size = count("SELECT coalesce(sum(size), 0) FROM media")

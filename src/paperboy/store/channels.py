@@ -18,7 +18,7 @@ from paperboy.store.db import Store, dumps
 _FLAG_EXCLUDE = frozenset({"min"})
 
 
-def _channel_flags(full: dict, chan: dict) -> dict[str, bool]:
+def channel_flags(full: dict, chan: dict) -> dict[str, bool]:
     """Every boolean flag on the ChannelFull and Channel.
 
     Telegram's `flags.N?true` fields serialise as real booleans, so capturing
@@ -27,6 +27,9 @@ def _channel_flags(full: dict, chan: dict) -> dict[str, bool]:
     `join_to_send`/`join_request` the join decision rests on (issue #20). `chan`
     is applied last so the authoritative Channel wins any overlap with the
     ChannelFull.
+
+    Public (Task 8): `participants` needs it too, for the linked group's own
+    preflight `ChatFull`.
     """
     flags: dict[str, bool] = {}
     for obj in (full, chan):
@@ -34,6 +37,9 @@ def _channel_flags(full: dict, chan: dict) -> dict[str, bool]:
             if isinstance(v, bool) and k not in _FLAG_EXCLUDE:
                 flags[k] = v
     return flags
+
+
+_channel_flags = channel_flags  # back-compat alias
 
 
 def _channel_kind(chan: dict) -> str | None:
@@ -78,7 +84,7 @@ def upsert_channel(
     participants_count = full.get("participants_count")
     restriction = chan.get("restriction_reason")
     restriction_json = dumps(restriction) if restriction else None
-    flags = _channel_flags(full, chan)
+    flags = channel_flags(full, chan)
     flags_json = dumps(flags) if flags else None
 
     store.conn.execute(

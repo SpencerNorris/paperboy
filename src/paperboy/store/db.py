@@ -93,6 +93,12 @@ class Store:
         self._run_id = run_id if run_id is not None else uuid4().hex
         return self._run_id
 
+    @property
+    def run_id(self) -> str | None:
+        """The current collect pass's id (`begin_run`), or `None` before one
+        begins — lets a collector do something exactly once per run."""
+        return self._run_id
+
     def add_raw(
         self,
         kind: str,

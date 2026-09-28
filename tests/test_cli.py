@@ -1,3 +1,6 @@
+import re
+
+import pytest
 from typer.testing import CliRunner
 
 from paperboy import app as composition
@@ -332,3 +335,118 @@ def test_export_without_prior_collect_exits_nonzero(tmp_path):
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result.exit_code != 0
+
+
+def test_collect_media_since_skips_older_media(tmp_path, monkeypatch):
+    fx = _fixtures()
+    fx["history"] = [
+        {
+            "_": "message", "id": 1, "message": "", "date": 1767322445,  # 2026-01-02
+            "media": {
+                "_": "MessageMediaDocument",
+                "document": {
+                    "_": "Document", "id": 1, "access_hash": 1, "mime_type": "text/plain",
+                    "attributes": [{"_": "DocumentAttributeFilename", "file_name": "a.txt"}],
+                },
+            },
+        }
+    ]
+    fx["media"] = {1: b"hello"}
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(fx)
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_since", "--media",
+         "--media-since", "2026-03-22", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "out_of_window" in result.stdout
+    assert not any((tmp_path / "clitest_since" / "media").rglob("*.txt"))
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain_output(result) -> str:
+    """CLI output with ANSI styling stripped. CI runners force colour and
+    Typer's error panel otherwise wraps/truncates long option names."""
+    return _ANSI.sub("", result.output)
+
+
+# Wide, colourless terminal for assertions on Typer's error panel text.
+_WIDE_ENV = {"COLUMNS": "200", "TERMINAL_WIDTH": "200", "NO_COLOR": "1"}
+
+
+def test_collect_media_since_rejects_bad_value(tmp_path):
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_badsince", "--media",
+         "--media-since", "whenever", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    assert result.exit_code != 0
+    assert "media-since" in _plain_output(result)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"), [("--media-msgs", "abc"), ("--media-max-mb", "0")]
+)
+def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_badsel", "--media", flag, value, "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    assert result.exit_code != 0
+    assert flag.lstrip("-") in _plain_output(result)
+
+
+def test_collect_exits_nonzero_when_the_target_itself_cannot_be_used(tmp_path, monkeypatch):
+    # Issue #56: a deleted/renamed handle (or a private channel) skips the
+    # `channel` phase. Nothing is collected, so `collect` must say so and exit
+    # non-zero — scripts and queues rely on the exit code — without a traceback.
+    from paperboy.budget import SkipAndRecord
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        gw = FakeGateway(_fixtures())
+
+        async def resolve(target_value: str) -> dict:
+            raise SkipAndRecord("The username is not in use by anyone else yet")
+
+        gw.resolve = resolve  # type: ignore[method-assign]
+        return gw
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@gone_channel", "--profile", "clitest_gone", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    out = _plain_output(result)
+    assert result.exit_code == 1, out
+    assert "nothing was collected" in out
+    assert "Traceback" not in out
+
+
+def test_collect_exits_zero_when_the_channel_phase_succeeds(tmp_path, monkeypatch):
+    # Guard for the non-zero rule above: it keys on the `channel` phase only,
+    # so a normal run over a usable target still exits 0.
+    fx = _fixtures()
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(fx)
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_ok", "--phases", "channel,history", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path), **_WIDE_ENV},
+    )
+    assert result.exit_code == 0, _plain_output(result)

@@ -49,6 +49,8 @@ _GATEWAY_READ_METHODS = frozenset({
     "get_channel_difference", "get_self", "get_authorizations",
     "get_password_state", "get_privacy", "download_media",
     "get_channel_recommendations", "check_chat_invite", "get_sponsored_messages",
+    "get_participants", "get_participant", "get_users", "get_full_user",
+    "get_user_photos", "download_user_photo", "get_message_reactions_list",
 })
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 
-from paperboy.ids import msg_uri, peer_ref_uri, to_iso
+from paperboy.ids import iso_or_none, msg_uri, peer_ref_uri
 from paperboy.store.db import Store, dumps
 from paperboy.store.sync import is_self
 
@@ -22,14 +22,6 @@ def content_hash(text: str, media_json: str | None) -> str:
     """sha256 hex of the text + a NUL separator + the media json (or empty)."""
     payload = f"{text}\x00{media_json or ''}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _iso_or_none(value: int | str | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return to_iso(value)
 
 
 def upsert_message(
@@ -45,7 +37,7 @@ def upsert_message(
     Always writes current state to `messages`; appends a `message_revisions`
     row iff the content hash changed since the last recorded revision
     (including the very first observation); appends a `message_metrics` row
-    iff at least one of views/forwards/replies is present on this
+    iff at least one of views/forwards/replies/reactions is present on this
     observation. Returns the message's URI.
     """
     del tier  # not yet stored per-message; carried by raw_records/edges/peers
@@ -66,8 +58,8 @@ def upsert_message(
     action = msg.get("action")
     action_json = dumps(action) if action else None
 
-    date = _iso_or_none(msg.get("date"))
-    edit_date = _iso_or_none(msg.get("edit_date"))
+    date = iso_or_none(msg.get("date"))
+    edit_date = iso_or_none(msg.get("edit_date"))
     from_uri = peer_ref_uri(msg.get("from_id"))
     if is_self(store, from_uri):
         # The collecting account is never attributed as an author (issue #12);
@@ -134,7 +126,7 @@ def upsert_message(
     replies = replies_obj.get("replies") if isinstance(replies_obj, dict) else None
     reactions = msg.get("reactions")
     reactions_json = dumps(reactions) if reactions else None
-    if views is not None or forwards is not None or replies is not None:
+    if views is not None or forwards is not None or replies is not None or reactions:
         store.conn.execute(
             "INSERT INTO message_metrics "
             "(message_uri, observed_at, views, forwards, replies, reactions_json) "

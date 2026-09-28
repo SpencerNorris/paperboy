@@ -30,12 +30,21 @@ class Clock(Protocol):
         """The `observed_at` for a projection derived from `payload`."""
         ...
 
+    def now(self) -> str:
+        """"Now" for a decision that has no payload of its own (e.g. the
+        profiles refresh floor): the wall clock live, the last served record's
+        stamp on replay — so the decision is reproducible from raw."""
+        ...
+
 
 class LiveClock:
     """Live collection: every observation happens now."""
 
     def for_payload(self, payload: dict) -> str:
         del payload
+        return utc_now_iso()
+
+    def now(self) -> str:
         return utc_now_iso()
 
 
@@ -74,3 +83,8 @@ class ReplayClock:
                 "ReplayClock.for_payload before any record was served"
             )
         return stamp
+
+    def now(self) -> str:
+        if self._current is None:
+            raise ReplayClockError("ReplayClock.now before any record was served")
+        return self._current
