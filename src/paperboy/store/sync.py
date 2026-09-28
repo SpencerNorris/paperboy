@@ -20,6 +20,11 @@ def get_state(store: Store, scope: str, key: str) -> dict | None:
     return json.loads(row["value_json"]) if row else None
 
 
+def clear_state(store: Store, scope: str, key: str) -> None:
+    """Delete one `sync_state` entry; a no-op when it is absent."""
+    store.conn.execute("DELETE FROM sync_state WHERE scope=? AND key=?", (scope, key))
+
+
 def set_state(store: Store, scope: str, key: str, value: dict) -> None:
     store.conn.execute(
         "INSERT INTO sync_state(scope, key, value_json) VALUES (?, ?, ?) "
