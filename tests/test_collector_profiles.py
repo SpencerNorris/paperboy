@@ -1116,3 +1116,141 @@ async def test_photo_empty_in_history_is_counted(tmp_path):
         )
         assert (res.counts["photos"], res.counts["photos_empty"]) == (1, 1)
         assert st.conn.execute("select count(*) from user_photos").fetchone()[0] == 1
+
+
+# ---- dead-ref backoff (issue #54) --------------------------------------------
+# A `min` stub whose stored provenance can no longer be resolved fails its
+# whole `getUsers` batch; bisection isolates it at a cost of ~log2(batch)
+# extra RPCs. Without a persisted marker that cost recurs on EVERY run, for
+# every target sharing the profile DB. The marker is keyed on the exact ref,
+# so a user who later appears with fresh provenance is retried immediately.
+
+
+class _Clock:
+    def __init__(self, now: str) -> None:
+        self._now = now
+
+    def now(self) -> str:
+        return self._now
+
+    def for_payload(self, payload: dict) -> str:
+        del payload
+        return self._now
+
+
+def _ctx_at(st, gw, settings, now: str):
+    ctx = _ctx(st, gw, settings)
+    ctx.clock = _Clock(now)
+    return ctx
+
+
+def _balanced(counts: dict[str, int]) -> bool:
+    return counts["gathered"] == (
+        counts["triaged"] + counts["empty"] + counts["skipped"]
+        + counts["unresolvable"] + counts["dead_ref_skipped"] + counts["self_skipped"]
+    )
+
+
+DAY1 = "2026-01-02T00:00:00+00:00"
+IN_COOLDOWN = "2026-01-07T23:59:59+00:00"    # T0 + 6d 23:59:59: still held back
+COOLDOWN_OVER = "2026-01-08T00:00:00+00:00"  # T0 + exactly 7d: retried
+
+
+async def _seed_four_with_dead_three(st):
+    _seed_channel(st)
+    for i in (1, 2, 3, 4):
+        _seed_stub(st, i, msg=i)
+
+
+@pytest.mark.asyncio
+async def test_isolated_dead_ref_is_not_resent_within_the_cooldown(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await _seed_four_with_dead_three(st)
+        users = {1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"), 4: _user(4)}
+        gw1 = _gw(users)
+        first = await ProfilesCollector().collect(_ctx_at(st, gw1, _settings(tmp_path), T0))
+        assert gw1.users_calls == [[1, 2, 3, 4], [1, 2], [3, 4], [3], [4]]
+        assert first.counts["skipped"] == 1 and first.counts["dead_ref_skipped"] == 0
+        assert _balanced(first.counts)
+
+        gw2 = _gw(users)
+        second = await ProfilesCollector().collect(
+            _ctx_at(st, gw2, _settings(tmp_path), IN_COOLDOWN)
+        )
+        assert gw2.users_calls == [[1, 2, 4]]  # one call; the dead ref is never re-bisected
+        assert second.counts["dead_ref_skipped"] == 1 and second.counts["skipped"] == 0
+        assert second.counts["triaged"] == 3
+        assert _balanced(second.counts)
+
+
+@pytest.mark.asyncio
+async def test_dead_ref_is_retried_once_the_cooldown_expires(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await _seed_four_with_dead_three(st)
+        users = {1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"), 4: _user(4)}
+        await ProfilesCollector().collect(_ctx_at(st, _gw(users), _settings(tmp_path), T0))
+        gw = _gw(users)
+        res = await ProfilesCollector().collect(_ctx_at(st, gw, _settings(tmp_path), COOLDOWN_OVER))
+        assert gw.users_calls[0] == [1, 2, 3, 4]
+        assert res.counts["dead_ref_skipped"] == 0 and res.counts["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_changed_ref_is_retried_immediately(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await _seed_four_with_dead_three(st)
+        users = {1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"), 4: _user(4)}
+        await ProfilesCollector().collect(_ctx_at(st, _gw(users), _settings(tmp_path), T0))
+        # User 3 turns up in a newer message: new provenance, so a new ref.
+        _seed_stub(st, 3, msg=33)
+        gw = _gw({**users, 3: _user(3)})
+        res = await ProfilesCollector().collect(_ctx_at(st, gw, _settings(tmp_path), DAY1))
+        assert gw.users_calls == [[1, 2, 3, 4]]
+        assert res.counts["dead_ref_skipped"] == 0 and res.counts["triaged"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_retried_ref_that_now_answers_clears_its_marker(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await _seed_four_with_dead_three(st)
+        users = {1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"), 4: _user(4)}
+        await ProfilesCollector().collect(_ctx_at(st, _gw(users), _settings(tmp_path), T0))
+        assert get_state(st, "profiles_dead_ref", "tg:user:3") is not None
+        await ProfilesCollector().collect(
+            _ctx_at(st, _gw({**users, 3: _user(3)}), _settings(tmp_path), COOLDOWN_OVER)
+        )
+        assert get_state(st, "profiles_dead_ref", "tg:user:3") is None
+
+
+@pytest.mark.asyncio
+async def test_dead_ref_skip_also_keeps_the_user_out_of_enrichment(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await _seed_four_with_dead_three(st)
+        users = {1: _user(1), 2: _user(2), 3: SkipAndRecord("MSG_ID_INVALID"), 4: _user(4)}
+        settings = _settings(tmp_path, enrich_profiles=True, profile_budget=10)
+        await ProfilesCollector().collect(_ctx_at(st, _gw(users), settings, T0))
+        full = {
+            i: {"_": "users.userFull", "full_user": {"_": "UserFull", "id": i},
+                "users": [_user(i)], "chats": []}
+            for i in (1, 2, 4)
+        }
+        gw = _gw(users, full_user=full)
+        await ProfilesCollector().collect(_ctx_at(st, gw, settings, DAY1))
+        assert 3 not in gw.full_user_calls
+
+
+@pytest.mark.asyncio
+async def test_collecting_account_in_triage_is_counted_so_the_books_balance(tmp_path):
+    # Live finding (issue #54 smoke): the collecting account is a gathered user;
+    # triage fetches it but deliberately never projects it, and nothing counted
+    # that outcome — so `gathered` exceeded the sum of the outcome counts by one.
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        for i in (1, 2):
+            _seed_stub(st, i, msg=i)
+        set_state(st, "account", "self", {"uri": "tg:user:2", "id": 2})
+        res = await ProfilesCollector().collect(
+            _ctx_at(st, _gw({1: _user(1), 2: _user(2)}), _settings(tmp_path), T0)
+        )
+        assert res.counts["triaged"] == 1 and res.counts["self_skipped"] == 1
+        assert _balanced(res.counts)
