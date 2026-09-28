@@ -63,12 +63,21 @@ def _skip_error_classes() -> tuple[type[Exception], ...]:
         UserBannedInChannelError,
         UserChannelsTooMuchError,
         UserIdInvalidError,
+        UsernameInvalidError,
+        UsernameNotOccupiedError,
         UsersTooMuchError,
     )
 
     return (
         ChatAdminRequiredError,
         ChannelPrivateError,
+        # `contacts.resolveUsername` on a handle that no longer exists (a
+        # deleted or renamed channel) or is malformed (issue #56). Only
+        # resolveUsername raises these in this read-only tool, so classifying
+        # them globally is safe: the `channel` phase is skipped and recorded,
+        # and later phases stop cleanly on "channel context not established".
+        UsernameNotOccupiedError,
+        UsernameInvalidError,
         MsgIdInvalidError,
         BroadcastForbiddenError,
         PremiumAccountRequiredError,
