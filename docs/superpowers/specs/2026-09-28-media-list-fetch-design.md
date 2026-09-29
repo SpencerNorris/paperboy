@@ -62,11 +62,13 @@ Module: `src/paperboy/media_list.py` —
    no new code**, because each segment is a normal collect run (ADR-0005).
    One gateway (one MTProto session, one `Budget`) is shared across all
    segments, so `max_rpc_per_run` bounds the whole command.
-4. **Stops:** a `HardStop` ends the command; a `PhaseStop` in a segment's
-   `channel` phase (e.g. a flood wait on `resolveUsername`) marks that
-   segment's rows `not_attempted` and continues with the next segment; a
-   `PhaseStop` from the free-disk floor ends the command. The report is
-   written in every case.
+4. **Stops:** with #69, flood waits up to `--max-flood-sleep` are slept
+   through, so a phase stop means a wait beyond the ceiling or repeated
+   failures. A `HardStop` ends the command; a `PhaseStop` in a segment's
+   `channel` phase marks that channel's remaining rows `not_attempted` (its
+   later segments are skipped too — don't re-resolve a channel that just
+   stopped) and continues with other channels; a `PhaseStop` from the
+   free-disk floor ends the command. The report is written in every case.
 5. **Per-row outcomes:** `CollectResult` gains an optional
    `outcomes: dict[str, str] | None` (message uri → outcome), populated by
    `MediaCollector` for every row it considers (`downloaded`, `duplicate`,
