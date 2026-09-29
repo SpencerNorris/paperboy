@@ -24,6 +24,7 @@ from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.media_keys import normalize_legacy_location, resolve_key_under
+from paperboy.media_sink import MediaSink, stream_file_into
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
@@ -314,6 +315,12 @@ class ReplaySource:
         ).fetchone() is not None
 
 
+# Read size when streaming a stored media file into the sink: reproject
+# re-verifies every file's sha on the way through without holding a whole
+# file in memory.
+_CHUNK = 1 << 20
+
+
 class RawReplayGateway:
     """`Gateway` served from a raw log, scoped to ONE historical `ReplayRun`
     (ADR-0005) — every query below is additionally bounded to
@@ -524,7 +531,9 @@ class RawReplayGateway:
             raise SkipAndRecord(f"replay: unusable media location for sha {sha}") from exc
         return resolve_key_under(self._src.profile_root, key)
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
         row = self._latest(
             ("mediadownload",),
             "json_extract(context_json, '$.channel_id') = ? "
@@ -532,7 +541,7 @@ class RawReplayGateway:
             (input_channel["channel_id"], message["id"]),
         )
         if row is None:
-            return None
+            return False
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
         path = self._resolve_payload_file(payload["path"], sha)
@@ -540,10 +549,11 @@ class RawReplayGateway:
         # not worth a trio/anyio dependency for.
         if not path.exists():  # noqa: ASYNC240
             raise SkipAndRecord(f"replay: media file missing for sha {sha}")
-        data = path.read_bytes()
+        sink.reset()
+        stream_file_into(path, sink, chunk_size=_CHUNK)
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
-        return data
+        return True
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         row = self._latest(

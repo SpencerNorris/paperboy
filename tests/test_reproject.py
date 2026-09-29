@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -503,12 +505,29 @@ def test_reproject_never_rewrites_media_files(tmp_path, monkeypatch):
     asyncio.run(run_full_collect(tmp_path))
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
 
-    def _no_write(self, data):
-        raise AssertionError(f"reproject wrote a media file: {self}")
+    media = tmp_path / "default" / "media"
 
-    monkeypatch.setattr(Path, "write_bytes", _no_write)
+    def _snapshot() -> dict[str, tuple[int, str]]:
+        return {
+            str(p.relative_to(media)): (
+                p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest()
+            )
+            for p in media.rglob("*")
+            if p.is_file() and ".incoming" not in p.parts
+        }
+
+    before = _snapshot()
+    assert before  # the fixture really stored media
+
+    def _no_replace(src, dst):
+        raise AssertionError(f"reproject moved a temp file over a final name: {dst}")
+
+    # A replay's temp copy is discarded; nothing may be renamed to a final name.
+    monkeypatch.setattr(os, "replace", _no_replace)
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 0, result.output
+    assert _snapshot() == before
+    assert list((media / ".incoming").iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
