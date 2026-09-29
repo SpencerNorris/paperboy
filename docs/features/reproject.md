@@ -124,13 +124,19 @@ operator can eyeball the correction before swapping files.
   Asserted in test by monkeypatching all three real constructors to raise.
 - **Zero credentials.** No keychain access anywhere on this path (asserted
   by monkeypatching `keyring.get_password` to raise).
-- **No media re-download or re-write.** `download_media` reads bytes back
-  from the source profile's content-addressed store: each payload's location
-  is resolved as a media key under the source profile dir (ADR-0007), and
-  legacy absolute/cwd-relative payloads are normalised by their sha, so a
-  moved profile dir still replays; a live collect's own
-  write-if-not-exists guard (added as part of this feature) makes the
-  guarantee free to verify by monkeypatching `Path.write_bytes` to raise.
+- **No media re-download or re-write of final files.** `download_media`
+  streams the stored file back from the source profile's content-addressed
+  store into the collector's `MediaSink` (re-verifying its sha on the way
+  through): each payload's location is resolved as a media key under the
+  source profile dir (ADR-0007), and legacy absolute/cwd-relative payloads
+  are normalised by their sha, so a moved profile dir still replays. The
+  collector then finds the destination already present and discards its
+  temp copy, so no final-name file is ever created or replaced; the test
+  asserts `os.replace` is never called, every stored file's size and sha are
+  unchanged, and `media/.incoming/` is empty afterwards. Cost (#64): each
+  replayed file is transiently copied once into `<source>/media/.incoming/`
+  and deleted (one extra write per file per replayed run). A hash-only sink
+  for replay would avoid it; deferred.
 
 ## Design deviations from the spec (D4, plan §"Locked design decisions")
 

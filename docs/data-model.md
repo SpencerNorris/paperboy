@@ -130,7 +130,7 @@ Content-addressed by SHA-256; deduped across messages.
 | `message_uri` | TEXT | Message the file came from. |
 | `kind` | TEXT | `photo` (server-re-encoded) or `document` (byte-exact). |
 | `mime_type` | TEXT | MIME type (documents). |
-| `size` | INTEGER | Byte size. |
+| `size` | INTEGER | Bytes received (streamed and counted; equals the declared size for documents, #64). |
 | `file_name` | TEXT | Original filename (documents). |
 | `attributes_json` | TEXT | Video/audio/sticker attributes. |
 | `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |

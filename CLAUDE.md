@@ -27,6 +27,7 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 `user_snapshots`/`user_photos`/`participants`/`participant_snapshots` tables
 (migration `0004_people.sql`) and reproject-replay support. See
 `docs/features/person-layer.md` and `docs/adr/0006-person-layer-storage.md`.
+Media downloads are streamed to `media/.incoming/*.part` and atomically renamed (#64, `docs/features/media-streaming.md`): declared-size guard (`size_mismatch`) and a free-disk floor (`--media-min-free-gb`, #53).
 
 ## Read these first
 
