@@ -5,8 +5,10 @@ one walk of the run's rowid window."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
+import time
 
 import pytest
 
@@ -213,3 +215,56 @@ def test_source_phase_helpers_read_the_index_not_the_run(tmp_path):
         finally:
             src.conn.set_trace_callback(None)
         assert not [s for s in stmts if "BETWEEN" in s or "json_extract" in s], stmts
+
+
+def test_namespaced_kinds_resolve(tmp_path):
+    def populate(st):
+        st.add_raw("User", {"_": "user", "id": 1}, "self", None, observed_at="t1")
+        st.add_raw("contacts.resolvedPeer", {"_": "contacts.resolvedPeer", "k": 1}, "stranger",
+                   {"target": "@durov"}, observed_at="t2")
+        st.add_raw("messages.chatFull", {"_": "messages.chatFull", "k": 2}, "stranger",
+                   {"channel_id": 5}, observed_at="t3")
+
+    with _source(tmp_path, populate) as src:
+        gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+        assert asyncio.run(gw.resolve("durov"))["k"] == 1
+        assert asyncio.run(gw.get_full_channel({"channel_id": 5}))["k"] == 2
+
+
+# Measured on a USB volume: 0.8 s for the timed section. The bound is 10x that,
+# floor 10 s — it catches a return to per-lookup range scans (which take
+# minutes at this size) without flaking on a slow disk.
+_RUN_SIZE_BOUND_S = 10.0
+
+
+def test_media_and_message_lookups_do_not_scale_with_run_size(tmp_path):
+    n_media, n_plain = 5_000, 45_000
+
+    def populate(st):
+        st.add_raw("User", {"_": "user", "id": 1}, "self", None, observed_at="t0")
+        st.add_raw("ResolvedPeer", {"_": "x"}, "stranger", {"target": "@a"}, observed_at="t0")
+        st.add_raw("ChatFull", {"full_chat": {}}, "stranger", {"channel_id": 5}, observed_at="t0")
+        rows = []
+        for i in range(1, n_media + n_plain + 1):
+            payload = {"_": "message", "id": i}
+            if i <= n_media:
+                payload["media"] = {"_": "MessageMediaPhoto"}
+            rows.append(("Message", "t1", "stranger", json.dumps({"channel_id": 5}),
+                         json.dumps(payload), st.run_id))
+        st.conn.executemany(
+            "INSERT INTO raw_records(kind, observed_at, tier, context_json, payload_json, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)", rows,
+        )
+        st.conn.commit()
+
+    with _source(tmp_path, populate) as src:
+        run = src.runs()[0]
+        started = time.perf_counter()
+        gw = RawReplayGateway(src, ReplayClock(), run)
+        src.index(run)
+        for mid in range(1, n_media + 1):  # MediaDownload misses never touch the sink
+            assert not asyncio.run(gw.download_media({"channel_id": 5}, {"id": mid}, None))  # type: ignore[arg-type]
+        got = asyncio.run(gw.get_messages({"channel_id": 5}, list(range(1, n_media + 1))))
+        elapsed = time.perf_counter() - started
+        assert all(m["_"] == "message" for m in got)
+        assert elapsed < _RUN_SIZE_BOUND_S, f"{elapsed:.1f}s for a {n_media + n_plain}-row run"
