@@ -172,6 +172,18 @@ async def collect_channel_with_context(
     if channel_context is not None:
         active = [c for c in active if c.name != "channel"]
     selected = set(phases) if phases is not None else {c.name for c in active}
+    if settings.media_msgs is not None and any(
+        c.name == "media" and c.name in selected for c in active
+    ):
+        # The media phase will walk only these ids. Recording them keeps the
+        # raw log sufficient to replay exactly the same rows: without it a
+        # reproject would walk every stored media message and re-derive dedup
+        # custody rows the live run never produced.
+        selection = {"msg_ids": sorted(set(settings.media_msgs))}
+        store.add_raw(
+            "MediaSelection", selection, ctx.tier, None,
+            observed_at=ctx.clock.for_payload(selection),
+        )
 
     results: list[CollectResult] = []
     progress = Progress(store, log)

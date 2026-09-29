@@ -129,3 +129,41 @@ async def test_stop_exc_carries_the_exception_type(tmp_path):
         assert isinstance(results[0].stop_exc, DiskFloorStop)
         assert isinstance(results[1].stop_exc, SkipAndRecord)
         assert isinstance(results[2].stop_exc, HardStop)
+
+
+@pytest.mark.asyncio
+async def test_media_selection_is_recorded_once_when_media_runs_with_msgs(tmp_path):
+    # A `media_msgs`-scoped media phase walks only those rows; the run records
+    # the ids so a reproject walks exactly the same rows (#68). Without it a
+    # replay would re-derive dedup custody rows for messages the live run
+    # never considered.
+    settings = load_settings("default", {"media_msgs": [7, 3, 5]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await collect_channel(
+            FakeGateway({}), st, settings, parse_target("@durov"),
+            phases=["channel", "media"], log=_LOG,
+            collectors=[_ChannelStub(), _SeenCtxStub()],
+        )
+        rows = st.conn.execute(
+            "SELECT run_id, payload_json FROM raw_records WHERE kind='MediaSelection'"
+        ).fetchall()
+        assert len(rows) == 1 and rows[0]["run_id"] == st.run_id
+        assert json.loads(rows[0]["payload_json"]) == {"msg_ids": [3, 5, 7]}
+
+
+@pytest.mark.asyncio
+async def test_no_media_selection_without_msgs_or_without_media_phase(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await collect_channel(
+            FakeGateway({}), st, load_settings("default", {}), parse_target("@durov"),
+            phases=["channel", "media"], log=_LOG,
+            collectors=[_ChannelStub(), _SeenCtxStub()],
+        )
+        await collect_channel(
+            FakeGateway({}), st, load_settings("default", {"media_msgs": [1]}),
+            parse_target("@durov"), phases=["channel"], log=_LOG,
+            collectors=[_ChannelStub(), _SeenCtxStub()],
+        )
+        assert st.conn.execute(
+            "SELECT count(*) FROM raw_records WHERE kind='MediaSelection'"
+        ).fetchone()[0] == 0
