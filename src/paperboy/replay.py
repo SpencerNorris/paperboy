@@ -11,13 +11,16 @@ executed (spec §3) — with the documented deviations D4.1–D4.4 in
 
 from __future__ import annotations
 
+import heapq
 import json
+import logging
 import os
 import sqlite3
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 import httpx
 
@@ -28,6 +31,8 @@ from paperboy.media_keys import normalize_legacy_location, resolve_key_under
 from paperboy.media_sink import MediaSink, stream_file_into
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
+
+log = logging.getLogger("paperboy.replay")
 
 
 class ReprojectSourceError(Exception):
@@ -66,6 +71,173 @@ def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
     return "(" + " OR ".join(parts) + ")", tuple(params)
 
 
+def kind_matches(stored_lower: str, kinds: tuple[str, ...]) -> bool:
+    """Python twin of `_kind_clause`: `stored_lower` (already `lower(kind)`)
+    equals a wanted kind or carries a dotted namespace prefix before it."""
+    return any(stored_lower == k or stored_lower.endswith("." + k) for k in kinds)
+
+
+MatchMode = Literal["suffix", "exact", "contains"]
+
+# Kinds whose `payload_json.$.id` is indexed (message lookups by message id).
+_MESSAGE_KINDS = ("message", "messageservice", "messageempty")
+_WEB_KINDS = ("tme_page", "wayback_cdx")
+
+# Rough per-entry cost on top of the context text (RawEntry + dict + bucket
+# slots); measured ~0.9 KB/row all-in on a real 27k-row run (#75).
+_ENTRY_OVERHEAD_BYTES = 600
+# One run's index above this logs a WARNING (no hard cap, no failure).
+INDEX_WARN_BYTES = 512 * 1024 * 1024
+_LOOKUP_CHUNK = 500
+
+
+@dataclass(frozen=True, slots=True)
+class RawEntry:
+    """One `raw_records` row as the index remembers it (payload excluded —
+    fetched by rowid only when a lookup actually serves it)."""
+
+    id: int
+    kind: str  # lower-cased stored kind
+    tier: str
+    observed_at: str
+    ctx: dict  # parsed context_json; {} when NULL or not a JSON object
+    payload_id: int | None  # CAST($.id AS INTEGER) — message kinds only
+    url: str | None  # $.url — web kinds only
+
+
+def _hashable_key(values: Iterable[object]) -> tuple | None:
+    """The dict key for `values`, or None when any is NULL/unhashable — SQL
+    `NULL = x` never matches, and a JSON object/array never equals a scalar."""
+    key = tuple(values)
+    for v in key:
+        if v is None or isinstance(v, dict | list):
+            return None
+    return key
+
+
+class RunIndex:
+    """Every raw record of ONE run, read by a single rowid-range walk
+    (`WALK_SQL`) and answered from memory ever after (#75). Lookups return the
+    same rows, in the same `id` order, as the per-lookup SQL they replace."""
+
+    _kind_sql, _kind_params = _kind_clause(_MESSAGE_KINDS)
+    WALK_SQL = (
+        "SELECT id, lower(kind), tier, observed_at, context_json, "
+        f"CASE WHEN {_kind_sql} THEN CAST(json_extract(payload_json, '$.id') AS INTEGER) END, "
+        "CASE WHEN lower(kind) IN ('tme_page', 'wayback_cdx') "
+        "THEN json_extract(payload_json, '$.url') END "
+        "FROM raw_records WHERE id BETWEEN ? AND ? ORDER BY id"
+    )
+
+    def __init__(self, all_entries: list[RawEntry]) -> None:
+        self.all_entries = all_entries
+        self.by_kind: dict[str, list[RawEntry]] = {}
+        for e in all_entries:
+            self.by_kind.setdefault(e.kind, []).append(e)
+        self._entries_cache: dict[tuple[MatchMode, tuple[str, ...]], list[RawEntry]] = {}
+        self._key_maps: dict[tuple, dict[tuple, list[RawEntry]]] = {}
+        self._ctx_groups: dict[str, dict[object, list[RawEntry]]] = {}
+
+    @classmethod
+    def build(cls, conn: sqlite3.Connection, run: ReplayRun) -> RunIndex:
+        started = time.perf_counter()
+        entries: list[RawEntry] = []
+        ctx_bytes = 0
+        for rid, kind, tier, observed_at, ctx_json, payload_id, url in conn.execute(
+            cls.WALK_SQL, (*cls._kind_params, run.lo, run.hi)
+        ):
+            ctx: dict = {}
+            if ctx_json is not None:
+                ctx_bytes += len(ctx_json)
+                try:
+                    parsed = json.loads(ctx_json)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    ctx = parsed
+            entries.append(RawEntry(rid, kind, tier, observed_at, ctx, payload_id, url))
+        index = cls(entries)
+        approx = ctx_bytes + len(entries) * _ENTRY_OVERHEAD_BYTES
+        message_rows = sum(
+            len(b) for k, b in index.by_kind.items() if kind_matches(k, _MESSAGE_KINDS)
+        )
+        log.info(
+            "replay index run=%s rows=%d message_rows=%d context_bytes=%d approx_bytes=%d "
+            "elapsed=%.2fs",
+            run.run_id, len(entries), message_rows, ctx_bytes, approx,
+            time.perf_counter() - started,
+        )
+        if approx > INDEX_WARN_BYTES:
+            log.warning(
+                "replay index for run=%s is large (approx_bytes=%d > %d): one run is held "
+                "in memory at a time",
+                run.run_id, approx, INDEX_WARN_BYTES,
+            )
+        return index
+
+    def entries(self, kinds: tuple[str, ...], mode: MatchMode = "suffix") -> list[RawEntry]:
+        """Entries of the matching kinds, `id` ASC. `suffix` = `_kind_clause`
+        semantics; `exact` = `lower(kind) IN`; `contains` = `LIKE '%k%'`."""
+        cached = self._entries_cache.get((mode, kinds))
+        if cached is not None:
+            return cached
+        if mode == "suffix":
+            match = lambda k: kind_matches(k, kinds)  # noqa: E731
+        elif mode == "exact":
+            match = lambda k: k in kinds  # noqa: E731
+        else:
+            match = lambda k: any(w in k for w in kinds)  # noqa: E731
+        buckets = [b for k, b in self.by_kind.items() if match(k)]
+        out = buckets[0] if len(buckets) == 1 else list(heapq.merge(*buckets, key=lambda e: e.id))
+        self._entries_cache[(mode, kinds)] = out
+        return out
+
+    @staticmethod
+    def _field(entry: RawEntry, name: str) -> object:
+        if name == "@tier":
+            return entry.tier
+        if name == "@payload_id":
+            return entry.payload_id
+        if name == "@url":
+            return entry.url
+        return entry.ctx.get(name)
+
+    def lookup(
+        self,
+        kinds: tuple[str, ...],
+        fields: tuple[str, ...],
+        values: tuple[object, ...],
+        mode: MatchMode = "suffix",
+    ) -> list[RawEntry]:
+        """Entries (`id` ASC) of `kinds` whose `fields` equal `values`. A
+        `None` value (or an entry missing a field) never matches."""
+        want = _hashable_key(values)
+        if want is None:
+            return []
+        cache_key = (mode, kinds, fields)
+        key_map = self._key_maps.get(cache_key)
+        if key_map is None:
+            key_map = {}
+            for e in self.entries(kinds, mode):
+                k = _hashable_key(self._field(e, f) for f in fields)
+                if k is not None:
+                    key_map.setdefault(k, []).append(e)
+            self._key_maps[cache_key] = key_map
+        return key_map.get(want, [])
+
+    def ctx_groups(self, key: str) -> dict[object, list[RawEntry]]:
+        """Every entry (any kind) grouped by its context value under `key`."""
+        groups = self._ctx_groups.get(key)
+        if groups is None:
+            groups = {}
+            for e in self.all_entries:
+                v = e.ctx.get(key)
+                if v is not None and not isinstance(v, dict | list):
+                    groups.setdefault(v, []).append(e)
+            self._ctx_groups[key] = groups
+        return groups
+
+
 class ReplaySourceError(Exception):
     """The source DB cannot be replayed safely (operator-actionable)."""
 
@@ -93,6 +265,9 @@ class ReplaySource:
         self._has_run_id = any(
             r[1] == "run_id" for r in conn.execute("PRAGMA table_info(raw_records)")
         )
+        # Single-entry cache: reproject is sequential per run, so only the
+        # current run's index is ever resident (#75).
+        self._index: tuple[tuple[int, int], RunIndex] | None = None
 
     @classmethod
     def open(cls, db_path: Path, profile_root: Path) -> Self:
@@ -308,6 +483,35 @@ class ReplaySource:
         _resolve_pending()
         _flush()
         return runs
+
+    def index(self, run: ReplayRun) -> RunIndex:
+        """The run's in-memory raw index, built by ONE walk and reused until
+        another run is asked for (#75)."""
+        key = (run.lo, run.hi)
+        if self._index is None or self._index[0] != key:
+            self._index = None  # free the previous run before building the next
+            self._index = (key, RunIndex.build(self.conn, run))
+        return self._index[1]
+
+    def payloads(self, ids: Iterable[int]) -> dict[int, sqlite3.Row]:
+        """`observed_at, payload_json` by rowid. A missing id is a corrupt
+        source (the index just saw it), never silently skipped."""
+        wanted = list(ids)
+        out: dict[int, sqlite3.Row] = {}
+        for i in range(0, len(wanted), _LOOKUP_CHUNK):
+            chunk = wanted[i : i + _LOOKUP_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for row in self.conn.execute(
+                f"SELECT id, observed_at, payload_json FROM raw_records WHERE id IN ({marks})",
+                chunk,
+            ):
+                out[row["id"]] = row
+        missing = [i for i in wanted if i not in out]
+        if missing:
+            raise ReprojectSourceError(
+                f"raw record(s) {missing[:5]} vanished from the source during replay"
+            )
+        return out
 
     def resolve_targets(self, run: ReplayRun) -> list[str]:
         """Every distinct `target` a `resolve()` was recorded against WITHIN
