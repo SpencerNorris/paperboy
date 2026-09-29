@@ -50,7 +50,8 @@ async def download_media(self, input_channel: dict, message: dict, sink: MediaSi
   logging declared vs received — never a partial file under a final name.
 - `FakeGateway` writes its fixture bytes into the sink (in a few chunks, so
   chunking is exercised); `RawReplayGateway` streams the stored file into
-  the sink in chunks (no `read_bytes()` of the whole file).
+  the sink in chunks (no `read_bytes()` of the whole file). In replay that
+  sink is **hash-only** (no backing file) — see §2.3.
 - `download_user_photo` (avatars, < ~1 MB) keeps returning bytes — out of
   scope; note it in the docstring.
 
@@ -75,6 +76,33 @@ In `MediaCollector.collect`:
 5. At phase start, sweep `.incoming/*.part` older than 1 hour (a crashed
    previous run), logging how many and how many bytes were removed.
 
+### 2.3 Replay (`reproject`) leaves the source untouched
+
+*Amended 2026-09-29 after the first #64 run escalated: the design above
+routed replay through the live download path (disk floor, `.incoming`, temp
+file + rename), and each review round found another way that leaked into a
+rebuild.*
+
+Replay rebuilds rows from files that already exist; it downloads nothing.
+So in replay (`ctx.gateway.replay is True`):
+
+- **Reads only from the source.** Replay writes the output database and
+  nothing else. It creates no `.incoming/` directory, no temp file and no
+  rename anywhere under the source profile, and must work when the source
+  profile directory is read-only.
+- **Hash-only sink.** The stored file is streamed (chunked, bounded memory)
+  into a `MediaSink` with no backing file; its `sha256`/`size` confirm the
+  bytes match the receipt. Nothing is copied.
+- **No free-disk floor and no `.incoming` sweep** — both guard downloads,
+  and replay makes none. A rebuild must not depend on how much space the
+  host has.
+- **Stored file present** → write the `media`/`custody_log` rows pointing at
+  the existing key. **Stored file missing** (under the recorded key or a
+  legacy suffix) → `skipped` with a WARNING; never fabricate a row.
+- **Writing media into a *different* output profile** (#70's
+  `--out-profile`) is not replay-into-source and is specified by #70, not
+  here. Until #70 lands, replay's only output is the database.
+
 ## 3. Tests (write first, see them fail)
 
 - **Bounded memory:** a fake gateway streams 200 MB in 1 MB chunks;
@@ -94,6 +122,14 @@ In `MediaCollector.collect`:
   two custody rows.
 - **Sweep:** a stale `.part` is removed at phase start; a fresh one is not.
 - `reproject` parity suite unchanged (replay streams from the stored file).
+- **Replay writes nothing into the source (§2.3):** reproject a fixture whose
+  source profile directory is made read-only (`chmod`, restored in teardown);
+  it completes, media rows are rebuilt, and a before/after snapshot of every
+  path + size + mtime under the source profile is identical — no `.incoming`.
+- **Replay ignores the disk floor:** `shutil.disk_usage` monkeypatched to 0
+  free → reproject still rebuilds the media rows.
+- **Replay with a missing stored file** → `skipped` counted, WARNING logged,
+  no row.
 
 ## 4. Definition of done (smoke on real data)
 
@@ -110,6 +146,34 @@ size` from `time -l` (must be far below the file size), `shasum -a 256` of
 the stored file matching its `media.sha256`, and `ls media/.incoming` empty.
 Then re-run the same command and show `duplicates` counted with no new
 download (that re-run is the second of the feature's ≤ 5 live invocations).
+
+### 4.1 Replay smoke on a small real-data fixture (offline, required)
+
+A full-store replay is not a usable smoke on this hardware (#75), so build a
+small fixture that finishes in minutes:
+
+1. `.backup` the scratch store (never the real one) to
+   `<scratch>/replay-src/default/paperboy.sqlite`.
+2. Trim it to **one run**: the smallest run (`ReplaySource.runs()`) whose raw
+   rows include ≥ 1 `MediaDownload`, by deleting every `raw_records` row
+   outside that run's rowid range; `VACUUM`. Paste the run's row count and
+   `MediaDownload` count.
+3. `<scratch>/replay-src/default/media/` is a real directory containing
+   **per-file symlinks** to exactly the stored files that run references
+   (never a symlink to the whole media dir, and never write into the real
+   one). Then `chmod -R a-w <scratch>/replay-src/default` (if the agent
+   sandbox refuses `chmod`, say so; the before/after digest below is then
+   the proof).
+4. `PAPERBOY_DATA_DIR=<scratch>/replay-src paperboy reproject --profile
+   default --phases channel,history,media --out <scratch>/replay-out.sqlite`
+   (**`history` is required**: the media phase selects its rows from the
+   rebuilt `messages`).
+
+Paste (redacted): the reproject table with **source and output columns
+labelled** — output `media` must equal the run's `MediaDownload` count minus
+any reported missing files, and must be > 0 (a zero is a failed smoke, not a
+pass); a before/after `find <src> -exec stat` digest of the fixture profile
+proving it unchanged; no `.incoming` anywhere under it.
 
 ## 5. Out of scope
 
