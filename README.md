@@ -142,7 +142,7 @@ The collecting account's own record is scrubbed from exports.
 | `paperboy collect TARGET --profiles [--profile-budget N]` | Also run full profile enrichment (`getFullUser`, photo history, avatars) — the expensive opt-in on top of the always-on `getUsers` triage. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
 | `paperboy export TARGET --format jsonl --out DIR [--profile P]` | Export to JSONL. |
-| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. Never writes into the source profile: the log goes beside `--out` (`paperboy.reprojected.log` by default), and a read-only source profile works. |
+| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. Never writes into the source profile: the log goes beside `--out` (`paperboy.reprojected.sqlite.log` by default), and a read-only source profile works. |
 | `paperboy watch` / `paperboy lookup` | Phase 2 — not implemented (exit with a notice). |
 
 `TARGET` accepts `@username`, `t.me/name`, `t.me/name/123`, an invite link, or a
@@ -171,7 +171,7 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 ./data/<profile>/        # in the repo dir by default; gitignored
   paperboy.sqlite     # system of record: raw_records + normalized tables + FTS5
   paperboy.log        # credential-redacted JSON log
-  paperboy.reprojected.sqlite / .log  # `reproject` output and its log (default --out)
+  paperboy.reprojected.sqlite(.log)  # `reproject` output and its log (default --out)
   media/              # (Phase 2) downloaded files, content-addressed
     .incoming/        # in-flight downloads (*.part), swept after 1 h
 ```

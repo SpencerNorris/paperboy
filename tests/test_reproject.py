@@ -186,9 +186,24 @@ def test_cli_reproject_custom_out_path(tmp_path, monkeypatch):
     assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
 
 
+def test_reproject_out_ending_in_dot_log_keeps_db_and_log_separate(tmp_path, monkeypatch):
+    """`--out x.log` must not make the log path equal the output DB (the
+    FileHandler would append JSON into the SQLite file)."""
+    asyncio.run(run_full_collect(tmp_path))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    out = tmp_path / "replay.log"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.read_bytes()[:16] == b"SQLite format 3\x00"
+    with sqlite3.connect(out) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    log = tmp_path / "replay.log.log"
+    assert log.exists() and log.read_text().strip()
+
+
 def test_reproject_logs_beside_the_output_not_into_the_source_profile(tmp_path, monkeypatch):
     """The source profile is read-only to replay (#64 §2.3): the log goes next
-    to `--out`, and the default `--out` gives `paperboy.reprojected.log`."""
+    to `--out`, and the default `--out` gives `paperboy.reprojected.sqlite.log`."""
     asyncio.run(run_full_collect(tmp_path))
     profile = tmp_path / "default"
     main_log = profile / "paperboy.log"
@@ -201,13 +216,13 @@ def test_reproject_logs_beside_the_output_not_into_the_source_profile(tmp_path, 
         app, ["reproject", "--profile", "default", "--out", str(elsewhere / "out.sqlite")]
     )
     assert result.exit_code == 0, result.output
-    out_log = elsewhere / "out.log"
+    out_log = elsewhere / "out.sqlite.log"
     assert out_log.exists() and out_log.read_text().strip()
     assert (main_log.read_bytes() if main_log.exists() else None) == log_before
 
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 0, result.output
-    assert (profile / "paperboy.reprojected.log").exists()
+    assert (profile / "paperboy.reprojected.sqlite.log").exists()
 
 
 def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkeypatch):
@@ -600,7 +615,7 @@ def test_reproject_works_against_a_read_only_source_profile(tmp_path, monkeypatc
     # (the collect's own empty `.incoming` pre-exists; the digest proves replay
     # created nothing new, and no partial file may be left in it)
     assert not list(profile.rglob("*.part"))
-    assert "immutable" in out.with_suffix(".log").read_text()
+    assert "immutable" in out.with_name(out.name + ".log").read_text()
     with sqlite3.connect(out) as conn:
         assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media
         assert conn.execute("SELECT count(*) FROM custody_log").fetchone()[0] == src_custody
@@ -641,7 +656,7 @@ def test_reproject_skips_a_missing_stored_file_with_a_warning(tmp_path, monkeypa
         assert conn.execute("SELECT count(*) FROM custody_log").fetchone()[0] == src_custody - 1
     # `configure_logging` owns the `paperboy` logger's handlers, so read the
     # run's own log file (beside --out) rather than caplog.
-    log_lines = (tmp_path / "default" / "paperboy.reprojected.log").read_text().splitlines()
+    log_lines = (tmp_path / "default" / "paperboy.reprojected.sqlite.log").read_text().splitlines()
     warnings = [ln for ln in log_lines if "media file missing for sha" in ln]
     assert len(warnings) == 1 and '"WARNING"' in warnings[0].upper()
     assert sorted(str(p.relative_to(media)) for p in media.rglob("*")) == before

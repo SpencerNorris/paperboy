@@ -136,8 +136,8 @@ operator can eyeball the correction before swapping files.
   unchanged. Replay uses a file-less hash-and-count sink (#64), so it writes
   nothing into the source profile: a read-only source profile works (tested
   by a size+mtime digest of the whole profile before and after).
-- **Log beside `--out`.** `reproject` writes `<out stem>.log` (default
-  `paperboy.reprojected.log`), never into the source profile's
+- **Log beside `--out`.** `reproject` writes `<out filename>.log` (`x.sqlite.log`, `x.log.log`;
+  never equal to the output DB; default `paperboy.reprojected.sqlite.log`), never into the source profile's
   `paperboy.log`.
 - **WAL source in a read-only directory.** The source is opened `mode=ro`. A
   WAL database whose `-shm`/`-wal` sidecars are absent, in a directory the

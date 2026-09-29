@@ -456,7 +456,7 @@ def reproject(
     # must not write there (#64 §2.3, a read-only profile must work).
     # `build_reproject` has already validated the profile and created
     # `out_path`'s parent, so this cannot manufacture `data/<typo>/`.
-    configure_logging(out_path.with_suffix(".log"), console=True)
+    configure_logging(out_path.with_name(out_path.name + ".log"), console=True)
     log = logging.getLogger("paperboy.cli")
     if source.opened_immutable:
         log.warning(
