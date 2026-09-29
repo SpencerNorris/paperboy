@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import shutil
 import sqlite3
+from collections import namedtuple
 from contextlib import closing
 from pathlib import Path
 
@@ -381,6 +384,146 @@ def test_cli_out_profile_writes_store_and_log_in_the_new_profile(tmp_path, monke
     db = tmp_path / "split" / "paperboy.sqlite"
     assert _count(db, "SELECT count(*) FROM messages WHERE channel_id NOT IN (6, 77)") == 0
     assert (tmp_path / "split" / "paperboy.sqlite.log").exists()
+
+
+# --- --out-profile copies media -----------------------------------------------
+
+
+def _files(root: Path) -> dict[str, bytes]:
+    """{relative path: bytes} of every regular file under `root` (recursing
+    through `.incoming` too), or {} when `root` does not exist."""
+    if not root.exists():
+        return {}
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def _media_keys(db: Path, like: str) -> list[str]:
+    with closing(sqlite3.connect(db)) as conn:
+        return sorted(
+            r[0] for r in conn.execute(
+                "SELECT path FROM media WHERE message_uri LIKE ?", (like,)
+            )
+        )
+
+
+def _split_beta(tmp_path, monkeypatch, name: str = "split"):
+    return _cli(tmp_path, monkeypatch, "--include-target", "@beta", "--out-profile", name)
+
+
+def test_out_profile_copies_only_that_targets_media_and_leaves_the_source_unchanged(
+    tmp_path, monkeypatch
+):
+    src_db = seed_two_target_source(tmp_path)
+    source_media = tmp_path / "default" / "media"
+    before = _files(source_media)
+    beta_keys = _media_keys(src_db, "tg:msg:6/%")
+    assert len(beta_keys) == 1 and len(_media_keys(src_db, "tg:msg:5/%")) == 1
+
+    result, _ = _split_beta(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+
+    assert _files(source_media) == before  # nothing written, moved or removed
+    out_media = tmp_path / "split" / "media"
+    copied = {k: v for k, v in _files(out_media).items() if not k.startswith(".incoming")}
+    assert copied == {k.removeprefix("media/"): BETA_BYTES for k in beta_keys}
+    assert (out_media / ".incoming").is_dir() and not list((out_media / ".incoming").iterdir())
+    out_db = tmp_path / "split" / "paperboy.sqlite"
+    assert _media_keys(out_db, "%") == beta_keys
+
+
+def test_out_profile_copy_is_atomic_temp_then_rename(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    calls: list[tuple[str, str]] = []
+    real_replace = os.replace
+
+    def spy(src, dst, *a, **kw):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "replace", spy)
+    result, _ = _split_beta(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    media_moves = [c for c in calls if "/split/media/" in c[1]]
+    assert len(media_moves) == 1
+    src, dst = media_moves[0]
+    assert "/split/media/.incoming/" in src and src.endswith(".part")
+    assert re.search(r"/split/media/[0-9a-f]{2}/[0-9a-f]{64}\.txt$", dst)
+    assert not list((tmp_path / "split" / "media").rglob("*.part"))
+
+
+def test_out_profile_copy_applies_the_disk_floor_to_the_destination(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    real_usage = shutil.disk_usage
+    usage_t = namedtuple("usage", "total used free")
+
+    def usage(path):
+        if "/split/" in str(path):
+            return usage_t(10**12, 10**12 - 1000, 1000)  # 1 KB free
+        return real_usage(path)
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    result, _ = _split_beta(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output  # the phase stops cleanly; the DB is written
+    assert "floor" in result.output
+    assert _count(tmp_path / "split" / "paperboy.sqlite", "SELECT count(*) FROM media") == 0
+    copied = {k for k in _files(tmp_path / "split" / "media") if not k.startswith(".incoming")}
+    assert not copied and not list((tmp_path / "split" / "media").rglob("*.part"))
+    assert _count(tmp_path / "split" / "paperboy.sqlite", "SELECT count(*) FROM messages") > 0
+
+
+def test_out_profile_copy_dedups_a_file_referenced_twice(tmp_path, monkeypatch):
+    settings = load_settings("default", {"data_dir": tmp_path})
+    fixtures = _channel_fixtures(
+        BETA_ID, "beta", linked=None, media={2: BETA_BYTES, 3: BETA_BYTES}
+    )
+    # One Telegram document forwarded into two messages: the second is a
+    # content-id dedup hit (custody row, no download, no MediaDownload raw).
+    docs = [m["media"]["document"] for m in fixtures["history"] if "media" in m]
+    docs[1]["id"] = docs[0]["id"]
+    with Store.open(tmp_path / "default" / "paperboy.sqlite") as store:
+        asyncio.run(collect_channel(
+            FakeGateway(fixtures), store, settings, parse_target("@beta"),
+            ["channel", "history", "media"], logging.getLogger("seed"),
+            collectors=[ChannelCollector(), HistoryCollector(), MediaCollector()],
+        ))
+    result, _ = _split_beta(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    out_db = tmp_path / "split" / "paperboy.sqlite"
+    copied = {k for k in _files(tmp_path / "split" / "media") if not k.startswith(".incoming")}
+    assert len(copied) == 1
+    assert _count(out_db, "SELECT count(*) FROM custody_log") == 2
+    assert _count(out_db, "SELECT count(*) FROM media") == 1  # the dedup hit adds custody only
+
+
+def test_out_profile_skips_a_missing_or_corrupt_source_file(tmp_path, monkeypatch):
+    src_db = seed_two_target_source(tmp_path)
+    [key] = _media_keys(src_db, "tg:msg:6/%")
+    stored = tmp_path / "default" / key
+    stored.write_bytes(b"corrupt!!" + stored.read_bytes()[9:])
+    result, _ = _split_beta(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert _count(tmp_path / "split" / "paperboy.sqlite", "SELECT count(*) FROM media") == 0
+    assert not {k for k in _files(tmp_path / "split" / "media") if not k.startswith(".incoming")}
+    log = (tmp_path / "split" / "paperboy.sqlite.log").read_text()
+    assert "does not match its receipt" in log
+
+    stored.unlink()  # now missing altogether
+    result, _ = _split_beta(tmp_path, monkeypatch, "split2")
+    assert result.exit_code == 0, result.output
+    assert _count(tmp_path / "split2" / "paperboy.sqlite", "SELECT count(*) FROM media") == 0
+    assert "media file missing" in (tmp_path / "split2" / "paperboy.sqlite.log").read_text()
+    assert not {k for k in _files(tmp_path / "split2" / "media") if not k.startswith(".incoming")}
+
+
+def test_reproject_refuses_to_copy_media_into_its_own_source_profile(tmp_path):
+    db = seed_two_target_source(tmp_path)
+    settings = load_settings("default", {"data_dir": tmp_path})
+    with ReplaySource.open(db, tmp_path / "default") as src, Store.open(
+        tmp_path / "o.sqlite"
+    ) as store, pytest.raises(ReprojectError, match="source profile itself"):
+        asyncio.run(reproject(
+            src, store, settings, "default", None, logging.getLogger("t"), out_profile="default"
+        ))
 
 
 # --- selector -----------------------------------------------------------------

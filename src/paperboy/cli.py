@@ -533,7 +533,7 @@ def reproject(
             summary = asyncio.run(
                 reproject_run(
                     source, out_store, settings, profile, phase_list, log,
-                    target_filter=target_filter,
+                    target_filter=target_filter, out_profile=out_profile,
                 )
             )
     except (ReprojectError, ReprojectSourceError) as exc:

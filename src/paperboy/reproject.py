@@ -20,7 +20,7 @@ from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.participants import ParticipantsCollector
 from paperboy.collectors.profiles import ProfilesCollector
 from paperboy.collectors.web import WebCollector
-from paperboy.config import Settings
+from paperboy.config import Settings, profile_dir
 from paperboy.recipes import collect_channel
 from paperboy.replay import (
     RawReplayGateway,
@@ -263,6 +263,7 @@ async def reproject(
     log: logging.Logger,
     *,
     target_filter: TargetFilter | None = None,
+    out_profile: str | None = None,
 ) -> ReprojectSummary:
     """Replay every historical collect pass in the source, one run at a time
     (ADR-0005): each run gets its own `ReplayClock`/`RawReplayGateway`/
@@ -276,10 +277,23 @@ async def reproject(
     `target_filter` (#70) restricts the replay to the `(run, raw target)`
     pairs it selects; the rest are not replayed at all, so the output holds no
     raw rows, projections or media for them.
+
+    `out_profile` (#70) names the profile the output store lives in: the media
+    phase then COPIES each referenced file from the source profile into
+    `<data_dir>/<out_profile>/media/` (the only case replay writes files, and
+    never under the source profile). Without it media is only re-hashed.
     """
     runs = source.runs()
     if not runs:
         raise ReprojectError("source raw log is empty — nothing to reproject")
+    if out_profile is not None and (
+        profile_dir(settings, out_profile).resolve() == source.profile_root.resolve()
+    ):
+        raise ReprojectError(
+            f"--out-profile {out_profile!r} is the source profile itself; "
+            "a reproject never writes into its source"
+        )
+    media_profile = out_profile if out_profile is not None else profile
 
     decisions: dict[str, dict[str, bool]] = {}
     records_by_run: dict[str, list[ResolveRecord]] = {}
@@ -366,13 +380,13 @@ async def reproject(
                 ParticipantsCollector(), ProfilesCollector(),
                 GraphCollector(),
                 WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
-                MediaCollector(),
+                MediaCollector(copy_on_replay=out_profile is not None),
             ]
             try:
                 run_results = await collect_channel(
                     gateway, out_store, replay_settings, parse_target(raw_target),
                     list(run_phases), log,
-                    collectors=collectors, profile=profile, clock=clock,
+                    collectors=collectors, profile=media_profile, clock=clock,
                     run_id=run.run_id,
                 )
             except Exception as exc:

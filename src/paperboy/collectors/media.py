@@ -202,7 +202,20 @@ def _guess_ext(kind: str, mime_type: str | None, file_name: str | None) -> str:
 
 
 class MediaCollector:
+    """Downloads (live) or re-derives (replay) each message's media.
+
+    `copy_on_replay` (#70): a replay normally only re-hashes files already in
+    the source profile and writes nothing. When the reproject targets a
+    DIFFERENT output profile (`--out-profile`), the replay gateway becomes the
+    byte source for the live write path instead: the file is streamed into the
+    output profile's `.incoming/`, then atomically renamed to its content-
+    addressed key, with the same disk floor and dedup as a live download.
+    """
+
     name = "media"
+
+    def __init__(self, *, copy_on_replay: bool = False) -> None:
+        self._copy_on_replay = copy_on_replay
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
@@ -224,10 +237,13 @@ class MediaCollector:
         media_root = media_dir(ctx.settings, ctx.profile)
         # A replay (reproject) only re-derives rows from files already in the
         # source profile: it must never write there (the source may be
-        # read-only), so it gets hash-and-count-only sinks and no `.incoming`.
+        # read-only), so it gets hash-and-count-only sinks and no `.incoming`
+        # - unless it copies into a different output profile (`writes`), where
+        # `media_root` is the OUTPUT profile's and the live write path applies.
         replay = getattr(ctx.gateway, "replay", False) is True
+        writes = not replay or self._copy_on_replay
         incoming: Path | None = None
-        if not replay:
+        if writes:
             incoming = _prepare_media_root(media_root)
             swept, swept_bytes = _sweep_incoming(incoming, now=time.time())
             if swept:
@@ -321,7 +337,7 @@ class MediaCollector:
                 counts["too_large"] += 1
                 continue
 
-            if floor_bytes and not replay:
+            if floor_bytes and writes:
                 free = _free_bytes(media_root)
                 if free - (size or 0) < floor_bytes:
                     raise DiskFloorStop(
