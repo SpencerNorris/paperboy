@@ -253,6 +253,7 @@ uv run pyright            # type-check
 - [`docs/data-model.md`](docs/data-model.md) — the database codebook (every table and column).
 - [`docs/features/collect-channel.md`](docs/features/collect-channel.md) — the core feature, with the live smoke transcript.
 - [`docs/features/pacing.md`](docs/features/pacing.md) — request pacing and FLOOD_WAIT handling.
+- [`docs/features/media-streaming.md`](docs/features/media-streaming.md) — streamed media downloads, declared-size guard, free-disk floor, replay-untouched-source.
 - [`docs/features/person-layer.md`](docs/features/person-layer.md) — participants and profile enrichment.
 - [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript.
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.
