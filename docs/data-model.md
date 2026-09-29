@@ -133,7 +133,7 @@ Content-addressed by SHA-256; deduped across messages.
 | `size` | INTEGER | Byte size. |
 | `file_name` | TEXT | Original filename (documents). |
 | `attributes_json` | TEXT | Video/audio/sticker attributes. |
-| `path` | TEXT | Where the file was written on disk. |
+| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
 | `downloaded_at` | TEXT | Download time. |
 | `exif_json` | TEXT | Extracted EXIF/metadata (documents). |
 
@@ -277,7 +277,7 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | INTEGER PK | Row id. |
-| `path` | TEXT | File path. |
+| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
 | `sha256` | TEXT | Hash at write time. |
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |

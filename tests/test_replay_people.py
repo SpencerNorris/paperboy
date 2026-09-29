@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ T2 = "2026-01-01T00:00:02+00:00"
 
 def _seed(tmp_path: Path) -> tuple[Path, Path]:
     db = tmp_path / "src.sqlite"
-    media_root = tmp_path / "media"
+    profile_root = tmp_path
     with Store.open(db) as st:
         st.begin_run("r1")
         st.add_raw(
@@ -78,7 +79,7 @@ def _seed(tmp_path: Path) -> tuple[Path, Path]:
             {"channel_id": 5, "user_id": 11, "method": "photos.getUserPhotos"}, observed_at=T2,
         )
         sha = "ab" * 32
-        avatar_path = media_root / "ab" / f"{sha}.jpg"
+        avatar_path = profile_root / "media" / "ab" / f"{sha}.jpg"
         avatar_path.parent.mkdir(parents=True)
         avatar_path.write_bytes(b"jpeg")
         st.add_raw(
@@ -98,12 +99,12 @@ def _seed(tmp_path: Path) -> tuple[Path, Path]:
             {"_": "account.PrivacyRules", "rules": [], "chats": [], "users": []},
             "self", {"key": "phone"}, observed_at=T1,
         )
-    return db, media_root
+    return db, profile_root
 
 
 def _gateway(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     clock = ReplayClock()
     return RawReplayGateway(src, clock, src.runs()[0]), clock
 
@@ -173,8 +174,36 @@ async def test_reaction_lists_by_msg_and_offset_and_privacy_by_key(tmp_path):
 
 
 def test_has_context_value(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     run = src.runs()[0]
     assert src.has_context_value(run, "method", "users.getUsers")
     assert not src.has_context_value(run, "method", "nope")
+
+
+def _avatar_gateway(tmp_path, stored):
+    """A gateway whose AvatarDownload payload holds `stored` as its location."""
+    db, profile_root = _seed(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', ?) "
+            "WHERE kind = 'AvatarDownload'",
+            (stored,),
+        )
+    src = ReplaySource.open(db, profile_root)
+    return RawReplayGateway(src, ReplayClock(), src.runs()[0])
+
+
+@pytest.mark.asyncio
+async def test_download_user_photo_normalises_legacy_absolute_payload_path(tmp_path):
+    sha = "ab" * 32
+    gone = tmp_path / "gone" / "data" / "default" / "media" / "ab" / f"{sha}.jpg"
+    gw = _avatar_gateway(tmp_path, str(gone))  # the directory is never created
+    assert await gw.download_user_photo({"id": 701}) == b"jpeg"
+
+
+@pytest.mark.asyncio
+async def test_download_user_photo_payload_without_sha_is_a_skip(tmp_path):
+    gw = _avatar_gateway(tmp_path, "bogus.jpg")
+    with pytest.raises(SkipAndRecord):
+        await gw.download_user_photo({"id": 701})

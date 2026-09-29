@@ -42,3 +42,5 @@ SQLCipher is **not** used: Datasette opens DBs via stdlib `sqlite3`, which
 cannot read SQLCipher files, and no maintained keyed-Datasette path was
 investigated. Data lives on an encrypted volume instead. Revisit only if an
 at-rest-encrypted, Datasette-served store becomes a hard requirement.
+
+Media locations are keys — see ADR-0007.

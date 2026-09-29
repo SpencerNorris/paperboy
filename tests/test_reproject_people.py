@@ -262,7 +262,7 @@ def test_triage_only_source_reprojects_triage_only(tmp_path, monkeypatch):
 
 def test_detect_phases_sees_the_person_layer(tmp_path):
     db = asyncio.run(run_people_collect(tmp_path))
-    src = ReplaySource.open(db, tmp_path / "default" / "media")
+    src = ReplaySource.open(db, tmp_path / "default")
     phases = detect_phases(src, src.runs()[0])
     assert phases.index("participants") == phases.index("discussion") + 1
     assert phases.index("profiles") == phases.index("participants") + 1

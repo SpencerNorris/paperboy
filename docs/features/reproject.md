@@ -125,7 +125,10 @@ operator can eyeball the correction before swapping files.
 - **Zero credentials.** No keychain access anywhere on this path (asserted
   by monkeypatching `keyring.get_password` to raise).
 - **No media re-download or re-write.** `download_media` reads bytes back
-  from the source profile's content-addressed store; a live collect's own
+  from the source profile's content-addressed store: each payload's location
+  is resolved as a media key under the source profile dir (ADR-0007), and
+  legacy absolute/cwd-relative payloads are normalised by their sha, so a
+  moved profile dir still replays; a live collect's own
   write-if-not-exists guard (added as part of this feature) makes the
   guarantee free to verify by monkeypatching `Path.write_bytes` to raise.
 

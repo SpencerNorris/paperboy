@@ -1,8 +1,10 @@
 """The `media` collector (Phase 2, opt-in): download every stored message's
 media, content-address it under
 `<data_dir>/<profile>/media/<sha256[:2]>/<sha256><ext>`, and record chain of
-custody. Mirrors `channel`/`history`'s shape (spec §6); unlike `history` it
-does not itself talk to `messages.getHistory` — it walks messages already
+custody. The stored location is the profile-relative key
+`media/<sha256[:2]>/<sha256><ext>` (ADR-0007), never a run-dependent path.
+Mirrors `channel`/`history`'s shape (spec §6); unlike `history` it does not
+itself talk to `messages.getHistory` — it walks messages already
 projected into the store by an earlier `history` run.
 
 Dedup is by SHA-256 (spec §6), but the actual bytes are the *expensive* thing
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,6 +35,12 @@ from typing import TYPE_CHECKING
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import profile_dir
+from paperboy.media_keys import (
+    find_existing_key,
+    is_valid_ext,
+    media_key,
+    resolve_media_key,
+)
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -108,7 +117,14 @@ def _guess_ext(kind: str, mime_type: str | None, file_name: str | None) -> str:
     if kind == "photo":
         return ".jpg"
     if file_name and (suffix := Path(file_name).suffix):
-        return suffix
+        if is_valid_ext(suffix):
+            return suffix
+        # A hostile/odd DocumentAttributeFilename must never abort the phase
+        # (media_key would raise): ignore the suffix and fall through to the
+        # MIME guess (ADR-0007).
+        logging.getLogger("paperboy.media").warning(
+            "media: unusable filename suffix (len %d); ignoring it", len(suffix)
+        )
     if mime_type and (guessed := mimetypes.guess_extension(mime_type)):
         return guessed
     return ""
@@ -133,7 +149,6 @@ class MediaCollector:
             "downloaded": 0, "duplicates": 0, "unavailable": 0,
             "skipped_kind": 0, "skipped": 0,
         }
-        media_root = profile_dir(ctx.settings, ctx.profile) / "media"
 
         content_index = self._load_content_index(ctx, channel_id)
 
@@ -256,18 +271,26 @@ class MediaCollector:
             else:
                 mime_type, file_name, attributes = _document_attrs(media)
             ext = _guess_ext(kind, mime_type, file_name)
-            path = media_root / sha[:2] / f"{sha}{ext}"
+            loc = media_key(sha, ext)
+            path = resolve_media_key(ctx.settings, ctx.profile, loc)
             # Content-addressed: an existing path is already the right bytes.
             # Guards replay idempotency (spec §4 — reproject never re-writes a
             # media file) and spares a live re-run a redundant write too.
             if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-            path_str = str(path)
+                # The same bytes may already sit under a different extension -
+                # a pre-#62 file whose legacy suffix this version would not
+                # re-derive. Reuse that location instead of writing a second
+                # copy (and keep the reprojected row faithful to the source).
+                existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
+                if existing_key is not None:
+                    loc = existing_key
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
 
             raw_payload = {
                 "sha256": sha, "kind": kind, "size": len(data), "mime_type": mime_type,
-                "file_name": file_name, "path": path_str, "message_uri": row["uri"],
+                "file_name": file_name, "path": loc, "message_uri": row["uri"],
             }
             downloaded_at = ctx.clock.for_payload(raw_payload)
             ctx.store.conn.execute(
@@ -276,10 +299,10 @@ class MediaCollector:
                 (
                     sha, row["uri"], kind, mime_type, len(data), file_name,
                     dumps(attributes) if attributes is not None else None,
-                    path_str, downloaded_at,
+                    loc, downloaded_at,
                 ),
             )
-            self._record_custody(ctx, path_str, sha, row["uri"], downloaded_at)
+            self._record_custody(ctx, loc, sha, row["uri"], downloaded_at)
             ctx.store.add_raw(
                 "MediaDownload", raw_payload, ctx.tier,
                 {"channel_id": channel_id, "msg_id": row["msg_id"]},
@@ -287,16 +310,17 @@ class MediaCollector:
             )
             counts["downloaded"] += 1
             if key is not None:
-                content_index[key] = (sha, path_str)
+                content_index[key] = (sha, loc)
 
         return CollectResult(name=self.name, counts=counts)
 
     def _load_content_index(
         self, ctx: CollectContext, channel_id: int
     ) -> dict[tuple[str, int], tuple[str, str]]:
-        """`content_key -> (sha256, path)` for every file already downloaded
-        for this channel — seeded from persisted state, so dedup works
-        across separate `collect` runs, not just within one.
+        """`content_key -> (sha256, media key)` (ADR-0007: relative to the profile
+        dir) for every file already downloaded for this channel — seeded from
+        persisted state, so dedup works across separate `collect` runs, not
+        just within one.
         """
         rows = ctx.store.conn.execute(
             "SELECT media.sha256 AS sha256, media.path AS path, "
@@ -318,10 +342,10 @@ class MediaCollector:
         return row["path"] if row else None
 
     def _record_custody(
-        self, ctx: CollectContext, path: str, sha: str, message_uri: str, recorded_at: str
+        self, ctx: CollectContext, key: str, sha: str, message_uri: str, recorded_at: str
     ) -> None:
         ctx.store.conn.execute(
             "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri) "
             "VALUES (?, ?, ?, ?)",
-            (path, sha, recorded_at, message_uri),
+            (key, sha, recorded_at, message_uri),
         )

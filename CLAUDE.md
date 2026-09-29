@@ -58,6 +58,10 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
   (keeps the `upsert_peer` #38/#39 lattice untouched); tri-state fields are
   `present | absent | hidden_from_you` in `field_states_json`, and "no photo"
   is never recorded as a fact (ADR-0006).
+- Media locations (`media.path`, `custody_log.path`, `MediaDownload`/
+  `AvatarDownload` payloads) are profile-relative keys
+  `media/<sha[:2]>/<sha><ext>` (ADR-0007), never absolute or cwd-relative
+  paths; construct with `media_keys.media_key`, resolve at read time.
 - `min` peers are stored with `(seen_in_chat, seen_in_msg)` provenance and
   fetched via `inputUserFromMessage`; optional user fields are tri-state
   (present / not-set / hidden-from-you) — never record "no photo".
