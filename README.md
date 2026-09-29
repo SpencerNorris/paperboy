@@ -246,9 +246,12 @@ uv run pyright            # type-check
 
 ## Documentation
 
+- [`docs/how-it-works.md`](docs/how-it-works.md) — **start here**: the moving parts in plain language (receipts vs. tables, replay, profiles, media keys).
 - [`docs/opsec.md`](docs/opsec.md) — operator security runbook.
 - [`docs/data-model.md`](docs/data-model.md) — the database codebook (every table and column).
 - [`docs/features/collect-channel.md`](docs/features/collect-channel.md) — the core feature, with the live smoke transcript.
+- [`docs/features/pacing.md`](docs/features/pacing.md) — request pacing and FLOOD_WAIT handling.
+- [`docs/features/person-layer.md`](docs/features/person-layer.md) — participants and profile enrichment.
 - [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript.
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.
 - [`docs/superpowers/specs/2026-08-20-paperboy-design.md`](docs/superpowers/specs/2026-08-20-paperboy-design.md) — the design.

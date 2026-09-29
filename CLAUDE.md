@@ -28,8 +28,17 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 (migration `0004_people.sql`) and reproject-replay support. See
 `docs/features/person-layer.md` and `docs/adr/0006-person-layer-storage.md`.
 
+**In progress on `dev/media-storage` (2026-09-29, not yet on `main`):** #69
+pacing (`--pacing-factor`, `--max-flood-sleep`; migration 0005) and #62
+profile-relative media keys (ADR-0007; migration 0006) have merged. Next:
+#64 media streaming, #75 replay lookup performance, #70 profile split, #68
+`fetch-media --list`. Order and protocol:
+`docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+
 ## Read these first
 
+- `docs/how-it-works.md` — plain-language map of the system (raw vs.
+  projections, replay/reproject, profiles, media keys). Keep it current.
 - `docs/research/telegram-extraction-surface.md` — what the Telegram API does
   and does not expose, by access tier, with the hard walls. Cited raw
   sub-reports in `docs/research/sources/`.
