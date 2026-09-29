@@ -175,12 +175,6 @@ async def reproject(
             "enrich_profiles": source.has_kind(run, "users.userfull"),
             "profile_budget": 10**9, "participant_oracle_budget": 10**9,
             "participant_reactions_budget": 10**9,
-            # The free-disk floor guards the disk against downloads; replay
-            # fetches nothing. Its only disk use is a temp copy of one stored
-            # file, and ENOSPC on that copy already stops the phase via
-            # MediaSinkWriteError. Applying the live default (5 GB) would make
-            # a rebuild depend on how much space the host happens to have.
-            "media_min_free_gb": 0,
         })
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:

@@ -458,6 +458,11 @@ def reproject(
     # `out_path`'s parent, so this cannot manufacture `data/<typo>/`.
     configure_logging(out_path.with_suffix(".log"), console=True)
     log = logging.getLogger("paperboy.cli")
+    if source.opened_immutable:
+        log.warning(
+            "source DB could not be opened plain read-only (read-only directory, WAL "
+            "sidecars absent); opened with immutable=1 - it must not be written concurrently"
+        )
     try:
         with source, out_store:
             summary = asyncio.run(

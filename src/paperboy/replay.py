@@ -72,8 +72,12 @@ class ReplaySource:
     (`media/<xx>/<sha><ext>`, ADR-0007) resolve against it.
     """
 
-    def __init__(self, conn: sqlite3.Connection, profile_root: Path) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, profile_root: Path, *, opened_immutable: bool = False
+    ) -> None:
         self.conn = conn
+        # True when the source could only be opened with `immutable=1` (see `open`).
+        self.opened_immutable = opened_immutable
         self.profile_root = profile_root
         # A real archive captured before this feature existed (ADR-0005) has
         # only pre-0003 migrations applied — `raw_records` has no `run_id`
@@ -87,9 +91,31 @@ class ReplaySource:
 
     @classmethod
     def open(cls, db_path: Path, profile_root: Path) -> Self:
+        """Open the source strictly read-only, never writing to its directory.
+
+        Plain `mode=ro` is preferred. A WAL database in a directory the process
+        cannot write to (a read-only archive, a mounted snapshot) cannot be
+        opened that way when its `-shm`/`-wal` sidecars are absent: SQLite must
+        create them (https://sqlite.org/wal.html, "Read-only databases"). Then
+        we fall back to `immutable=1`, which skips locking and sidecars
+        entirely. That is only safe if nothing writes the source while we read
+        it; the caller reads `opened_immutable` and logs a WARNING (logging is
+        not configured yet when the source is opened).
+        """
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
-        return cls(conn, profile_root)
+        try:
+            return cls(conn, profile_root)
+        except sqlite3.OperationalError as exc:
+            # Both messages occur for the missing-sidecar case (which one
+            # depends on the SQLite build / first statement issued).
+            conn.close()
+            if not any(m in str(exc) for m in ("unable to open", "readonly database")):
+                raise
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+        return cls(conn, profile_root, opened_immutable=True)
 
     def close(self) -> None:
         self.conn.close()
