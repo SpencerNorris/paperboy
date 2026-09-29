@@ -517,55 +517,38 @@ class ReplaySource:
         """Every distinct `target` a `resolve()` was recorded against WITHIN
         `run`, in first-seen (capture) order — `reproject` re-runs a full
         collect per target per historical run (ADR-0005)."""
-        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
-        rows = self.conn.execute(
-            "SELECT json_extract(context_json, '$.target') AS target FROM raw_records "
-            f"WHERE {kind_sql} AND target IS NOT NULL AND id BETWEEN ? AND ? ORDER BY id",
-            (*kind_params, run.lo, run.hi),
-        ).fetchall()
         seen: dict[str, None] = {}
-        for r in rows:
-            seen.setdefault(r["target"])
+        for e in self.index(run).entries(("resolvedpeer",)):
+            target = e.ctx.get("target")
+            if target is not None:
+                seen.setdefault(target)
         return list(seen)
 
     def linked_group_ids(self, run: ReplayRun) -> set[int]:
-        kind_sql, kind_params = _kind_clause(("chatfull",))
-        rows = self.conn.execute(
-            "SELECT json_extract(payload_json, '$.full_chat.linked_chat_id') AS g "
-            f"FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ?",
-            (*kind_params, run.lo, run.hi),
-        ).fetchall()
-        return {r["g"] for r in rows if r["g"]}
+        chatfulls = self.index(run).entries(("chatfull",))
+        linked: set[int] = set()
+        for row in self.payloads(e.id for e in chatfulls).values():
+            full_chat = json.loads(row["payload_json"]).get("full_chat")
+            group = full_chat.get("linked_chat_id") if isinstance(full_chat, dict) else None
+            if group:
+                linked.add(group)
+        return linked
 
     def has_kind(self, run: ReplayRun, *kinds: str) -> bool:
-        kind_sql, kind_params = _kind_clause(kinds)
-        return self.conn.execute(
-            f"SELECT 1 FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ? LIMIT 1",
-            (*kind_params, run.lo, run.hi),
-        ).fetchone() is not None
+        return bool(self.index(run).entries(kinds))
 
     def has_context_channel(self, run: ReplayRun, channel_ids: set[int]) -> bool:
-        return any(
-            self.conn.execute(
-                "SELECT 1 FROM raw_records "
-                "WHERE json_extract(context_json, '$.channel_id') = ? "
-                "AND id BETWEEN ? AND ? LIMIT 1",
-                (cid, run.lo, run.hi),
-            ).fetchone() is not None
-            for cid in channel_ids
-        )
+        groups = self.index(run).ctx_groups("channel_id")
+        return any(cid in groups for cid in channel_ids)
 
     def has_context_value(self, run: ReplayRun, key: str, value: object) -> bool:
         """Whether any raw record in `run` carries `value` under context
         `key` (e.g. `method` = `users.getUsers`) — for phase detection of
         kinds that are NOT distinctive on their own (a `User` record is also
-        the self marker). The path is a bound parameter, like every other
-        query in this module."""
-        return self.conn.execute(
-            "SELECT 1 FROM raw_records WHERE json_extract(context_json, ?) = ? "
-            "AND id BETWEEN ? AND ? LIMIT 1",
-            (f"$.{key}", value, run.lo, run.hi),
-        ).fetchone() is not None
+        the self marker)."""
+        if value is None or isinstance(value, dict | list):
+            return False
+        return value in self.index(run).ctx_groups(key)
 
 
 # Read size when streaming a stored media file into the sink: reproject

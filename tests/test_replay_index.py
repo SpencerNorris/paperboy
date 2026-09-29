@@ -182,3 +182,34 @@ def test_gateway_lookups_issue_no_sql_beyond_a_point_fetch(tmp_path):
             )
         )
         assert "USING INTEGER PRIMARY KEY (rowid=?)" in plan
+
+
+def _phase_run(st):
+    st.add_raw("User", {"_": "user", "id": 1}, "self", None, observed_at="t1")
+    st.add_raw("ResolvedPeer", {"_": "x"}, "stranger", {"target": "@a"}, observed_at="t2")
+    st.add_raw("ResolvedPeer", {"_": "x"}, "stranger", {"target": "@b"}, observed_at="t3")
+    st.add_raw("ResolvedPeer", {"_": "x"}, "stranger", {"target": "@a"}, observed_at="t4")
+    st.add_raw("messages.ChatFull", {"full_chat": {"linked_chat_id": 555}}, "stranger",
+               {"channel_id": 5}, observed_at="t5")
+    st.add_raw("ChatFull", {"full_chat": {"linked_chat_id": 0}}, "stranger",
+               {"channel_id": 6}, observed_at="t6")
+    st.add_raw("User", {"_": "user", "id": 2}, "stranger",
+               {"method": "users.getUsers", "user_id": 2}, observed_at="t7")
+
+
+def test_source_phase_helpers_read_the_index_not_the_run(tmp_path):
+    with _source(tmp_path, _phase_run) as src:
+        run = src.runs()[0]
+        src.index(run)
+        stmts: list[str] = []
+        src.conn.set_trace_callback(stmts.append)
+        try:
+            assert src.resolve_targets(run) == ["@a", "@b"]
+            assert src.linked_group_ids(run) == {555}
+            assert src.has_kind(run, "chatfull") and not src.has_kind(run, "mediadownload")
+            assert src.has_context_channel(run, {5}) and not src.has_context_channel(run, {9})
+            assert src.has_context_value(run, "method", "users.getUsers")
+            assert not src.has_context_value(run, "method", "nope")
+        finally:
+            src.conn.set_trace_callback(None)
+        assert not [s for s in stmts if "BETWEEN" in s or "json_extract" in s], stmts
