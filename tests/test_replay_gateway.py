@@ -494,3 +494,40 @@ async def test_download_media_payload_without_sha_is_a_skip(tmp_path):
     gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
     with MediaSink(tmp_path / "t.part") as sink, pytest.raises(SkipAndRecord):
         await gw.download_media({"channel_id": CID}, {"id": 2}, sink)
+
+
+def test_resolve_catalogue_maps_targets_to_channel_ids(tmp_path):
+    from tests.test_profile_split import seed_two_target_source
+
+    db = seed_two_target_source(tmp_path)
+    run1, run2 = ReplaySource.open(db, tmp_path / "default").runs()[:2]
+    with Store.open(db) as st:
+        # A foreign resolve that landed on a USER (ADR-0005 "stray intrusion"):
+        # in run 2's rowid window, so no channel id, no username.
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer", "peer": {"_": "PeerUser", "user_id": 9},
+                    "chats": [], "users": []},
+                   "stranger", {"target": "@stray"}, observed_at="2026-01-01T00:00:00+00:00")
+    src = ReplaySource.open(db, tmp_path / "default")
+    records = src.resolve_catalogue()
+    assert [(r.run_id, r.raw_target, r.channel_id, r.username) for r in records] == [
+        (run1.run_id, "@alpha", 5, "alpha"),
+        (run2.run_id, "@beta", 6, "beta"),
+        (run2.run_id, "@stray", None, None),
+    ]
+    assert src.linked_group_map() == {6: 77}
+
+
+def test_resolve_catalogue_private_channel_has_no_username(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None,
+                   observed_at="2026-01-01T00:00:00+00:00")
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer",
+                    "peer": {"_": "PeerChannel", "channel_id": 8},
+                    "chats": [{"_": "Channel", "id": 8, "access_hash": 7}]},
+                   "stranger", {"target": "t.me/+abcdef"},
+                   observed_at="2026-01-01T00:00:01+00:00")
+    [rec] = ReplaySource.open(db, tmp_path).resolve_catalogue()
+    assert (rec.channel_id, rec.username) == (8, None)
