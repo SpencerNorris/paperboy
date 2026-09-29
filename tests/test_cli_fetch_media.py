@@ -152,3 +152,22 @@ def test_unwritable_report_fails_before_any_segment(tmp_path, monkeypatch):
     )
     assert result.exit_code == 1
     assert "report" in result.stdout.lower()
+
+
+def test_gateway_build_failure_still_writes_the_report(tmp_path, monkeypatch):
+    path = _prepare(tmp_path)
+
+    async def failing_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        raise composition.ConfigError("no credentials")
+
+    monkeypatch.setattr(composition, "build_gateway", failing_build_gateway)
+    report = tmp_path / "r.csv"
+    result = runner.invoke(
+        app,
+        ["fetch-media", str(path), "--profile", "p", "--report", str(report)],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 1
+    with report.open(newline="") as fh:
+        assert {r["outcome"] for r in csv.DictReader(fh)} == {"not_attempted"}

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from paperboy.budget import HardStop, SkipAndRecord
+from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.config import load_settings
 from paperboy.fetch_media import fetch_media
 from paperboy.media_list import classify_rows, parse_media_list
@@ -229,3 +229,44 @@ async def test_report_written_on_unexpected_error(tmp_path):
                 profile="p", report_path=report,
             )
     assert [r["outcome"] for r in _report(report)][:2] == ["downloaded", "not_attempted"]
+
+
+@pytest.mark.asyncio
+async def test_channel_phase_stop_ends_the_command(tmp_path):
+    """A channel-phase PhaseStop (e.g. resolve FLOOD_WAIT over the ceiling) must
+    not go on to channel B: its RPC would sleep the persisted cooldown."""
+    gw = _gateway(BYTES, full_channel_by_id={
+        10: PhaseStop("flood wait 3600s"), 20: _full(20, "chan_b"),
+    })
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        summary = await fetch_media(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=report,
+        )
+    assert not summary.complete
+    assert "channel phase_stop" in (summary.stop_reason or "")
+    assert gw.calls.count("resolve") == 1  # channel B never attempted
+    assert gw.download_media_calls == []
+    assert {r["outcome"] for r in _report(report)} == {"not_attempted"}
+
+
+@pytest.mark.asyncio
+async def test_inherited_media_since_does_not_filter_list_rows(tmp_path):
+    """The list is the selection: a collect-era `media_since` window must not
+    leave list rows not_attempted."""
+    settings = load_settings("default", {
+        "data_dir": tmp_path, "media_min_free_gb": 0,
+        "media_since": "2027-01-01T00:00:00+00:00",  # after every seeded message
+    })
+    report = tmp_path / "r.csv"
+    gw = _gateway(BYTES)
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        summary = await fetch_media(
+            gw, st, settings, _classified(st, tmp_path), LOG,
+            profile="p", report_path=report,
+        )
+    assert summary.complete
+    assert "not_attempted" not in {r["outcome"] for r in _report(report)}

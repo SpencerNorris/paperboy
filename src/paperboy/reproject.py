@@ -256,7 +256,7 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
         phases.append("graph")
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
-    if source.has_kind(run, "mediadownload"):
+    if source.has_kind(run, "mediadownload") or source.media_selection(run) is not None:
         phases.append("media")
     return phases
 

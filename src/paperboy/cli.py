@@ -401,8 +401,14 @@ def _print_summary(summary: FetchSummary) -> None:
     console.print(table)
 
 
-async def _run_fetch(settings, secrets, profile, store, classified, log, report_path):
-    gateway = await composition.build_gateway(settings, secrets, profile, store)
+async def _run_fetch(settings, profile, store, classified, log, report_path):
+    try:
+        secrets = composition.build_secrets(profile)
+        gateway = await composition.build_gateway(settings, secrets, profile, store)
+    except BaseException:
+        # The report is written in every case, including auth/keychain failures.
+        write_report(report_path, store, initial_results(classified))
+        raise
     if not settings.unsafe:
         checks = await run_doctor(gateway, settings)
         if doctor_blocks(checks):
@@ -498,8 +504,7 @@ def fetch_media_cmd(
         if segments:
             summary = _run_async_or_exit(
                 _run_fetch(
-                    settings, composition.build_secrets(profile), profile, store,
-                    classified, log, report_path,
+                    settings, profile, store, classified, log, report_path,
                 )
             )
         else:

@@ -97,6 +97,17 @@ def _reproject(tmp_path: Path, monkeypatch):
     return runner.invoke(app, ["reproject", "--profile", "default"])
 
 
+def test_detect_phases_media_from_selection_marker_without_download_raw(tmp_path):
+    """A segment whose files were all dedup'd leaves custody rows but no
+    MediaDownload raw; the MediaSelection marker still implies `media`."""
+    db = asyncio.run(build_source(tmp_path))
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM raw_records WHERE lower(kind) = 'mediadownload'")
+    src = ReplaySource.open(db, tmp_path / "default")
+    phases = [detect_phases(src, run) for run in src.runs()]
+    assert phases[2] == ["channel", "media"] and phases[4] == ["media"]
+
+
 def test_detect_phases_marker_run_is_media_only(tmp_path):
     db = asyncio.run(build_source(tmp_path))
     src = ReplaySource.open(db, tmp_path / "default")

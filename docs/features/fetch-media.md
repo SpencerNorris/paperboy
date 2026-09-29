@@ -82,15 +82,18 @@ stop, never fetched under the wrong id.
 
 ## Stop policy
 
-* `channel` phase skip/stop (private, renamed handle, ...): that channel's
-  remaining rows stay `not_attempted`, WARNING once, the command continues with
-  other channels.
-* **Any** `media`-phase `PhaseStop` (free-disk floor, a FLOOD_WAIT over
+* `channel` phase **skip** (private, renamed handle, handle resolving to another
+  channel): that channel's remaining rows stay `not_attempted`, WARNING once, the
+  command continues with other channels.
+* **Any** `PhaseStop` in the `channel` phase (e.g. FLOOD_WAIT on
+  `contacts.resolveUsername`) or the `media` phase (free-disk floor, a FLOOD_WAIT over
   `--max-flood-sleep`, a sink write error, repeated failures) or a `HardStop`
   **ends the command**. Reason: a persisted flood cooldown is slept
   unconditionally by the next RPC (`Budget._pace`), which would defeat
   `--max-flood-sleep` on the next channel, and disk/sink errors are not
   channel-specific.
+* `media_since` (a collect-era window) is ignored: the explicit list is the
+  selection, so no list row is silently filtered out.
 * Unreached rows are `not_attempted`; exit 1; the report is written in every case
   (`try/finally`). Re-running resumes: finished rows classify `already_stored`.
 * The doctor preflight runs once (skipped by `--unsafe`); a block exits 1 before

@@ -13,13 +13,16 @@ append a `ChannelContextReused` marker instead of re-running `channel`.
 
 Stop policy (docs/features/fetch-media.md):
 
-* a `channel` phase that skips or stops marks that channel's remaining rows
+* a `channel` phase that SKIPS (private channel, renamed handle, handle
+  resolving to another channel) marks that channel's remaining rows
   `not_attempted` and the command continues with other channels;
-* ANY `media`-phase `PhaseStop` (free-disk floor, a FLOOD_WAIT over the
-  ceiling, a sink error, repeated failures) or a `HardStop` ends the command.
-  A persisted flood cooldown is slept unconditionally by the next RPC
-  (`Budget._pace`), which would defeat `--max-flood-sleep` on the next
-  channel, and disk/sink errors are not channel-specific.
+* ANY `PhaseStop` - in the `channel` phase (e.g. a FLOOD_WAIT on
+  `contacts.resolveUsername`) or the `media` phase (free-disk floor, a
+  FLOOD_WAIT over the ceiling, a sink error, repeated failures) - or a
+  `HardStop` ends the command. A persisted flood cooldown is slept
+  unconditionally by the next RPC (`Budget._pace`), which would defeat
+  `--max-flood-sleep` on the next channel, and disk/sink errors are not
+  channel-specific.
 
 Unreached rows are `not_attempted`; re-running resumes because finished rows
 classify `already_stored`. The report is written in every case.
@@ -137,7 +140,14 @@ async def _run_segments(
             continue
         log.info("%s start", label)
         outcomes: dict[str, str] = {}
-        seg_settings = settings.model_copy(update={"media_msgs": seg.msg_ids})
+        seg_settings = settings.model_copy(update={
+                # The explicit list is the selection: a collect-era date window
+                # must not silently filter list rows out (they would stay
+                # not_attempted forever).
+                "media_msgs": seg.msg_ids,
+                "media_since": None,
+            }
+        )
         cached = contexts.get(seg.channel_id)
         phase_results, established = await collect_channel_with_context(
             gateway, store, seg_settings, parse_target(f"@{seg.username}"),
@@ -157,6 +167,10 @@ async def _run_segments(
         media_result = by_name.get("media")
         if any(r.stopped == "hard_stop" for r in phase_results):
             return "hard_stop"
+        if channel_result is not None and channel_result.stopped == "phase_stop":
+            reason = type(channel_result.stop_exc).__name__
+            log.warning("%s: channel phase stopped (%s); ending the command", label, reason)
+            return f"channel phase_stop ({reason})"
         if channel_result is not None and channel_result.stopped is not None:
             dead_channels.add(seg.channel_id)
             log.warning(
