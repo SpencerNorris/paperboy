@@ -16,7 +16,9 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from paperboy.cli import app as cli_app
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.history import HistoryCollector
@@ -291,6 +293,94 @@ def _rows(db: Path, table: str, where: str) -> list[tuple]:
             conn.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE {where}").fetchall(),
             key=repr,
         )
+
+
+# --- CLI flags and validation -------------------------------------------------
+
+runner = CliRunner()
+
+
+def _cli(tmp_path, monkeypatch, *args: str):
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(cli_app, ["reproject", "--profile", "default", *args])
+    return result, " ".join(result.output.split())  # rich wraps long lines
+
+
+def test_cli_include_and_exclude_are_mutually_exclusive(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    result, out = _cli(
+        tmp_path, monkeypatch, "--include-target", "@alpha", "--exclude-target", "@beta"
+    )
+    assert result.exit_code == 1
+    assert "mutually exclusive" in out
+    assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
+
+
+def test_cli_out_and_out_profile_are_mutually_exclusive(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    result, out = _cli(
+        tmp_path, monkeypatch, "--out", str(tmp_path / "x.sqlite"), "--out-profile", "split"
+    )
+    assert result.exit_code == 1
+    assert "--out" in out and "--out-profile" in out and "mutually exclusive" in out
+    assert not (tmp_path / "x.sqlite").exists() and not (tmp_path / "split").exists()
+
+
+@pytest.mark.parametrize("name", ["", "a/b", "..", ".", "default", "a\\b"])
+def test_cli_out_profile_rejects_bad_names_and_the_source_profile(tmp_path, monkeypatch, name):
+    seed_two_target_source(tmp_path)
+    result, _ = _cli(tmp_path, monkeypatch, "--out-profile", name)
+    assert result.exit_code == 1
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["default"]
+    assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
+
+
+def test_cli_out_profile_refuses_existing_store(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    (tmp_path / "split").mkdir()
+    (tmp_path / "split" / "paperboy.sqlite").write_bytes(b"precious")
+    result, out = _cli(tmp_path, monkeypatch, "--out-profile", "split")
+    assert result.exit_code == 1
+    assert "already" in out and "split" in out
+    assert (tmp_path / "split" / "paperboy.sqlite").read_bytes() == b"precious"
+
+
+def test_cli_unknown_target_writes_nothing(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    target_out = tmp_path / "o" / "x.sqlite"
+    result, out = _cli(
+        tmp_path, monkeypatch, "--exclude-target", "@nope", "--out", str(target_out)
+    )
+    assert result.exit_code == 1
+    assert "unknown target" in out and "@alpha (5)" in out
+    assert not (tmp_path / "o").exists()
+
+    result, out = _cli(
+        tmp_path, monkeypatch, "--include-target", "@nope", "--out-profile", "split"
+    )
+    assert result.exit_code == 1 and "unknown target" in out
+    assert not (tmp_path / "split").exists()
+    assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
+
+
+def test_cli_exclude_target_writes_the_clean_store_and_its_log(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    out_db = tmp_path / "default" / "paperboy.split.sqlite"
+    result, _ = _cli(tmp_path, monkeypatch, "--exclude-target", "@beta", "--out", str(out_db))
+    assert result.exit_code == 0, result.output
+    assert _count(out_db, "SELECT count(*) FROM messages WHERE channel_id IN (6, 77)") == 0
+    assert _count(out_db, "SELECT count(*) FROM messages WHERE channel_id = 5") > 0
+    log = out_db.with_name(out_db.name + ".log").read_text()
+    assert "decision=excluded" in log and "decision=included" in log
+
+
+def test_cli_out_profile_writes_store_and_log_in_the_new_profile(tmp_path, monkeypatch):
+    seed_two_target_source(tmp_path)
+    result, _ = _cli(tmp_path, monkeypatch, "--include-target", "@beta", "--out-profile", "split")
+    assert result.exit_code == 0, result.output
+    db = tmp_path / "split" / "paperboy.sqlite"
+    assert _count(db, "SELECT count(*) FROM messages WHERE channel_id NOT IN (6, 77)") == 0
+    assert (tmp_path / "split" / "paperboy.sqlite.log").exists()
 
 
 # --- selector -----------------------------------------------------------------

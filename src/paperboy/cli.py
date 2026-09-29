@@ -10,7 +10,7 @@ import logging
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import typer
 from rich.console import Console
@@ -30,8 +30,8 @@ from paperboy.export.jsonl import export_jsonl
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
 from paperboy.recipes import collect_channel
-from paperboy.replay import ReprojectSourceError
-from paperboy.reproject import ReprojectError
+from paperboy.replay import ReplaySource, ReprojectSourceError
+from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
 from paperboy.reproject import reproject as reproject_run
 from paperboy.targets import parse_target
 
@@ -428,6 +428,29 @@ def export_cmd(
     console.print(table)
 
 
+def _out_profile_store_path(settings: Settings, profile: str, name: str) -> Path:
+    """`<data_dir>/<name>/paperboy.sqlite` for `--out-profile`, or exit 1.
+
+    The name becomes a directory under the data dir, so it must be a plain
+    name (no separators, not `.`/`..`), differ from the source profile, and
+    must not already hold a store — a split never merges into an existing
+    profile."""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        console.print(f"[red]--out-profile {name!r} is not a plain profile name[/]")
+        raise typer.Exit(code=1)
+    if name == profile:
+        console.print(f"[red]--out-profile must differ from the source --profile ({profile!r})[/]")
+        raise typer.Exit(code=1)
+    path = profile_dir(settings, name) / "paperboy.sqlite"
+    if path.exists():
+        console.print(
+            f"[red]profile {name!r} already has a store at {path} — pick a fresh "
+            "--out-profile or move it aside[/]"
+        )
+        raise typer.Exit(code=1)
+    return path
+
+
 @app.command()
 def reproject(
     profile: str = typer.Option("default", "--profile"),
@@ -440,16 +463,58 @@ def reproject(
         None, "--phases",
         help="Comma-separated phase subset; default: auto-detected from the raw log.",
     ),
+    include_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include-target",
+            help="Replay ONLY this target (@username, username or channel id; repeatable). "
+                 "Its linked discussion group follows it. See 'Splitting a mixed profile'.",
+        ),
+    ] = None,
+    exclude_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-target",
+            help="Replay everything EXCEPT this target (repeatable; exclusive with "
+                 "--include-target).",
+        ),
+    ] = None,
+    out_profile: str = typer.Option(
+        None, "--out-profile",
+        help="Write the output to <data_dir>/<name>/paperboy.sqlite and copy the media it "
+             "references into <data_dir>/<name>/media/ (exclusive with --out).",
+    ),
 ) -> None:
     """Rebuild all projections from raw_records into a fresh DB — offline,
     no network, no credentials. See docs/features/reproject.md."""
     settings = _settings_with_overrides(profile)
-    out_path = Path(out) if out else profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
     phase_list = phases.split(",") if phases else None
+    include_target, exclude_target = include_target or [], exclude_target or []
+    if include_target and exclude_target:
+        console.print("[red]--include-target and --exclude-target are mutually exclusive[/]")
+        raise typer.Exit(code=1)
+    if out_profile is not None and out:
+        console.print("[red]--out and --out-profile are mutually exclusive[/]")
+        raise typer.Exit(code=1)
+    if out_profile is not None:
+        out_path = _out_profile_store_path(settings, profile, out_profile)
+    elif out:
+        out_path = Path(out)
+    else:
+        out_path = profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
+
+    target_filter: TargetFilter | None = None
+
+    def _check_targets(source: ReplaySource) -> None:
+        # Runs before the output exists: an unknown target must write nothing.
+        nonlocal target_filter
+        target_filter = resolve_target_filter(source, include_target, exclude_target)
 
     try:
-        source, out_store = composition.build_reproject(settings, profile, out_path)
-    except composition.ConfigError as exc:
+        source, out_store = composition.build_reproject(
+            settings, profile, out_path, check=_check_targets
+        )
+    except (composition.ConfigError, ReprojectError) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from None
     # The log lives beside the output, never in the source profile: replay
@@ -466,7 +531,10 @@ def reproject(
     try:
         with source, out_store:
             summary = asyncio.run(
-                reproject_run(source, out_store, settings, profile, phase_list, log)
+                reproject_run(
+                    source, out_store, settings, profile, phase_list, log,
+                    target_filter=target_filter,
+                )
             )
     except (ReprojectError, ReprojectSourceError) as exc:
         console.print(f"[red]{exc}[/]")

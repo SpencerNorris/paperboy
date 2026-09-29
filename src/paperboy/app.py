@@ -21,6 +21,8 @@ from paperboy.secrets import SERVICE, KeyringSecrets
 from paperboy.store.db import Store
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from telethon import TelegramClient
 
     from paperboy.config import Settings
@@ -144,23 +146,44 @@ def build_store(settings: Settings, profile: str) -> Store:
     return Store.open(path)
 
 
+def open_replay_source(settings: Settings, profile: str) -> ReplaySource:
+    """Open `profile`'s DB strictly read-only as a replay source."""
+    source_db = profile_dir(settings, profile) / "paperboy.sqlite"
+    if not source_db.exists():
+        raise ConfigError(f"no source DB for profile {profile!r} at {source_db}")
+    try:
+        return ReplaySource.open(source_db, profile_dir(settings, profile))
+    except ReplaySourceError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def build_reproject(
-    settings: Settings, profile: str, out_path: Path
+    settings: Settings,
+    profile: str,
+    out_path: Path,
+    *,
+    check: Callable[[ReplaySource], None] | None = None,
 ) -> tuple[ReplaySource, Store]:
     """Wire the replay pair's source + a fresh target `Store`. Deliberately
     the ONLY composition path for `reproject`: no client, no gateway, no
     `Budget`, no secrets — a reproject is incapable of touching Telegram,
     the web, or the keychain (spec §2, §8).
+
+    `check(source)` runs after the source is open and BEFORE the output exists
+    (`Store.open` creates its directory), so a rejected `--include/--exclude-
+    target` (#70) leaves nothing on disk. It may raise `ReprojectError`; the
+    source is closed first.
     """
-    source_db = profile_dir(settings, profile) / "paperboy.sqlite"
-    if not source_db.exists():
-        raise ConfigError(f"no source DB for profile {profile!r} at {source_db}")
-    if out_path.exists():
-        raise ConfigError(
-            f"refusing to overwrite existing {out_path} — move it aside or pass a fresh --out"
-        )
+    source = open_replay_source(settings, profile)
     try:
-        source = ReplaySource.open(source_db, profile_dir(settings, profile))
-    except ReplaySourceError as exc:
-        raise ConfigError(str(exc)) from exc
-    return source, Store.open(out_path)
+        if check is not None:
+            check(source)
+        if out_path.exists():
+            raise ConfigError(
+                f"refusing to overwrite existing {out_path} — move it aside or pass a "
+                "fresh --out"
+            )
+        return source, Store.open(out_path)
+    except BaseException:
+        source.close()
+        raise
