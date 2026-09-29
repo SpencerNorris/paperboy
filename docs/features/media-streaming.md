@@ -76,7 +76,12 @@ not fill the disk.
 See the smoke transcript below (redacted; the unredacted transcripts stay in
 the operator's scratch directory).
 
-### Live smoke (2 of the 5 permitted invocations)
+### Live smoke (3 of the 5 permitted invocations)
+
+Runs 1 and 2 ran at commit 95c98d8; run 3 ran at `b0a00f8`, the last commit
+that touches `src/` (later commits are docs only). Runs 1-2 are still valid
+for the live sink path: after them, the only change to `gateway.py` /
+`media_sink.py` is the `path=None` (replay) branch, which live sinks never take.
 
 Scratch data dir (`<scratch>`), a snapshot of the real store made with
 `sqlite3 ".backup"`; `PAPERBOY_REQUIRE_PROXY=false`, `--profile default`,
@@ -129,3 +134,70 @@ $ find <scratch>/default/media -type f -newer smoke-64-run1.txt
 
 The second run made no `upload.getFile` request (only the channel-phase
 RPCs), and `.incoming/` stayed empty.
+
+Invocation 3, at `b0a00f8` (VPN check first, same result: both addresses via
+`utun4`), a second ~1.0 GB video (`<id>`, same channel, no custody row before),
+`--media-msgs <id>` only. Transcript: `smoke-64-run3.txt`.
+
+```
+media · downloaded=1 duplicates=0 unavailable=0 skipped_kind=0 skipped=0 size_mismatch=0 out_of_window=0 not_selected=7792 too_large=0 · 656s
+     663.09 real        65.04 user         9.91 sys
+       77381632  maximum resident set size
+       96600568  peak memory footprint
+sqlite> SELECT sha256, size, path FROM media ORDER BY downloaded_at DESC LIMIT 1;
+086f3fb4...23d4b2|1005068556|media/08/086f3fb4...23d4b2.mp4
+$ shasum -a 256 <that file>   -> 086f3fb4...23d4b2 (equals media.sha256)
+$ stat -f %z <that file>      -> 1005068556          (equals media.size)
+$ ls -la <scratch>/default/media/.incoming -> total 0 (empty)
+```
+
+Peak RSS 77.4 MB for a 1,005,068,556-byte file (7.7% of the file size) on the
+final code. Feature totals: 3 files, about 2.2 GB downloaded; 3 of 5 live
+invocations used.
+
+### Replay smoke (spec 4.1): reproject reads the media, and writes nothing
+
+Fixture: a `.backup` of the real store trimmed (`DELETE FROM raw_records WHERE
+id > 990`, then `VACUUM`) to its first historical run, `legacy-0001`: 990 raw
+rows, 152 `MediaDownload` records. The fixture stays in WAL mode and is
+sidecar-free. Its `media/` is a symlink farm (one link per stored file, 150
+present, 2 missing) into the read-only real data dir, then every non-link
+entry is `chmod a-w`. Run: `reproject --profile default --phases
+channel,history,media --out <scratch>/replay-out.sqlite` (12.9 s, peak RSS
+63.6 MB). Unredacted transcript: `smoke-64-replay.txt`; log
+`replay-out.log`; digests `replay-before.txt`/`replay-after.txt`.
+
+A narrowed phase set with no `history` selects zero rows (the trap an earlier
+attempt fell into), so the phases above are the full set the run needs.
+
+```
+WARNING  source DB could not be opened plain read-only (read-only directory,
+         WAL sidecars absent); opened with immutable=1 - it must not be written
+         concurrently
+history  messages=543 revisions=543 tombstones=258 edges=238
+WARNING  media: skipping msg <id>: replay: media file missing for sha <sha>   (x2)
+media    downloaded=150 duplicates=0 unavailable=302 skipped_kind=27 skipped=2
+         size_mismatch=0 out_of_window=0 not_selected=0 too_large=0
+```
+
+Row counts, columns labelled. **source** is the untrimmed backup's projection
+tables (the fixture's `raw_records` is the trimmed 990); **reprojected** is the
+output, and it is the pass criterion:
+
+| table | source (untrimmed backup) | reprojected (output) |
+|---|---|---|
+| raw_records | 990 (trimmed) | 955 |
+| messages | 59050 | 543 |
+| media | 757 | **150** (152 MediaDownload - 2 missing files) |
+| custody_log | 1148 | **150** |
+
+Source-untouched proof (pasted commands and output):
+
+```
+$ diff replay-before.txt replay-after.txt          # size, mtime, mode of all 272 entries
+(no output)
+$ find replay-fx -name .incoming -o -name '*.log' -o -name '*-shm' -o -name '*-wal' | wc -l
+0
+symlink targets (size+mtime+mode md5) before == after
+cross-check: output media rows 150, distinct 150, not matching a MediaDownload payload 0; custody_log 150
+```
