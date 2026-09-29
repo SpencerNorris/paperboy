@@ -182,6 +182,9 @@ class FakeGateway:
     to simulate `Budget.call`'s classification without going through it —
     `FakeGateway` never touches `Budget`.
 
+    `resolve_by_target` (a `{username: dict | BaseException}` lookup, like
+    `full_channel_by_id`; missing key falls back to `resolve`).
+
     Person-layer fixture keys (spec §4–§8): `full_channel_by_id` (a
     `{channel_id: dict | BaseException}` lookup — lets a test answer the
     LINKED GROUP's `ChatFull` differently from the target's; missing key
@@ -232,7 +235,14 @@ class FakeGateway:
 
     async def resolve(self, target_value: str) -> dict:
         self.calls.append("resolve")
-        del target_value
+        # `resolve_by_target` ({username: dict | BaseException}) answers
+        # several channels in one test (#68); missing key -> `resolve`.
+        by_target: dict[str, object] = self._fx.get("resolve_by_target", {})
+        if target_value in by_target:
+            value = by_target[target_value]
+            if isinstance(value, BaseException):
+                raise value
+            return cast(dict, value)
         return self._fx["resolve"]
 
     async def get_full_channel(self, input_channel: dict) -> dict:

@@ -168,6 +168,8 @@ class ClassifiedRow:
     uri: str  # the resolved `tg:msg:` uri when known, else `row.uri`
     channel_id: int | None = None
     declared_bytes: int | None = None
+    # `(sha256, media key)` of the already-stored file, when known offline.
+    stored: tuple[str, str] | None = None
 
 
 def _global_indexes(store: Store) -> tuple[dict[tuple[str, int], tuple[str, str]], set[str]]:
@@ -240,7 +242,10 @@ def classify_rows(store: Store, rows: Iterable[ListRow]) -> list[ClassifiedRow]:
             continue
         key = content_key(media)
         if uri in stored_uris or (key is not None and key in index):
-            out.append(ClassifiedRow(row, "already_stored", uri, channel_id, declared))
+            out.append(ClassifiedRow(
+                row, "already_stored", uri, channel_id, declared,
+                index.get(key) if key is not None else None,
+            ))
             continue
         out.append(ClassifiedRow(row, "pending", uri, channel_id, declared))
     return out
