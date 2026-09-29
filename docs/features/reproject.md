@@ -246,7 +246,69 @@ gateway lookup issues no `raw_records` SQL beyond one rowid point-fetch; a
 
 ### Definition of done — offline transcript (#75)
 
-PENDING: filled in by the DoD run (below, once the full reproject completes).
+Offline only (no Telegram call). Source = a `sqlite3 .backup` copy of the real
+store in `<scratch>/75/default` (65,827 raw rows, 65 runs; the real data dir was
+only read by `.backup`); media = a per-file symlink farm (753 links, 2 missing
+files) into `<scratch>/75/default/media`, never a link to the real dir.
+Unredacted transcripts stay in `<scratch>/75/`.
+
+Before and after, `find -L <scratch>/75/default/media -type f | wc -l` -> `753`
+both times; `du -shL` -> `32G` both times; `find <scratch>/75/default -name
+'*.log' -o -name '.incoming'` -> nothing (the source was not written).
+
+**Before** (today's media lookup SQL, biggest run = 27,567 rows, an id with no
+`MediaDownload`; `before.py`):
+
+```
+runs()=65 in 10.7s
+EXPLAIN QUERY PLAN:
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+one missing-message media lookup #1: 5.77s row=None
+one missing-message media lookup #2: 9.20s row=None
+one missing-message media lookup #3: 10.70s row=None
+```
+
+**After** (`RunIndex` on the same run; `after.py`):
+
+```
+EXPLAIN QUERY PLAN of RunIndex.WALK_SQL (once per run):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+EXPLAIN QUERY PLAN of the payload fetch (per served hit):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid=?)
+media-bearing messages in the run: 17654
+index(run) build: 4.34s rows=27567
+17654 download_media misses through the gateway: 0.013s
+```
+
+**Full run** (background, PID recorded; phases `channel,history,media`, not
+narrowed): `reproject --profile default --phases channel,history,media`.
+
+```
+wall time                 1754.27 real (29 min 14 s)   34.75 user   35.72 sys
+maximum resident set size 71385088 bytes
+peak memory footprint     109085224 bytes
+index lines               65 (one per run); largest: rows=27567 message_rows=27341
+                          context_bytes=727748 approx_bytes=17267948 elapsed=5.03s
+media phase (first run with downloads) downloaded=150 duplicates=0
+media phase (last)                     downloaded=0 duplicates=449 unavailable=5
+```
+
+| table | source (backup) | reprojected (output) |
+|-------|-----------------|----------------------|
+| raw_records | 65827 | 57110 |
+| messages | 59050 | 52633 |
+| media | 755 | 753 |
+| custody_log | 1144 | 4593 |
+| web_snapshots | 15314 | 0 |
+
+(The reprojected column covers only the requested phases: no `web`, `graph`,
+`participants` or `profiles`, so `users`/`web_snapshots`/... are 0 by
+construction; `web_snapshots` is also #74's known loss, out of scope. Two
+missing stored files -> `media` 753 of 755.) The media phase, which made no
+visible progress in 3.5 h before this change, completes with the whole
+reproject in under 30 minutes; the bulk of the remaining time is hashing 32 GB
+of media.
+
 
 ## Round-trip equality contract (D5)
 
