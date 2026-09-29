@@ -32,11 +32,12 @@ def test_defaults_match_spec(monkeypatch):
         "PAPERBOY_PROFILE_BUDGET",
         "PAPERBOY_MIN_SESSION_AGE_DAYS",
         "PAPERBOY_FLOOD_SLEEP_THRESHOLD",
+        "PAPERBOY_PACING_FACTOR",
     ):
         monkeypatch.delenv(var, raising=False)
     s = load_settings("default", {})
     assert s.min_session_age_days == 7
-    assert s.flood_sleep_threshold == 60
+    assert s.flood_sleep_threshold == 3600
     assert s.max_rpc_per_run == 20000
     assert s.profile_budget == 2000
     assert s.allow_join is False
@@ -127,3 +128,19 @@ def test_parse_msg_ids_rejects_garbage():
     for bad in ("", "abc", "5-", "9-3", "0", "-4", "1,,2"):
         with pytest.raises(ValueError):
             parse_msg_ids(bad)
+
+
+def test_pacing_factor_default_and_bounds(monkeypatch):
+    from pydantic import ValidationError
+
+    monkeypatch.delenv("PAPERBOY_PACING_FACTOR", raising=False)
+    assert load_settings("default", {}).pacing_factor == 2.0
+    assert load_settings("default", {"pacing_factor": 1.0}).pacing_factor == 1.0
+    with pytest.raises(ValidationError):
+        load_settings("default", {"pacing_factor": 0.5})
+
+
+def test_pacing_factor_env_and_cli_precedence(monkeypatch):
+    monkeypatch.setenv("PAPERBOY_PACING_FACTOR", "3")
+    assert load_settings("default", {}).pacing_factor == 3.0
+    assert load_settings("default", {"pacing_factor": 1.5}).pacing_factor == 1.5
