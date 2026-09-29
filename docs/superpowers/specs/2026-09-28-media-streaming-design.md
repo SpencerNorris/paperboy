@@ -3,8 +3,9 @@
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** #64 (streaming);
 closes the remaining half of #53 (free-disk floor; `--media-max-mb` already
 shipped in #57).
-**Batch:** 1 (parallel with #62 — read the "Seams" section of
-`2026-09-28-media-storage-overview.md` first).
+**Order:** 3 of 5 in the sequential chain (after #69 and #62; read
+`2026-09-28-media-storage-overview.md` first, including the live smoke
+protocol).
 **No ADR needed:** storage layout and key format are unchanged here; this is
 how bytes travel, not where they live.
 
@@ -64,18 +65,15 @@ In `MediaCollector.collect`:
    (`PAPERBOY_MEDIA_MIN_FREE_GB`, `--media-min-free-gb`), `ge=0`.
 2. Temp files live in `media_root / ".incoming" / f"{uuid4().hex}.part"` —
    same filesystem as the destination, so the rename is atomic.
-3. After a successful download: compute the destination from the sink's sha
-   exactly as today (`media_root / sha[:2] / f"{sha}{ext}"` — see Seams);
-   if it exists, delete the temp file and take the dedup path (custody only);
-   otherwise `os.replace(temp, dest)`. Then write rows exactly as today, with
-   `size = sink.size`.
+3. After a successful download: `key = media_key(sink.sha256, ext)` and
+   `dest = resolve_media_key(settings, profile, key)` (both from #62, already
+   merged); if `dest` exists, delete the temp file and take the dedup path
+   (custody only); otherwise `os.replace(temp, dest)`. Then write rows as #62
+   left them (the key is the stored value), with `size = sink.size`.
 4. On any exception after the sink was created: delete the temp file
    (`try/finally`), then let the exception propagate as today.
 5. At phase start, sweep `.incoming/*.part` older than 1 hour (a crashed
    previous run), logging how many and how many bytes were removed.
-
-Seams (batch 1): keep today's destination expression and `str(path)` stored
-value — #62 replaces both with keys at integration.
 
 ## 3. Tests (write first, see them fail)
 
@@ -99,17 +97,19 @@ value — #62 replaces both with keys at integration.
 
 ## 4. Definition of done (smoke on real data)
 
-Against live Telegram (operator's account, proxy on), one large known file
-and one photo from the pending list, with a memory measurement:
+Live, under the overview's smoke protocol (scratch data dir, no `--unsafe`,
+≤ 3 GB): one video of 1–2.5 GB and one photo, from a channel already in the
+store, not yet downloaded, with a memory measurement:
 
 ```
-/usr/bin/time -l uv run paperboy collect @<channel> --phases channel,media \
-    --media-msgs <id-of-a-≥1 GB-video>,<id-of-a-photo> --unsafe
+PAPERBOY_DATA_DIR=<scratch> /usr/bin/time -l uv run paperboy collect @<channel> \
+    --phases channel,media --media-msgs <video-id>,<photo-id> --max-rpc 60
 ```
-Paste: the collect table, `maximum resident set size` from `time -l` (must
-be far below the file size), `shasum -a 256` of the stored file matching its
-`media.sha256`, and `ls media/.incoming` empty. Then re-run the same command
-and show `duplicates` counted with no new download.
+Paste (redacted per protocol §5): the collect table, `maximum resident set
+size` from `time -l` (must be far below the file size), `shasum -a 256` of
+the stored file matching its `media.sha256`, and `ls media/.incoming` empty.
+Then re-run the same command and show `duplicates` counted with no new
+download (that re-run is the second of the feature's ≤ 5 live invocations).
 
 ## 5. Out of scope
 

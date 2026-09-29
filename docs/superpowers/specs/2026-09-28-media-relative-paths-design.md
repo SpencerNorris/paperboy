@@ -1,8 +1,9 @@
 # Media locations as profile-relative keys (#62)
 
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** issue #62.
-**Batch:** 1 (parallel with #64 — read the "Seams" section of
-`2026-09-28-media-storage-overview.md` first).
+**Order:** 2 of 5 in the sequential chain (after #69; read
+`2026-09-28-media-storage-overview.md` first, including the live smoke
+protocol).
 **ADR:** lands `docs/adr/0007-media-keys.md` before any code (storage is a
 settled decision; this amends how ADR-0002's `media`/`custody_log` locate
 files).
@@ -52,9 +53,9 @@ the configured storage root at read time.
 1. **Writers** — `collectors/media.py` and `collectors/profiles.py`
    (`_download_avatar`): compute `key = media_key(sha, ext)`, write the bytes
    to `resolve_media_key(...)`, store `key` in `media.path`,
-   `custody_log.path` and the raw payload's `"path"`. (Batch-1 note: #64
-   rewrites the byte-writing lines in parallel. Own the key/stored-value
-   lines; leave the write mechanics as they are. The integrator merges.)
+   `custody_log.path` and the raw payload's `"path"`. Leave the byte-writing
+   mechanics as they are — #64 (next in the chain) replaces them and will
+   call `media_key`/`resolve_media_key` directly.
 2. **Migration `0005_media_keys.sql`** — rewrite existing rows in place with
    pure SQL, using the sha to anchor (works for both legacy forms):
    `path = 'media/' || substr(sha256,1,2) || '/' || substr(path, instr(path, sha256))`
@@ -94,8 +95,9 @@ the configured storage root at read time.
 
 ## 5. Definition of done (smoke on real data)
 
-On a **copy** of the live store (`cp data/default/paperboy.sqlite` to
-scratch — never migrate the original in the smoke):
+Offline, on a **backup copy** of the live store in the scratch data dir (per
+the overview's live smoke protocol §1 — `sqlite3 … ".backup …"`, never
+migrate the original):
 
 ```
 sqlite3 copy.sqlite "select count(*) from media where path not like 'media/%'"   # before: ~755 (26 Sep count)

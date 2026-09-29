@@ -2,9 +2,11 @@
 
 **Status:** draft for Gate A, 2026-09-28 (revised the same day after operator
 review). **Tracking:** issue #69.
-**Batch:** can run in the first overnight batch — touches `budget.py`,
-`config.py`, `cli.py` (flags), the web collector's pacing, one migration; no
-overlap with #62/#64 beyond adding fields to `Settings`.
+**Order:** 1 of 5 in the sequential chain — first, so every later feature's
+live smoke runs under conservative pacing. Touches `budget.py`, `config.py`,
+`cli.py` (flags), the web collector's pacing, one migration. Read
+`2026-09-28-media-storage-overview.md` first, including the live smoke
+protocol.
 **ADR:** amendment to ADR-0003 (guardrails are a settled decision).
 
 ## 1. Policy (operator decisions, 2026-09-28)
@@ -95,8 +97,11 @@ overlap with #62/#64 beyond adding fields to `Settings`.
 
 ## 5. Definition of done (smoke)
 
-Live, read-only, small: `paperboy collect @<small public channel> --phases
-channel,history --max-rpc 30` at INFO — paste the effective-interval line and
-log timestamps showing ≥ 2 s between same-method calls. Then
-`select method, seconds, applied_seconds from flood_log order by rowid desc
-limit 5` (empty is fine — say so).
+Live, under the overview's smoke protocol (scratch data dir, no `--unsafe`):
+`PAPERBOY_DATA_DIR=<scratch> paperboy collect @<channel already in the store>
+--phases channel,history --max-rpc 30` at INFO — paste (redacted) the
+effective-interval line and log timestamps showing ≥ 2 s between
+same-method calls. Then `select method, seconds, applied_seconds from
+flood_log order by rowid desc limit 5` on the scratch store (empty is fine —
+say so). The long-wait and retry behaviour is proven by the fake-clock tests,
+**not** by provoking real flood waits — never try to trigger one.

@@ -11,56 +11,69 @@ handed to one implementing agent on its own.
 
 | Spec | Issue | Run | Why it's needed |
 |---|---|---|---|
-| [`…-media-relative-paths-design.md`](2026-09-28-media-relative-paths-design.md) | #62 | overnight 1 | Portable media keys — prerequisite for the split, the VM and GCS |
-| [`…-media-streaming-design.md`](2026-09-28-media-streaming-design.md) | #64 (+#53) | overnight 1 | 2.4 GB files must not sit in RAM; the disk must not fill silently |
-| [`…-pacing-safety-factor-design.md`](2026-09-28-pacing-safety-factor-design.md) | #69 | overnight 1 | Conservative pacing; sleep through long waits instead of killing phases |
-| [`…-profile-split-design.md`](2026-09-28-profile-split-design.md) | #70 | overnight 2 | Get the unrelated investigation out of `default` before adding 146 GB to it |
-| [`…-media-list-fetch-design.md`](2026-09-28-media-list-fetch-design.md) | #68 | overnight 2 | The pull is driven by a cross-channel CSV |
-| [`…-media-gcs-backend-design.md`](2026-09-28-media-gcs-backend-design.md) | #63 | daytime | VM disk < pull size; needs IAM, VM proxy and a VM smoke with the operator |
+| # | Spec | Issue | Why it's needed |
+|---|---|---|---|
+| 1 | [`…-pacing-safety-factor-design.md`](2026-09-28-pacing-safety-factor-design.md) | #69 | Conservative pacing first, so every later live smoke runs under it |
+| 2 | [`…-media-relative-paths-design.md`](2026-09-28-media-relative-paths-design.md) | #62 | Portable media keys — prerequisite for streaming, the split, the VM and GCS |
+| 3 | [`…-media-streaming-design.md`](2026-09-28-media-streaming-design.md) | #64 (+#53) | 2.4 GB files must not sit in RAM; the disk must not fill silently |
+| 4 | [`…-profile-split-design.md`](2026-09-28-profile-split-design.md) | #70 | Get the unrelated investigation out of `default` before adding 146 GB to it |
+| 5 | [`…-media-list-fetch-design.md`](2026-09-28-media-list-fetch-design.md) | #68 | The pull is driven by a cross-channel CSV |
+| — | [`…-media-gcs-backend-design.md`](2026-09-28-media-gcs-backend-design.md) | #63 | Daytime: needs IAM, a VM proxy and a VM smoke with the operator |
 
-## Run order
+## Run order — strictly sequential
 
-- **Overnight run 1 — `federated-run`, 3 features, base `dev/media-storage`:**
-  #62, #64, #69. Overlaps: #62/#64 share `collectors/media.py` (see Seams);
-  #69 only adds `Settings` fields next to theirs (trivial merge).
-- **Overnight run 2 — after run 1 is integrated on `dev/media-storage`:**
-  #70 and #68. Both touch the replay side of `reproject` (#70: a target
-  filter in the run loop; #68: a `ChannelContextReused` replay marker) —
-  small, separate hunks; the integrator resolves. If the orchestration can't
-  chain runs unattended, run them as two `single-feature-run`s back to back.
+Features 1–5 run **one at a time, in the order above**, each as a
+`single-feature-run` whose branch is cut from `dev/media-storage` *after*
+the previous feature has merged into it. Each feature's PR targets
+`dev/media-storage`; the operator merges `dev/media-storage → main` (Gate B)
+once, in the morning. Sequential means no two agents ever share the
+Telegram session, and each feature builds on the finished code of the one
+before it (e.g. #64 calls #62's `media_key` directly — there is no merge
+seam to manage).
+
+If a feature exhausts its retry budget (K=3), it escalates on its issue and
+**the chain stops there** — later features depend on earlier ones.
+
 - **Daytime:** #63 (security reviewer on; ops prerequisites in its spec).
 - **Then the operator procedure** in the #70 spec (split, verify, swap), a
   `fetch-media --dry-run` on the cleaned list, and the pull.
-- **Mac fallback** is possible after runs 1–2: the data volume had 190 GiB
-  free on 2026-09-28, so the full pull fits but leaves ~44 GiB; P1+P2
-  (~90 GB) is comfortable. Set the #64 free-disk floor accordingly.
+- **Mac fallback** is possible after 1–5: the data volume had 190 GiB free
+  on 2026-09-28, so the full pull fits but leaves ~44 GiB; P1+P2 (~90 GB) is
+  comfortable. Set the #64 free-disk floor accordingly.
 
-## Definition-of-done smokes that need the operator's Telegram account
+## Live smoke protocol (agents may run limited live smokes)
 
-#64, #69 and #68 (the live slice) smoke against live Telegram with the
-collecting account. Unattended runs **must not** do this unless the operator
-authorizes it at Gate A; otherwise implement, test, open the PR, and leave
-the live smoke marked pending for the morning. #62, #70 and #68's `--dry-run`
-smoke offline on a copy of the real store and can complete overnight.
+The operator authorizes implementing agents to run the live smokes named in
+each spec's Definition of Done, against Telegram with the collecting account,
+**within these limits**. Anything outside them is pending for the operator.
 
-## Seams between #62 and #64 (read before implementing either)
-
-Both edit the write path in `collectors/media.py` (and the avatar twin in
-`collectors/profiles.py`). To keep the parallel legs mergeable:
-
-- **#62 owns naming and reading:** it introduces `media_key(sha256, ext) ->
-  str` (`"media/ab/<sha><ext>"`) and `resolve_media_key(settings, profile,
-  key) -> Path` in a new `src/paperboy/media_keys.py`, stores the key (not a
-  path) in `media.path`, `custody_log.path` and new raw payloads, migrates old
-  rows, and updates `replay.py`'s readers.
-- **#64 owns writing:** it changes the gateway download signature to stream
-  into a sink, adds the temp-file + atomic-rename writer and the disk guard.
-  It keeps **today's** destination expression (`media_root / sha[:2] /
-  f"{sha}{ext}"`) and today's `str(path)` stored value, untouched.
-- **Integration:** replace #64's destination expression with
-  `resolve_media_key(..., media_key(sha, ext))` and its stored value with the
-  key. This is the one expected conflict; the integrator resolves it and
-  re-runs the full suite.
+1. **Never the real store.** Work in a scratch data dir outside the repo
+   (the handoff prompt names it). Snapshot the store with SQLite's online
+   backup, never `cp` of a live file:
+   `sqlite3 <real>/default/paperboy.sqlite ".backup '<scratch>/default/paperboy.sqlite'"`
+   (or Python's `sqlite3.Connection.backup`), then run with
+   `PAPERBOY_DATA_DIR=<scratch>`. The keychain session is looked up by
+   profile name, so `--profile default` still authenticates. Offline smokes
+   that need existing media files (#70) may symlink `<scratch>/default/media`
+   to the real media dir and must show its file count and total size
+   unchanged before/after.
+2. **Read-only, guarded.** Never `--unsafe`, `--join` or `--profiles`. If
+   `doctor` blocks (e.g. no proxy configured), do not override — record the
+   smoke as pending with the doctor output.
+3. **Caps per feature:** ≤ 5 live invocations; each with `--max-rpc 60` or
+   lower; ≤ 3 media files and ≤ 3 GB downloaded in total; only channels
+   already in the store, and never the investigation being split out (#70).
+4. **Stop conditions:** any `FLOOD_WAIT` over 60 s, `PEER_FLOOD`,
+   `FROZEN_METHOD_INVALID`, or an auth/session error → stop, record it on
+   the feature's issue, and make **no further live calls for the rest of the
+   night** (later features mark their live smokes pending). Never retry to
+   "get a clean run".
+5. **Public repo — redact.** In commits, PR bodies and issue comments, write
+   channels as `@<channel>` and message ids as `<id>`; never paste usernames,
+   channel ids, titles or message text. Keep the unredacted transcript in the
+   scratch dir and reference its filename.
+6. Scratch outputs stay in the scratch dir for the operator's review — don't
+   delete them.
 
 ## Shared constraints (from CLAUDE.md; non-negotiable)
 

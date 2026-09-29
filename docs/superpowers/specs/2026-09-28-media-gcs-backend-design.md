@@ -1,7 +1,8 @@
 # Media storage backend: write downloads to a GCS bucket (#63)
 
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** issue #63.
-**Batch:** 2. **Depends on:** #62 (keys) and #64 (streaming sink) — both
+**Order:** daytime, after the overnight chain, with the operator present.
+**Depends on:** #62 (keys) and #64 (streaming sink) — both
 must be on the base branch. Independent of #68.
 **ADR:** lands `docs/adr/0008-media-backends.md` (the backend abstraction,
 the dependency choice) and an amendment to ADR-0003 (the outbound allow-list)

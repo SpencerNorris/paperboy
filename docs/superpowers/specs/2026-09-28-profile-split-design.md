@@ -1,8 +1,12 @@
 # Split a mixed profile into per-investigation profiles via `reproject`
 
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** issue #70.
-**Depends on:** #62 (profile-relative media keys — the split copies media by
-key into another profile's folder). Independent of #64/#68/#69/#63.
+**Order:** 4 of 5 in the sequential chain (after #69, #62, #64). **Depends
+on:** #62 (profile-relative media keys — the split copies media by key into
+another profile's folder) and #64 (replay streams media through the sink).
+Read `2026-09-28-media-storage-overview.md` first, including the live smoke
+protocol. **The agent never performs the swap (§3 step 4) on the real
+profile** — that is the operator's call after review.
 **ADR:** none new — this is the raw-first design (ADR-0002, ADR-0005) used
 for its intended purpose; note the new flags in `docs/features/reproject.md`.
 
@@ -95,10 +99,15 @@ are zero.
   in exactly one output (log assertion).
 - Existing reproject tests unchanged when no filter is given.
 
-## 5. Definition of done (smoke on the real store)
+## 5. Definition of done (offline smoke on a copy of the real store)
 
-Run §3 steps 1–3 against the live `default` profile (the source is only
-read). Paste:
+Offline (no Telegram), under the overview's smoke protocol: back up the real
+store into the scratch data dir with `sqlite3 … ".backup …"`, symlink
+`<scratch>/default/media` to the real media dir (read-only use — show its
+file count and total bytes unchanged before/after), and run §3 steps 2–3
+with `PAPERBOY_DATA_DIR=<scratch>`, so both outputs and the split-out
+profile's copied media land in the scratch dir. Paste (redacted — the
+excluded target is `@<target>`):
 
 - Per-table row counts: source, clean default, split-out profile, and
   `source − split-out` next to `clean default`, with each difference

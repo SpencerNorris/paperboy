@@ -1,9 +1,11 @@
 # `fetch-media` — download media for an ordered list of message URIs (#68)
 
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** issue #68.
-**Batch:** 2. **Depends on:** #64 (streaming; the pending list holds files up
-to 2.4 GB), #62 (the report prints stable keys) and #69 (pacing safety
-factor). Independent of #63.
+**Order:** 5 of 5 in the sequential chain (last). **Depends on:** #64
+(streaming; the pending list holds files up to 2.4 GB), #62 (the report
+prints stable keys) and #69 (pacing). Independent of #63 and #70. Read
+`2026-09-28-media-storage-overview.md` first, including the live smoke
+protocol.
 **No ADR needed:** a new recipe over the existing `media` collector; storage
 is unchanged. (The optional pre-resolved channel context in
 `collect_channel` is a recipe change; note it in ADR-0005's consequences,
@@ -143,11 +145,18 @@ paperboy fetch-media LIST [--profile P] [--media-max-mb N] [--media-min-free-gb 
 
 ## 7. Definition of done (smoke on real data)
 
-1. `paperboy fetch-media download-list.csv --dry-run` on the real list —
-   paste the outcome and segment tables (expect ~99 `already_stored`, 40
-   `unresolvable`).
-2. A real fetch of a **5-row slice** of the list (mix of video and photo,
-   two channels) with `--report` — paste the table and the report.
+All under the overview's smoke protocol (scratch data dir, redacted
+evidence; the operator's list lives outside the repo — the handoff prompt
+gives its path; never copy it into the repo).
+
+1. `PAPERBOY_DATA_DIR=<scratch> paperboy fetch-media <list> --dry-run` on
+   the real list — offline; paste the outcome and segment tables (counts
+   only; expect ~99 `already_stored` and 40 `unresolvable` — the latter are
+   the split-out investigation's rows).
+2. A live fetch of a **3-row slice** (write it to the scratch dir): one
+   photo and two small videos, from two different channels, ≤ 3 GB total,
+   none from the split-out investigation, with `--report` and `--max-rpc 60`.
+   Paste the table and the report with URIs redacted.
 3. Re-run the same slice — every row `already_stored`, zero downloads.
 
 ## 8. Out of scope
