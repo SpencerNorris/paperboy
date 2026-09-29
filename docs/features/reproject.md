@@ -186,8 +186,130 @@ types with their TL namespace (`contacts.resolvedPeer` for `ResolvedPeer`,
 `ChannelDifference*`) but not others (`Message`, `ChatInvite*`,
 `SponsoredMessage`, `MediaDownload`, ...) — collectors record
 `payload.get("_", ...)` verbatim, so every kind lookup in `replay.py` matches
-a bare kind *or* any `<namespace>.<kind>` suffix (`_kind_clause`), not an
-exact string.
+a bare kind *or* any `<namespace>.<kind>` suffix (`kind_matches`, the Python
+twin of the SQL `_kind_clause` that the per-run walk still uses — see
+"Performance" below), not an exact string.
+
+## Performance — per-run raw index (#75)
+
+**Problem (measured).** Every replayed request used to be one SQL lookup shaped
+`lower(kind) = ? OR lower(kind) LIKE '%.k'` plus `json_extract(context_json,
+…)` plus `id BETWEEN run.lo AND run.hi`. `EXPLAIN QUERY PLAN` showed
+`SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)`: every
+lookup read every row of the run, `payload_json` included. On a `.backup` copy
+of the real store (65,827 raw rows, 65 runs, largest run 27,567 rows) one
+`MediaDownload` lookup that finds nothing took 6-11 s, and the store has
+~44,000 media-bearing messages, so the `media` phase was projected in days.
+
+**Mechanism (chosen: M5).** `ReplaySource.index(run)` walks the run's rowid
+window **once** (`RunIndex.WALK_SQL`, the only range query left) and keeps one
+small `RawEntry` per row (`id`, lower-cased kind, tier, `observed_at`, parsed
+context, and for message kinds `CAST($.id AS INTEGER)`, for web kinds `$.url`;
+never the payload). Every gateway method, `resolve`, `iter_history`, the
+`get_channel_difference` nested-message match and stamp, the web replay client
+and the phase-detection helpers (`resolve_targets`, `linked_group_ids`,
+`has_kind`, `has_context_channel`, `has_context_value`) answer from that index;
+a hit then fetches its payload by rowid (`SEARCH ... (rowid=?)`). One run is
+resident at a time (the next run replaces it). Results are identical by
+construction: same rows, same `id` order, payload text read verbatim, the SQL
+`CAST` kept in the walk, `NULL` never matching. The reproject parity suite is
+unchanged and green.
+
+| # | Option | Media lookup, a miss | Migration |
+|---|--------|----------------------|-----------|
+| M0 | today: `LIKE` + rowid range | 9.4-10 s (planner probe) | no |
+| M1 | `kind IN (exact spellings)` on the existing kind index | 61 ms first, ~0 after; message-kind lookups stay O(run) (1.1-1.6 s) and lose the early exit on hits | no |
+| M2/M3/M4 | new `(kind, id)`, expression, or `json_extract` indexes | 0.3-0.8 ms | yes, and one index per lookup shape |
+| **M5** | **per-run in-memory index** | **17,654 lookups in 13-20 ms** (build ~4-5 s once per run) | **no** |
+
+**Why not an index.** `ReplaySource` opens the source `mode=ro` (or
+`immutable=1`) and never migrates it — only the *output* goes through
+`Store.open`. An index migration would therefore silently not exist on an old,
+read-only or hand-copied source, which is exactly the case reproject serves.
+M5 needs nothing from the source, and it is the only option that also fixes
+`iter_history` (2.8-3.9 s per page x 252 pages on the biggest run before),
+`get_messages` misses, the diff's nested lookups and the once-per-run
+`has_context_value` / `MAX(observed_at)` walks. No schema, index or raw change,
+so no ADR (ADR-0005 has a one-line note) and no `docs/data-model.md` change.
+
+**Memory and logging.** About 0.9 KB per row (23.7 MB for the 27,567-row run,
+Python overhead included). Each run logs one INFO line from `paperboy.replay`:
+`replay index run=… rows=… message_rows=… context_bytes=… approx_bytes=…
+elapsed=…`, and a WARNING when one run's estimate exceeds 512 MB
+(`replay.INDEX_WARN_BYTES`). There is no hard cap and no failure.
+
+**Tests.** `tests/test_replay_index.py`: `kind_matches` equals the SQL clause
+over the stored spellings; entries are id-ordered and bucketed; `None` never
+matches; the SQL `CAST` semantics; one walk per run; the INFO/WARNING lines; a
+gateway lookup issues no `raw_records` SQL beyond one rowid point-fetch; a
+50,000-row run (5,000 media-bearing) with a timing bound; namespaced kinds.
+
+### Definition of done — offline transcript (#75)
+
+Offline only (no Telegram call). Source = a `sqlite3 .backup` copy of the real
+store in `<scratch>/75/default` (65,827 raw rows, 65 runs; the real data dir was
+only read by `.backup`); media = a per-file symlink farm (753 links, 2 missing
+files) into `<scratch>/75/default/media`, never a link to the real dir.
+Unredacted transcripts stay in `<scratch>/75/`.
+
+Before and after, `find -L <scratch>/75/default/media -type f | wc -l` -> `753`
+both times; `du -shL` -> `32G` both times; `find <scratch>/75/default -name
+'*.log' -o -name '.incoming'` -> nothing (the source was not written).
+
+**Before** (today's media lookup SQL, biggest run = 27,567 rows, an id with no
+`MediaDownload`; `before.py`):
+
+```
+runs()=65 in 10.7s
+EXPLAIN QUERY PLAN:
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+one missing-message media lookup #1: 5.77s row=None
+one missing-message media lookup #2: 9.20s row=None
+one missing-message media lookup #3: 10.70s row=None
+```
+
+**After** (`RunIndex` on the same run; `after.py`):
+
+```
+EXPLAIN QUERY PLAN of RunIndex.WALK_SQL (once per run):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+EXPLAIN QUERY PLAN of the payload fetch (per served hit):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid=?)
+media-bearing messages in the run: 17654
+index(run) build: 4.34s rows=27567
+17654 download_media misses through the gateway: 0.013s
+```
+
+**Full run** (background, PID recorded; phases `channel,history,media`, not
+narrowed): `reproject --profile default --phases channel,history,media`.
+
+```
+wall time                 1754.27 real (29 min 14 s)   34.75 user   35.72 sys
+maximum resident set size 71385088 bytes
+peak memory footprint     109085224 bytes
+index lines               65 (one per run); largest: rows=27567 message_rows=27341
+                          context_bytes=727748 approx_bytes=17267948 elapsed=5.03s
+media phase (first run with downloads) downloaded=150 duplicates=0
+media phase (a later run)               downloaded=0 duplicates=449 unavailable=5
+media phase (final run)                downloaded=2 duplicates=169 unavailable=6403
+```
+
+| table | source (backup) | reprojected (output) |
+|-------|-----------------|----------------------|
+| raw_records | 65827 | 57110 |
+| messages | 59050 | 52633 |
+| media | 755 | 753 |
+| custody_log | 1144 | 4593 |
+| web_snapshots | 15314 | 0 |
+
+(The reprojected column covers only the requested phases: no `web`, `graph`,
+`participants` or `profiles`, so `users`/`web_snapshots`/... are 0 by
+construction; `web_snapshots` is also #74's known loss, out of scope. Two
+missing stored files -> `media` 753 of 755.) The media phase, which made no
+visible progress in 3.5 h before this change, completes with the whole
+reproject in under 30 minutes; the bulk of the remaining time is hashing 32 GB
+of media.
+
 
 ## Round-trip equality contract (D5)
 
