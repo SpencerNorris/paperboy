@@ -41,6 +41,15 @@ app = typer.Typer(
 )
 console = Console()
 
+_PACING_HELP = (
+    "Multiply every request interval we assume by this (default 2.0, min 1.0). "
+    "Never applied to server-mandated FLOOD_WAITs."
+)
+_FLOOD_HELP = (
+    "Longest single FLOOD_WAIT (seconds, margin included) to sleep through before "
+    "stopping the phase (default 3600)."
+)
+
 
 def _settings_with_overrides(profile: str, **overrides: object) -> Settings:
     clean = {k: v for k, v in overrides.items() if v is not None}
@@ -100,9 +109,13 @@ def auth(profile: str = typer.Option("default", "--profile")) -> None:
 def doctor(
     profile: str = typer.Option("default", "--profile"),
     strict: bool = typer.Option(False, "--strict"),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
 ) -> None:
     """Opsec preflight: proxy, session age, 2FA, privacy keys, profile minimalism."""
-    settings = _settings_with_overrides(profile)
+    settings = _settings_with_overrides(
+        profile, pacing_factor=pacing_factor, flood_sleep_threshold=max_flood_sleep
+    )
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=False)
     secrets = composition.build_secrets(profile)
 
@@ -167,8 +180,11 @@ def collect(
     ),
     profile_interval: float = typer.Option(
         None, "--profile-interval",
-        help="Seconds between full-profile RPCs (default: Budget's 1.0s).",
+        help="Base seconds between full-profile RPCs (default 1.0), multiplied by "
+             "--pacing-factor.",
     ),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
     profile_refresh_after: str = typer.Option(
         None, "--profile-refresh-after",
         help="Skip re-enriching users enriched more recently than this (e.g. 7d, 12h, 30m).",
@@ -204,6 +220,10 @@ def collect(
         overrides["enrich_profiles"] = True
     if profile_interval is not None:
         overrides["profile_interval"] = profile_interval
+    if pacing_factor is not None:
+        overrides["pacing_factor"] = pacing_factor
+    if max_flood_sleep is not None:
+        overrides["flood_sleep_threshold"] = max_flood_sleep
     if profile_refresh_after is not None:
         try:
             overrides["profile_refresh_after"] = parse_duration(profile_refresh_after)
