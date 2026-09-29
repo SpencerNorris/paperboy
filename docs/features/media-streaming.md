@@ -57,6 +57,9 @@ not fill the disk.
   legacy suffix) -> temp deleted, rows only; else rename, then rows.
 - **Sweep.** At phase start `.incoming/*.part` older than 1 h (a dead run) are
   deleted and counted in an INFO log.
+  Running two `collect`s against the same profile at once is unsupported (the
+  sweep would delete the other run's `.part` files once older than 1 h), which
+  is consistent with one MTProto session per auth key.
 - **Reproject.** `RawReplayGateway.download_media` streams the stored file
   through a hash-and-count-only `MediaSink(None)` (re-verifying its sha).
   Replay never writes into the source profile: no `.incoming/`, no sweep, no
@@ -108,18 +111,18 @@ media · downloaded=2 duplicates=0 unavailable=0 skipped_kind=0 skipped=0 size_m
             91734520  peak memory footprint
 ```
 
-Peak RSS 81.7 MB for a 1,004,435,113-byte video (about 8% of the file size;
+Peak RSS 81.7 MB for a ~1004 MB video (about 8% of the file size;
 the pre-#64 path held the whole file plus copies).
 
 ```
 sqlite> SELECT sha256, size, path FROM media ORDER BY downloaded_at DESC LIMIT 2;
-452c8df5...b90bd|189730|media/45/452c8df5...b90bd.jpg
-c7ec9656...075cd|1004435113|media/c7/c7ec9656...075cd.mp4
+452c8df5…|~0.2 MB|media/45/452c8df5….jpg
+c7ec965613bf…|~1004 MB|media/c7/c7ec965613bf….mp4
 
-$ shasum -a 256 <scratch>/default/media/c7/c7ec9656...075cd.mp4
-c7ec965613bfa6af40990c93d6524de916c8c1e039b366085d8e166da75607cd   (equals media.sha256)
+$ shasum -a 256 <scratch>/default/media/c7/c7ec965613bf….mp4
+c7ec965613bf…  (equals media.sha256; truncated, full value in the scratch transcript)
 $ stat -f %z <same file>
-1004435113                                                          (equals media.size)
+~1004 MB                                                            (equals media.size)
 $ ls -la <scratch>/default/media/.incoming
 total 0                                                             (empty)
 ```
@@ -145,13 +148,13 @@ media · downloaded=1 duplicates=0 unavailable=0 skipped_kind=0 skipped=0 size_m
        77381632  maximum resident set size
        96600568  peak memory footprint
 sqlite> SELECT sha256, size, path FROM media ORDER BY downloaded_at DESC LIMIT 1;
-086f3fb4...23d4b2|1005068556|media/08/086f3fb4...23d4b2.mp4
-$ shasum -a 256 <that file>   -> 086f3fb4...23d4b2 (equals media.sha256)
-$ stat -f %z <that file>      -> 1005068556          (equals media.size)
+086f3fb4…|~1005 MB|media/08/086f3fb4….mp4
+$ shasum -a 256 <that file>   -> 086f3fb4… (equals media.sha256; truncated, full value in the scratch transcript)
+$ stat -f %z <that file>      -> ~1005 MB            (equals media.size)
 $ ls -la <scratch>/default/media/.incoming -> total 0 (empty)
 ```
 
-Peak RSS 77.4 MB for a 1,005,068,556-byte file (7.7% of the file size) on the
+Peak RSS 77.4 MB for a ~1005 MB file (7.7% of the file size) on the
 final code.
 
 Invocation 4, at the final commit `36b8fab` (dedup re-run of invocation 3's
