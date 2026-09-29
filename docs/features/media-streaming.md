@@ -69,7 +69,12 @@ not fill the disk.
   `skipped` with a warning. Replay never consults the free-disk floor (the
   collector gates it on `gateway.replay`). The
   sweep therefore runs only in live collect; concurrent live runs on one
-  profile are unsupported (one session per auth key).
+  profile are unsupported (one session per auth key). Replay verifies each
+  streamed file's sha against its receipt (a mismatch is `skipped` with a
+  WARNING). The one replay that writes files is `reproject --out-profile`
+  (#70): the collector then takes the live write path into the OUTPUT
+  profile (`.incoming/`, atomic rename, destination disk floor); see
+  `reproject.md`, "Splitting a mixed profile".
 - **Durability.** `MediaSink.close()` fsyncs before the rename, so an OS crash
   cannot leave a partial file under a final name; a failed close during
   exception unwinding is logged, never allowed to mask the original error.

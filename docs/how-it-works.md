@@ -72,9 +72,11 @@ collector ──asks──► real Telegram      collector ──asks──► f
 ```
 
 Media during replay: the receipt says "file abc… is at `media/ab/abc….mp4`".
-Replay opens that existing file, checks its fingerprint matches, and writes a
-row pointing at it. **It copies nothing and writes nothing into the source**,
-only the new database.
+Replay opens that existing file, checks its fingerprint matches the receipt (a
+file that no longer hashes to it is skipped with a warning, never trusted), and
+writes a row pointing at it. **It copies nothing and writes nothing into the
+source**, only the new database. The one exception is `--out-profile`
+(section 5): there the checked file is copied into the *new* profile.
 
 Replay goes **run by run**: each past `collect` is one "run", replayed in order
 ([ADR-0005](adr/0005-run-structure.md)).
@@ -96,17 +98,26 @@ also per profile, in the OS keychain, never in the folder.)
 
 ```
 data/default/ (mixed)
-   │  reproject --exclude-target @<other>        reproject --include-target @<other>
-   ▼                                              --out-profile <other>   ▼
-data/default/ (clean)                         data/<other>/
-├── paperboy.sqlite (rebuilt)                 ├── paperboy.sqlite (just that one)
-└── media/  untouched; rows point here        └── media/  COPY of only that
-                                                  investigation's files
+   │ reproject --exclude-target @<other>      reproject --include-target @<other>
+   │           --out <file>                              --out-profile <other>
+   ▼                                                       ▼
+data/default/ (clean, after you swap the file in)     data/<other>/
+├── paperboy.sqlite (rebuilt)                         ├── paperboy.sqlite (just that one)
+└── media/  untouched; rows point here                ├── paperboy.sqlite.log
+                                                      └── media/  COPY of only that
+                                                          investigation's files
 ```
 
-Only the split-off investigation's files are copied, because the new profile
-must stand alone. Once you delete the leftovers from `default`, that's a move,
-not extra disk.
+`@<other>` may be spelled `@name`, `name` or a channel id; it matches by the
+channel it *resolved to*, and its linked discussion group comes along. An
+unknown name is an error that lists what the source contains, before anything
+is written. Only the split-off investigation's files are copied (into
+`data/<other>/media/.incoming/`, then renamed into place, so a crash never
+leaves a half file under a real name), because the new profile must stand
+alone. The old profile's `media/` keeps the copies you no longer need:
+`uv run python scripts/unreferenced_media.py --profile default` lists them
+(it never deletes). Once you delete the leftovers, that's a move, not extra
+disk. Steps and caveats: [`features/reproject.md`](features/reproject.md).
 
 ## 6. The media pull
 
