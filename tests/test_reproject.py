@@ -530,6 +530,35 @@ def test_reproject_never_rewrites_media_files(tmp_path, monkeypatch):
     assert list((media / ".incoming").iterdir()) == []
 
 
+def test_reproject_works_against_a_read_only_source_media_dir(tmp_path, monkeypatch):
+    """Replay must never write into the source profile: with `media/` (and its
+    `.incoming`) read-only, reproject still exits 0 with media/custody parity
+    and creates nothing under the source media dir."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        src_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+        src_custody = conn.execute("SELECT count(*) FROM custody_log").fetchone()[0]
+    assert src_media > 0 and src_custody > 0
+
+    media = tmp_path / "default" / "media"
+    before = sorted(str(p.relative_to(media)) for p in media.rglob("*"))
+    dirs = [media, *[p for p in media.rglob("*") if p.is_dir()]]
+    modes = {d: d.stat().st_mode for d in dirs}
+    for d in dirs:
+        d.chmod(0o555)
+    try:
+        monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+        result = runner.invoke(app, ["reproject", "--profile", "default"])
+    finally:
+        for d in dirs:
+            d.chmod(modes[d])
+    assert result.exit_code == 0, result.output
+    assert sorted(str(p.relative_to(media)) for p in media.rglob("*")) == before
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media
+        assert conn.execute("SELECT count(*) FROM custody_log").fetchone()[0] == src_custody
+
+
 def test_reproject_ignores_the_live_free_disk_floor(tmp_path, monkeypatch):
     """The free-disk floor protects the disk from downloads; replay downloads
     nothing, so a nearly-full host must not change what a reproject rebuilds."""

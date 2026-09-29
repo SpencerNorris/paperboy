@@ -130,13 +130,11 @@ operator can eyeball the correction before swapping files.
   through): each payload's location is resolved as a media key under the
   source profile dir (ADR-0007), and legacy absolute/cwd-relative payloads
   are normalised by their sha, so a moved profile dir still replays. The
-  collector then finds the destination already present and discards its
-  temp copy, so no final-name file is ever created or replaced; the test
-  asserts `os.replace` is never called, every stored file's size and sha are
-  unchanged, and `media/.incoming/` is empty afterwards. Cost (#64): each
-  replayed file is transiently copied once into `<source>/media/.incoming/`
-  and deleted (one extra write per file per replayed run). A hash-only sink
-  for replay would avoid it; deferred.
+  collector then finds the destination already present and records rows
+  only, so no final-name file is ever created or replaced; the test asserts
+  `os.replace` is never called and every stored file's size and sha are
+  unchanged. Replay uses a file-less hash-and-count sink (#64), so it writes
+  nothing into the source profile: a read-only source `media/` works (tested).
 
 ## Design deviations from the spec (D4, plan §"Locked design decisions")
 

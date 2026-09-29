@@ -222,10 +222,16 @@ class MediaCollector:
         }
 
         media_root = media_dir(ctx.settings, ctx.profile)
-        incoming = _prepare_media_root(media_root)
-        swept, swept_bytes = _sweep_incoming(incoming, now=time.time())
-        if swept:
-            ctx.log.info("media: swept %d stale part file(s), %d bytes", swept, swept_bytes)
+        # A replay (reproject) only re-derives rows from files already in the
+        # source profile: it must never write there (the source may be
+        # read-only), so it gets hash-and-count-only sinks and no `.incoming`.
+        replay = getattr(ctx.gateway, "replay", False) is True
+        incoming: Path | None = None
+        if not replay:
+            incoming = _prepare_media_root(media_root)
+            swept, swept_bytes = _sweep_incoming(incoming, now=time.time())
+            if swept:
+                ctx.log.info("media: swept %d stale part file(s), %d bytes", swept, swept_bytes)
         floor_bytes = int(ctx.settings.media_min_free_gb * 10**9)
 
         content_index = self._load_content_index(ctx, channel_id)
@@ -315,7 +321,7 @@ class MediaCollector:
                 counts["too_large"] += 1
                 continue
 
-            if floor_bytes:
+            if floor_bytes and not replay:
                 free = _free_bytes(media_root)
                 if free - (size or 0) < floor_bytes:
                     raise DiskFloorStop(
@@ -326,7 +332,7 @@ class MediaCollector:
                         counts=counts,
                     )
 
-            temp = incoming / f"{uuid.uuid4().hex}.part"
+            temp = incoming / f"{uuid.uuid4().hex}.part" if incoming is not None else None
             try:
                 try:
                     outcome = await self._stream_one(
@@ -375,12 +381,23 @@ class MediaCollector:
                     existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
                     if existing_key is not None:
                         loc = existing_key
+                    elif temp is None:
+                        # Replay with the stored file absent under both names:
+                        # there are no bytes to place and the source must not be
+                        # written to. Skip (recorded), never fabricate a row.
+                        ctx.log.warning(
+                            "media: replay skipping msg %s: stored file for sha %s not found",
+                            row["msg_id"], sha,
+                        )
+                        counts["skipped"] += 1
+                        continue
                     else:
                         _finalize(temp, path)
             finally:
                 # A no-op after a successful rename; otherwise discards the
                 # partial/duplicate temp so nothing lingers under `.incoming/`.
-                _unlink_quiet(temp)
+                if temp is not None:
+                    _unlink_quiet(temp)
 
             raw_payload = {
                 "sha256": sha, "kind": kind, "size": received, "mime_type": mime_type,
@@ -415,7 +432,7 @@ class MediaCollector:
         media: dict,
         kind: str,
         declared: int | None,
-        temp: Path,
+        temp: Path | None,
     ) -> str | tuple[str, int]:
         """Stream one message's media into `temp`. Returns the `counts` key of
         a non-download outcome (`skipped`/`unavailable`/`size_mismatch`), or

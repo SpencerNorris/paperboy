@@ -58,11 +58,14 @@ not fill the disk.
 - **Sweep.** At phase start `.incoming/*.part` older than 1 h (a dead run) are
   deleted and counted in an INFO log.
 - **Reproject.** `RawReplayGateway.download_media` streams the stored file
-  through the sink (re-verifying its sha); the collector finds the
-  destination present and discards the temp copy. Cost: one transient extra
-  write per replayed file (see `docs/features/reproject.md`). Replay forces
-  `media_min_free_gb=0`: it downloads nothing, and ENOSPC on the temp copy
-  already stops the phase, so a rebuild never depends on host free space.
+  through a hash-and-count-only `MediaSink(None)` (re-verifying its sha).
+  Replay never writes into the source profile: no `.incoming/`, no sweep, no
+  temp copy, so a read-only source works and needs no spare disk. The
+  collector finds the destination present (or the same bytes under a legacy
+  name) and records rows only; if neither exists the message is counted
+  `skipped` with a warning. Replay also forces `media_min_free_gb=0`. The
+  sweep therefore runs only in live collect; concurrent live runs on one
+  profile are unsupported (one session per auth key).
 - **Durability.** `MediaSink.close()` fsyncs before the rename, so an OS crash
   cannot leave a partial file under a final name; a failed close during
   exception unwinding is logged, never allowed to mask the original error.

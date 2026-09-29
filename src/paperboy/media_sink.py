@@ -56,12 +56,22 @@ def _describe(exc: OSError) -> str:
 
 
 class MediaSink:
-    """Write chunks to `path`, hashing and counting as they arrive."""
+    """Write chunks to `path`, hashing and counting as they arrive.
 
-    def __init__(self, path: Path, *, limit: int | None = None) -> None:
+    `path=None` is hash-and-count-only mode: nothing is written anywhere, but
+    the hash, the byte count and the `limit` still apply. Reproject replay uses
+    it so it never writes into the (possibly read-only) source profile.
+    """
+
+    def __init__(self, path: Path | None, *, limit: int | None = None) -> None:
         self._path = path
         self._limit = limit
-        self._fh: IO[bytes] = open(path, "wb")  # noqa: SIM115 - closed by close()/__exit__
+        self._fh: IO[bytes] | None = None
+        if path is not None:
+            try:
+                self._fh = open(path, "wb")  # noqa: SIM115 - closed by close()/__exit__
+            except OSError as exc:
+                raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher = hashlib.sha256()
         self._size = 0
 
@@ -70,7 +80,8 @@ class MediaSink:
         if self._limit is not None and received > self._limit:
             raise MediaSizeExceeded(self._limit, received)
         try:
-            self._fh.write(chunk)
+            if self._fh is not None:
+                self._fh.write(chunk)
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher.update(chunk)
@@ -80,8 +91,9 @@ class MediaSink:
     def reset(self) -> None:
         """Truncate the temp file and restart the hash: a fresh attempt."""
         try:
-            self._fh.seek(0)
-            self._fh.truncate()
+            if self._fh is not None:
+                self._fh.seek(0)
+                self._fh.truncate()
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher = hashlib.sha256()
@@ -89,24 +101,36 @@ class MediaSink:
 
     def flush(self) -> None:
         try:
-            self._fh.flush()
+            if self._fh is not None:
+                self._fh.flush()
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
 
     def close(self) -> None:
         """Flush, fsync and close, so a later rename never exposes bytes that
         an OS crash could still lose."""
+        fh = self._fh
+        if fh is None or fh.closed:
+            return
+        error: OSError | None = None
         try:
-            if not self._fh.closed:
-                self._fh.flush()
-                os.fsync(self._fh.fileno())
-            self._fh.close()
+            fh.flush()
+            os.fsync(fh.fileno())
         except OSError as exc:
-            raise MediaSinkWriteError(_describe(exc)) from exc
+            error = exc
+        finally:
+            # Always release the descriptor, even when flush/fsync failed, so
+            # repeated disk errors cannot leak fds.
+            try:
+                fh.close()
+            except OSError as exc:
+                error = error or exc
+        if error is not None:
+            raise MediaSinkWriteError(_describe(error)) from error
 
     @property
     def closed(self) -> bool:
-        return self._fh.closed
+        return self._fh is None or self._fh.closed
 
     @property
     def size(self) -> int:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,7 @@ def test_write_oserror_is_wrapped(tmp_path: Path) -> None:
             pass
 
     real = sink._fh
+    assert real is not None
     sink._fh = _Broken()  # type: ignore[assignment]
     with pytest.raises(MediaSinkWriteError) as ei:
         sink.write(b"abc")
@@ -130,3 +132,34 @@ def test_failed_close_without_prior_error_still_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "fsync", _enospc)
     with pytest.raises(MediaSinkWriteError), MediaSink(tmp_path / "f.part") as sink:
         sink.write(b"abc")
+
+
+def test_hash_only_mode_writes_nothing_but_hashes_counts_and_limits(tmp_path):
+    with MediaSink(None, limit=5) as sink:
+        sink.write(b"abc")
+        sink.reset()
+        sink.write(b"hello")
+        assert sink.size == 5
+        assert sink.sha256 == hashlib.sha256(b"hello").hexdigest()
+        with pytest.raises(MediaSizeExceeded):
+            sink.write(b"x")
+    assert sink.closed
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_open_failure_becomes_media_sink_write_error(tmp_path):
+    with pytest.raises(MediaSinkWriteError):
+        MediaSink(tmp_path / "missing-dir" / "x.part")
+
+
+def test_close_releases_the_descriptor_when_fsync_fails(tmp_path, monkeypatch):
+    sink = MediaSink(tmp_path / "x.part")
+    sink.write(b"abc")
+
+    def _boom(fd):
+        raise OSError(errno.EIO, "boom")
+
+    monkeypatch.setattr(os, "fsync", _boom)
+    with pytest.raises(MediaSinkWriteError):
+        sink.close()
+    assert sink.closed

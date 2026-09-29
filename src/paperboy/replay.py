@@ -329,6 +329,10 @@ class RawReplayGateway:
     the network — there is no client, no session, no `Budget` anywhere in
     this class."""
 
+    # Tells collectors this is a replay: they must not write to the source
+    # profile (e.g. the media collector uses file-less hashing sinks).
+    replay = True
+
     def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None:
         self._src = source
         self._clock = clock
