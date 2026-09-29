@@ -75,6 +75,7 @@ def test_doctor_accepts_the_flags(tmp_path, captured):
 @pytest.mark.asyncio
 async def test_build_gateway_logs_the_pacing_line(tmp_path, monkeypatch, caplog):
     import logging
+    from unittest.mock import MagicMock
 
     from paperboy.config import load_settings
     from paperboy.store.db import Store
@@ -86,7 +87,7 @@ async def test_build_gateway_logs_the_pacing_line(tmp_path, monkeypatch, caplog)
     monkeypatch.setattr(composition, "build_client", lambda *a, **k: _Client())
     caplog.set_level(logging.INFO, logger="paperboy.app")
     with Store.open(tmp_path / "p.sqlite") as store:
-        await composition.build_gateway(load_settings("p", {}), None, "p", store)
+        await composition.build_gateway(load_settings("p", {}), MagicMock(), "p", store)
     line = next(r.message for r in caplog.records if r.message.startswith("pacing:"))
     assert "factor=2.0" in line and "contacts.resolveUsername=10.0s" in line
 
