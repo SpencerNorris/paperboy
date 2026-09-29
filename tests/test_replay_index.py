@@ -268,3 +268,70 @@ def test_media_and_message_lookups_do_not_scale_with_run_size(tmp_path):
         elapsed = time.perf_counter() - started
         assert all(m["_"] == "message" for m in got)
         assert elapsed < _RUN_SIZE_BOUND_S, f"{elapsed:.1f}s for a {n_media + n_plain}-row run"
+
+
+def _set_context(db, rid, value):
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE raw_records SET context_json = ? WHERE id = ?", (value, rid))
+    conn.commit()
+    conn.close()
+
+
+def test_malformed_context_json_fails_loudly_naming_row_and_run(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("r1")
+        st.add_raw("contacts.ResolvedPeer", {"_": "x"}, "stranger", {"target": "@a"},
+                   observed_at="t1")
+    _set_context(db, 1, '{"target": SECRET-not-json')
+    with ReplaySource.open(db, tmp_path) as src:
+        run = src.runs()[0]
+        with pytest.raises(replay.ReprojectSourceError) as exc:
+            src.index(run)
+    msg = str(exc.value)
+    assert "id=1" in msg and run.run_id in msg
+    assert "SECRET" not in msg
+
+
+def test_null_context_json_is_no_match_and_no_error(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("r1")
+        st.add_raw("contacts.ResolvedPeer", {"_": "x"}, "stranger", None, observed_at="t1")
+    assert sqlite3.connect(db).execute(
+        "SELECT json_extract(context_json, '$.target') FROM raw_records"
+    ).fetchone() == (None,)
+    with ReplaySource.open(db, tmp_path) as src:
+        assert src.resolve_targets(src.runs()[0]) == []
+
+
+def _sql_extract(db, expr):
+    conn = sqlite3.connect(db)
+    return [r[0] for r in conn.execute(f"SELECT {expr} FROM raw_records ORDER BY id")]
+
+
+def test_non_scalar_target_and_linked_chat_id_match_old_sql_semantics(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.begin_run("r1")
+        st.add_raw("contacts.ResolvedPeer", {"_": "x"}, "stranger",
+                   {"target": {"a": [1, 2], "b": "é"}}, observed_at="t1")
+        st.add_raw("contacts.ResolvedPeer", {"_": "x"}, "stranger", {"target": ["x", 1]},
+                   observed_at="t2")
+        st.add_raw("contacts.ResolvedPeer", {"_": "x"}, "stranger", {"target": "@plain"},
+                   observed_at="t3")
+        st.add_raw("messages.ChatFull", {"full_chat": {"linked_chat_id": [7, 8]}}, "stranger",
+                   None, observed_at="t4")
+        st.add_raw("messages.ChatFull", {"full_chat": {"linked_chat_id": 42}}, "stranger",
+                   None, observed_at="t5")
+    old_targets = list(dict.fromkeys(
+        t for t in _sql_extract(db, "json_extract(context_json, '$.target')") if t is not None
+    ))
+    old_linked = {
+        g for g in _sql_extract(db, "json_extract(payload_json, '$.full_chat.linked_chat_id')")
+        if g
+    }
+    with ReplaySource.open(db, tmp_path) as src:
+        run = src.runs()[0]
+        assert src.resolve_targets(run) == old_targets
+        assert src.linked_group_ids(run) == old_linked

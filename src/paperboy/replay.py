@@ -20,7 +20,7 @@ import time
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 import httpx
 
@@ -115,6 +115,15 @@ def _hashable_key(values: Iterable[object]) -> tuple | None:
     return key
 
 
+def _as_sqlite_json_value(value: Any) -> Any:
+    """`value` as SQLite `json_extract` would return it: scalars as-is, a JSON
+    object/array as its compact JSON *text* (hashable, and truthy even when
+    empty) — the pre-#75 behaviour of `resolve_targets`/`linked_group_ids`."""
+    if isinstance(value, dict | list):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return value
+
+
 class RunIndex:
     """Every raw record of ONE run, read by a single rowid-range walk
     (`WALK_SQL`) and answered from memory ever after (#75). Lookups return the
@@ -152,7 +161,12 @@ class RunIndex:
                 try:
                     parsed = json.loads(ctx_json)
                 except ValueError:
-                    parsed = None
+                    # The pre-#75 SQL (`json_extract`) raised "malformed JSON"
+                    # here, so a corrupt row failed the reproject loudly. Keep
+                    # that; name the row and run, never the content.
+                    raise ReprojectSourceError(
+                        f"raw record id={rid} in run {run.run_id} has malformed context_json"
+                    ) from None
                 if isinstance(parsed, dict):
                     ctx = parsed
             entries.append(RawEntry(rid, kind, tier, observed_at, ctx, payload_id, url))
@@ -519,7 +533,7 @@ class ReplaySource:
         collect per target per historical run (ADR-0005)."""
         seen: dict[str, None] = {}
         for e in self.index(run).entries(("resolvedpeer",)):
-            target = e.ctx.get("target")
+            target = _as_sqlite_json_value(e.ctx.get("target"))
             if target is not None:
                 seen.setdefault(target)
         return list(seen)
@@ -529,7 +543,11 @@ class ReplaySource:
         linked: set[int] = set()
         for row in self.payloads(e.id for e in chatfulls).values():
             full_chat = json.loads(row["payload_json"]).get("full_chat")
-            group = full_chat.get("linked_chat_id") if isinstance(full_chat, dict) else None
+            group = (
+                _as_sqlite_json_value(full_chat.get("linked_chat_id"))
+                if isinstance(full_chat, dict)
+                else None
+            )
             if group:
                 linked.add(group)
         return linked
