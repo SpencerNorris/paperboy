@@ -29,6 +29,7 @@ from typing import Self
 from uuid import uuid4
 
 from paperboy.ids import to_iso, utc_now_iso
+from paperboy.media_keys import key_sha256
 
 log = logging.getLogger("paperboy.store")
 
@@ -82,18 +83,15 @@ class Store:
         return store
 
     def unnormalised_media_counts(self) -> dict[str, int]:
-        """Rows in `media`/`custody_log` whose `path` is not its canonical key
-        `media/<sha[:2]>/<sha><ext>` (NULL, lacking its own sha, or a legacy
-        form that migration 0006 has not rewritten)."""
+        """Rows in `media`/`custody_log` whose `path` is not a well-formed key
+        (`is_media_key`) naming the row's own sha256: NULL, lacking its sha, or
+        a legacy form migration 0006 cannot make safe (e.g. a backslash in the
+        suffix). Checked in Python so the count and `resolve_key_under` share
+        one grammar."""
         counts: dict[str, int] = {}
         for table in ("media", "custody_log"):
-            row = self.conn.execute(
-                f"SELECT count(*) FROM {table} "  # noqa: S608 - fixed table names
-                "WHERE path IS NULL OR instr(path, sha256) = 0 "
-                "OR path <> 'media/' || substr(sha256, 1, 2) || '/' "
-                "|| substr(path, instr(path, sha256))"
-            ).fetchone()
-            counts[table] = row[0]
+            rows = self.conn.execute(f"SELECT path, sha256 FROM {table}")  # noqa: S608
+            counts[table] = sum(1 for r in rows if key_sha256(r["path"]) != r["sha256"])
         return counts
 
     def _apply_migrations(self) -> None:

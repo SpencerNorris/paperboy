@@ -415,3 +415,10 @@ def test_guess_ext_drops_unusable_suffix(caplog):
     with caplog.at_level(logging.WARNING):
         assert _guess_ext("document", None, "report.pdf ") == ""
     assert _guess_ext("document", None, "clip.MP4") == ".MP4"
+
+
+def test_guess_ext_unusable_suffix_falls_through_to_mime():
+    from paperboy.collectors.media import _guess_ext
+
+    assert _guess_ext("document", "application/pdf", "Statement No. 5") == ".pdf"
+    assert _guess_ext("document", None, "Statement No. 5") == ""

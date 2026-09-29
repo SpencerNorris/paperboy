@@ -6,6 +6,7 @@ import pytest
 
 from paperboy.config import load_settings
 from paperboy.media_keys import (
+    find_existing_key,
     is_media_key,
     media_dir,
     media_key,
@@ -86,7 +87,34 @@ def test_normalize_legacy_without_sha_raises():
     with pytest.raises(ValueError):
         normalize_legacy_location("elsewhere/nothing.bin", SHA)
     with pytest.raises(ValueError):
-        normalize_legacy_location(f"data/media/ab/{SHA}.bad ext", SHA)
+        normalize_legacy_location(f"data/media/ab/{SHA}.a/b", SHA)
+    with pytest.raises(ValueError):
+        normalize_legacy_location(f"data/media/ab/{SHA}.a\\b", SHA)
+    with pytest.raises(ValueError):
+        normalize_legacy_location(f"data/media/ab/{SHA}.a\x00b", SHA)
+
+
+@pytest.mark.parametrize(
+    "suffix", [". 5", ".final version", ".\u0645\u0633\u062a\u0646\u062f", "." + "a" * 40]
+)
+def test_legacy_suffix_kept_verbatim_and_resolvable(tmp_path, suffix):
+    """Pre-#62 files were written under whatever Path(file_name).suffix gave;
+    they stay readable although new keys would reject the suffix."""
+    key = normalize_legacy_location(f"/old/root/media/ab/{SHA}{suffix}", SHA)
+    assert key == f"media/ab/{SHA}{suffix}"
+    assert is_media_key(key)
+    assert resolve_key_under(tmp_path, key) == tmp_path / key
+    with pytest.raises(ValueError):
+        media_key(SHA, suffix)  # new keys stay strict
+
+
+def test_find_existing_key(tmp_path):
+    assert find_existing_key(tmp_path, SHA) is None
+    d = tmp_path / "media" / "ab"
+    d.mkdir(parents=True)
+    (d / f"{SHA}. 5").write_bytes(b"x")
+    (d / f"{SHA}x").write_bytes(b"x")  # not a key: extension must start with "."
+    assert find_existing_key(tmp_path, SHA) == f"media/ab/{SHA}. 5"
 
 
 def test_media_dir(tmp_path):

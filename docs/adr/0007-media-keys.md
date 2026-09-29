@@ -39,6 +39,12 @@ containing the data dir, profile name, drive or a leading `/`.
   time; a stored key is data and is validated before use as a path.
 - Legacy values are normalised by anchoring on the sha (the filename is the
   substring starting at the sha), not by directory string surgery.
+- Two grammars: NEW keys are canonical-strict (`is_valid_ext`); EXISTING keys
+  are traversal-safe only (no `/`, `\`, NUL). Pre-#62 files were written under
+  whatever `Path(file_name).suffix` gave (e.g. `. 5`, non-ASCII), so rejecting
+  them would silently drop evidence on reproject. The media collector reuses a
+  file already on disk for the sha (`find_existing_key`) rather than writing a
+  second copy under a re-derived extension.
 - Migration `0006_media_keys.sql` rewrites `media.path` and `custody_log.path`
   in place. `raw_records` is never modified; replay normalises old payloads.
 - Rows that do not contain their own sha are left untouched, counted and

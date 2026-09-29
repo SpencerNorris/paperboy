@@ -721,3 +721,45 @@ def test_reproject_from_moved_profile_dir_with_legacy_payloads(tmp_path, monkeyp
             for path in paths:
                 assert is_media_key(path)
                 assert resolve_key_under(new_root / "default", path).exists()
+
+
+@pytest.mark.parametrize("suffix", [". 5", ".\u062a\u0642\u0631\u064a\u0631"])
+def test_reproject_keeps_legacy_media_with_non_canonical_suffix(tmp_path, monkeypatch, suffix):
+    """Pre-#62 files sit on disk under whatever Path(file_name).suffix gave. Their
+    suffix fails the strict grammar for NEW keys, but reproject must still find
+    them, keep the media row, and not write a second (extensionless) copy."""
+    src_db = asyncio.run(run_full_collect(tmp_path))
+    media_root = tmp_path / "default" / "media"
+    for f in list(media_root.rglob("*.txt")):
+        f.rename(f.with_name(f.name[: -len(".txt")] + suffix))
+    with sqlite3.connect(src_db) as conn:
+        for table in ("media", "custody_log"):
+            conn.execute(
+                f"UPDATE {table} SET path = substr(path, 1, length(path) - 4) || ?", (suffix,)
+            )
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', "
+            "'media/' || substr(json_extract(payload_json, '$.sha256'), 1, 2) || '/' "
+            "|| json_extract(payload_json, '$.sha256') || ?) "
+            "WHERE lower(kind) IN ('mediadownload', 'avatardownload')",
+            (suffix,),
+        )
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+    files_before = sorted(p.name for p in media_root.rglob("*") if p.is_file())
+    assert files_before and all(n.endswith(suffix) for n in files_before)
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    out_db = tmp_path / "out.sqlite"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out_db)])
+    assert result.exit_code == 0, result.output
+
+    assert sorted(p.name for p in media_root.rglob("*") if p.is_file()) == files_before
+    with sqlite3.connect(out_db) as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
+        for table in ("media", "custody_log"):
+            paths = [r[0] for r in conn.execute(f"SELECT path FROM {table}")]
+            assert paths
+            for path in paths:
+                assert path.endswith(suffix)
+                assert resolve_key_under(tmp_path / "default", path).exists()

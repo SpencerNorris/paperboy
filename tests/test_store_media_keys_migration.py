@@ -78,3 +78,16 @@ def test_0006_is_idempotent(tmp_path):
         with Store.open(db) as st:
             snapshots.append((_paths(st, "media"), _paths(st, "custody_log")))
     assert snapshots[0] == snapshots[1] == ([f"media/aa/{A}.jpg"], [f"media/aa/{A}.jpg"])
+
+
+def test_unnormalised_count_uses_the_key_grammar(tmp_path):
+    """A legacy suffix that is traversal-safe (". 5") is a valid key; one that is
+    not (a backslash) stays counted so the operator is warned."""
+    db = tmp_path / "p.sqlite"
+    with Store.open(db) as st:
+        _put(st, "media", A, f"data/default/media/aa/{A}. 5")
+        _put(st, "media", B, f"data/default/media/bb/{B}.a\\b")
+        _put(st, "custody_log", A, f"data/default/media/aa/{A}. 5")
+    _unapply(db, "0006_media_keys")
+    with Store.open(db) as st:
+        assert st.unnormalised_media_counts() == {"media": 1, "custody_log": 0}

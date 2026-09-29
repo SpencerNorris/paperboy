@@ -34,7 +34,13 @@ from typing import TYPE_CHECKING
 
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.media_keys import is_valid_ext, media_key, resolve_media_key
+from paperboy.config import profile_dir
+from paperboy.media_keys import (
+    find_existing_key,
+    is_valid_ext,
+    media_key,
+    resolve_media_key,
+)
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -114,11 +120,11 @@ def _guess_ext(kind: str, mime_type: str | None, file_name: str | None) -> str:
         if is_valid_ext(suffix):
             return suffix
         # A hostile/odd DocumentAttributeFilename must never abort the phase
-        # (media_key would raise): fall back to no extension (ADR-0007).
+        # (media_key would raise): ignore the suffix and fall through to the
+        # MIME guess (ADR-0007).
         logging.getLogger("paperboy.media").warning(
-            "media: unusable filename suffix (len %d); storing without extension", len(suffix)
+            "media: unusable filename suffix (len %d); ignoring it", len(suffix)
         )
-        return ""
     if mime_type and (guessed := mimetypes.guess_extension(mime_type)):
         return guessed
     return ""
@@ -271,8 +277,16 @@ class MediaCollector:
             # Guards replay idempotency (spec §4 — reproject never re-writes a
             # media file) and spares a live re-run a redundant write too.
             if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
+                # The same bytes may already sit under a different extension -
+                # a pre-#62 file whose legacy suffix this version would not
+                # re-derive. Reuse that location instead of writing a second
+                # copy (and keep the reprojected row faithful to the source).
+                existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
+                if existing_key is not None:
+                    loc = existing_key
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
 
             raw_payload = {
                 "sha256": sha, "kind": kind, "size": len(data), "mime_type": mime_type,

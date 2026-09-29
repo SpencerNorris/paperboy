@@ -20,7 +20,7 @@ MEDIA_PREFIX = "media"
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _EXT_RE = re.compile(r"\.[A-Za-z0-9][A-Za-z0-9._-]{0,15}")
 _KEY_RE = re.compile(
-    rf"{MEDIA_PREFIX}/(?P<shard>[0-9a-f]{{2}})/(?P<sha>[0-9a-f]{{64}})(?P<ext>\.[^/\\]*)?"
+    rf"{MEDIA_PREFIX}/(?P<shard>[0-9a-f]{{2}})/(?P<sha>[0-9a-f]{{64}})(?P<ext>\.[^/\\\x00]*)?"
 )
 
 
@@ -37,14 +37,40 @@ def media_key(sha256: str, ext: str) -> str:
     return f"{MEDIA_PREFIX}/{sha256[:2]}/{sha256}{ext}"
 
 
-def is_media_key(value: object) -> bool:
-    """True only for a canonical key (the shard must match the sha)."""
+def key_sha256(value: object) -> str | None:
+    """The sha256 a well-formed key names, else `None`. Traversal-safe grammar
+    (see module docstring): shard matches the sha, the extension is empty or a
+    `.`-led run with no `/`, backslash or NUL."""
     if not isinstance(value, str):
-        return False
+        return None
     m = _KEY_RE.fullmatch(value)
     if m is None or m["shard"] != m["sha"][:2]:
-        return False
-    return is_valid_ext(m["ext"] or "")
+        return None
+    return m["sha"]
+
+
+def is_media_key(value: object) -> bool:
+    """True for a well-formed, traversal-safe key (new or legacy-suffixed)."""
+    return key_sha256(value) is not None
+
+
+def find_existing_key(root: Path, sha256: str) -> str | None:
+    """The key of a file already on disk for `sha256` under profile dir `root`,
+    whatever its extension, else `None`. Content-addressed, so any such file
+    already holds the right bytes; reusing it stops a re-derived extension from
+    writing a second copy (reproject of a legacy archive, #62)."""
+    if _SHA_RE.fullmatch(sha256) is None:
+        return None
+    shard_dir = root / MEDIA_PREFIX / sha256[:2]
+    if not shard_dir.is_dir():
+        return None
+    candidates = sorted(
+        e.name for e in shard_dir.iterdir()
+        if e.name.startswith(sha256) and is_media_key(f"{MEDIA_PREFIX}/{sha256[:2]}/{e.name}")
+    )
+    if not candidates:
+        return None
+    return f"{MEDIA_PREFIX}/{sha256[:2]}/{candidates[0]}"
 
 
 def media_dir(settings: Settings, profile: str) -> Path:
@@ -53,7 +79,7 @@ def media_dir(settings: Settings, profile: str) -> Path:
 
 
 def resolve_key_under(root: Path, key: str) -> Path:
-    """Join a key onto `root` (a profile dir). Strict: only canonical keys."""
+    """Join a key onto `root` (a profile dir). Only well-formed keys."""
     if not is_media_key(key):
         raise ValueError("not a media key")
     return root / key
@@ -68,10 +94,17 @@ def normalize_legacy_location(value: str, sha256: str) -> str:
     """Map a legacy stored location (relative, absolute, any separator) to a key.
 
     Anchored on the sha, not on directory structure: the filename is the
-    substring of `value` starting at `sha256`. Raises `ValueError` when the
-    value does not contain its own sha; never guesses.
+    substring of `value` starting at `sha256`. The legacy extension is kept
+    verbatim (it names the file on disk) provided it is traversal-safe.
+    Raises `ValueError` when the value does not contain its own sha or the
+    result is not a well-formed key; never guesses.
     """
+    if _SHA_RE.fullmatch(sha256) is None:
+        raise ValueError("media key: sha256 must be 64 lowercase hex characters")
     i = value.find(sha256)
     if i < 0:
         raise ValueError("legacy media location does not contain its sha256")
-    return media_key(sha256, value[i + len(sha256) :])
+    key = f"{MEDIA_PREFIX}/{sha256[:2]}/{sha256}{value[i + len(sha256) :]}"
+    if not is_media_key(key):
+        raise ValueError("legacy media location has an unsafe extension")
+    return key
