@@ -146,6 +146,10 @@ class Settings(BaseSettings):
     # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
     # stored message, exceeds this many MB (10^6 bytes). None = no cap.
     media_max_mb: int | None = Field(default=None, ge=1)
+    # `--media-min-free-gb` (issue #53): floor of free space on the media
+    # volume. Checked before each download against `free - declared size`;
+    # the media phase stops cleanly when it would be crossed. 0 disables.
+    media_min_free_gb: float = Field(default=5.0, ge=0)
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 

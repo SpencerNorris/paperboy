@@ -202,6 +202,11 @@ def collect(
         None, "--media-max-mb", min=1,
         help="With --media: skip any file larger than this many MB (size as Telegram records it).",
     ),
+    media_min_free_gb: float = typer.Option(
+        None, "--media-min-free-gb", min=0.0,
+        help="With --media: stop the media phase when free disk on the media volume, minus "
+             "the next file's declared size, would fall below this many GB (default 5).",
+    ),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -241,6 +246,8 @@ def collect(
             raise typer.BadParameter(str(exc), param_hint="--media-msgs") from None
     if media_max_mb is not None:
         overrides["media_max_mb"] = media_max_mb
+    if media_min_free_gb is not None:
+        overrides["media_min_free_gb"] = media_min_free_gb
     if unsafe:
         overrides["unsafe"] = True
     settings = load_settings(profile, overrides)
