@@ -1,5 +1,7 @@
 import hashlib
+import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -85,7 +87,8 @@ async def test_document_downloads_hashes_and_records_media_and_custody(tmp_path)
         assert res.counts["downloaded"] == 1
         assert gw.download_media_calls == [1]
 
-        expected_path = tmp_path / "p" / "media" / sha[:2] / f"{sha}.pdf"
+        key = f"media/{sha[:2]}/{sha}.pdf"
+        expected_path = tmp_path / "p" / key
         assert expected_path.exists()
         assert expected_path.read_bytes() == data
 
@@ -96,7 +99,7 @@ async def test_document_downloads_hashes_and_records_media_and_custody(tmp_path)
         assert row["mime_type"] == "application/pdf"
         assert row["file_name"] == "report.pdf"
         assert row["size"] == len(data)
-        assert row["path"] == str(expected_path)
+        assert row["path"] == key
         assert row["downloaded_at"] is not None
         assert row["exif_json"] is None
 
@@ -105,7 +108,13 @@ async def test_document_downloads_hashes_and_records_media_and_custody(tmp_path)
         ).fetchall()
         assert len(custody) == 1
         assert custody[0]["source_message_uri"] == "tg:msg:5/1"
-        assert custody[0]["path"] == str(expected_path)
+        assert custody[0]["path"] == key
+        payload = json.loads(
+            st.conn.execute(
+                "SELECT payload_json FROM raw_records WHERE kind='MediaDownload'"
+            ).fetchone()["payload_json"]
+        )
+        assert payload["path"] == key
 
         raw_kinds = [
             r["kind"] for r in st.conn.execute("SELECT kind FROM raw_records").fetchall()
@@ -379,3 +388,30 @@ async def test_media_max_mb_downloads_when_size_unknown(tmp_path):
         res = await MediaCollector().collect(_ctx(st, gw, settings))
     assert gw.download_media_calls == [1]
     assert res.counts["too_large"] == 0
+
+
+@pytest.mark.asyncio
+async def test_key_is_identical_from_any_cwd_and_data_dir_form(tmp_path, monkeypatch):
+    """The stored key never depends on cwd or on how data_dir was spelled (#62)."""
+    monkeypatch.chdir(tmp_path)
+    data = b"%PDF-1.4 same bytes"
+    sha = hashlib.sha256(data).hexdigest()
+    key = f"media/{sha[:2]}/{sha}.pdf"
+    for name, data_dir in (("a", Path("data")), ("b", tmp_path / "data2")):
+        settings = load_settings("default", {"data_dir": data_dir})
+        gw = FakeGateway({"media": {1: data}})
+        with Store.open(tmp_path / f"{name}.sqlite") as st:
+            _seed(st, _doc_msg(1))
+            await MediaCollector().collect(_ctx(st, gw, settings))
+            row = st.conn.execute("SELECT path FROM media WHERE sha256=?", (sha,)).fetchone()
+            assert row["path"] == key
+    assert (tmp_path / "data" / "p" / key).read_bytes() == data
+    assert (tmp_path / "data2" / "p" / key).read_bytes() == data
+
+
+def test_guess_ext_drops_unusable_suffix(caplog):
+    from paperboy.collectors.media import _guess_ext
+
+    with caplog.at_level(logging.WARNING):
+        assert _guess_ext("document", None, "report.pdf ") == ""
+    assert _guess_ext("document", None, "clip.MP4") == ".MP4"

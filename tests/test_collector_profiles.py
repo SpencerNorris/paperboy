@@ -436,8 +436,11 @@ async def test_photo_history_and_avatar_download_are_content_addressed(tmp_path)
         media = st.conn.execute("select kind, message_uri, path, mime_type from media").fetchall()
         assert {m["kind"] for m in media} == {"avatar"}
         assert all(m["message_uri"] is None for m in media)
-        media_dir = str(tmp_path / "p" / "media")
-        assert all(m["path"].startswith(media_dir) and m["path"].endswith(".jpg") for m in media)
+        sha_keys = {
+            f"media/{sha[:2]}/{sha}.jpg"
+            for (sha,) in st.conn.execute("select sha256 from user_photos")
+        }
+        assert {m["path"] for m in media} == sha_keys
         custody = st.conn.execute(
             "select count(*) from custody_log where source_message_uri is null"
         ).fetchone()[0]

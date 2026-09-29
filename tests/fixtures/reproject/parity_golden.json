@@ -33,7 +33,7 @@
  "custody_log": [
   {
    "id": 1,
-   "path": "<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
+   "path": "media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
    "recorded_at": "2026-01-01T00:00:00+00:00",
    "sha256": "7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd",
    "source_message_uri": "tg:msg:5/2"
@@ -90,7 +90,7 @@
    "kind": "document",
    "message_uri": "tg:msg:5/2",
    "mime_type": "text/plain",
-   "path": "<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
+   "path": "media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
    "sha256": "7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd",
    "size": 13
   }
@@ -306,7 +306,7 @@
    "id": 15,
    "kind": "MediaDownload",
    "observed_at": "2026-01-01T00:00:00+00:00",
-   "payload_json": "{\"file_name\": \"a.txt\", \"kind\": \"document\", \"message_uri\": \"tg:msg:5/2\", \"mime_type\": \"text/plain\", \"path\": \"<DATA_DIR>/default/media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt\", \"sha256\": \"7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd\", \"size\": 13}",
+   "payload_json": "{\"file_name\": \"a.txt\", \"kind\": \"document\", \"message_uri\": \"tg:msg:5/2\", \"mime_type\": \"text/plain\", \"path\": \"media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt\", \"sha256\": \"7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd\", \"size\": 13}",
    "run_id": "run-0001",
    "tier": "stranger"
   },

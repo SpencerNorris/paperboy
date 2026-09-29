@@ -24,7 +24,7 @@ _KEY_RE = re.compile(
 )
 
 
-def _valid_ext(ext: str) -> bool:
+def is_valid_ext(ext: str) -> bool:
     return ext == "" or (_EXT_RE.fullmatch(ext) is not None and ".." not in ext)
 
 
@@ -32,7 +32,7 @@ def media_key(sha256: str, ext: str) -> str:
     """The single constructor of media keys. Raises `ValueError` on bad input."""
     if _SHA_RE.fullmatch(sha256) is None:
         raise ValueError("media key: sha256 must be 64 lowercase hex characters")
-    if not _valid_ext(ext):
+    if not is_valid_ext(ext):
         raise ValueError(f"media key: unusable extension {ext!r}")
     return f"{MEDIA_PREFIX}/{sha256[:2]}/{sha256}{ext}"
 
@@ -44,7 +44,7 @@ def is_media_key(value: object) -> bool:
     m = _KEY_RE.fullmatch(value)
     if m is None or m["shard"] != m["sha"][:2]:
         return False
-    return _valid_ext(m["ext"] or "")
+    return is_valid_ext(m["ext"] or "")
 
 
 def media_dir(settings: Settings, profile: str) -> Path:
