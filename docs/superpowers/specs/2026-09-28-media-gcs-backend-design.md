@@ -21,8 +21,13 @@ into a noncurrent version, and no version can be permanently destroyed until
 it is 365 days old (verified on this bucket on 2026-09-28). So the "upload to
 `incoming/<uuid>`, server-side copy to the final key, delete the temp"
 pattern from #63's first draft would keep — and bill — a second copy of every
-file for a year (~150 GB of duplicates for the pending pull). Re-verify the
-bucket's policy before implementing; this section assumes it unchanged.
+file for a year (~150 GB of duplicates for the pending pull).
+
+The operator intends to **shorten the retention span** (decision 2026-09-28;
+the policy is unlocked, so it can be reduced). The design below doesn't
+depend on the value: writing each object exactly once, to its final key, is
+correct for any retention setting and never creates duplicates. Re-check the
+bucket's current policy before the smoke and quote it in the ADR.
 
 **Therefore: only ever write an object once, to its final key.** The final
 key needs the sha256, which is known only after the whole file has streamed.
@@ -79,17 +84,19 @@ So:
   `if_generation_match`) vs. the JSON API over `httpx` + `google-auth`.
   Recommend the former for correctness of resumable upload; the ADR records
   the choice.
-- **Replay / reproject — open question for the planner.** Reproject has a
-  hard **zero-network** invariant. Today `RawReplayGateway.download_media`
-  reads the stored bytes back; with a GCS store that would be a network read.
-  Recommended resolution: replay does not need the bytes at all — the raw
-  `MediaDownload` payload already records `sha256`/`size`, and the object is
-  content-addressed and create-only. So replay should report the recorded
-  sha/size to the collector and the collector's `exists(key)` dedup path
-  records custody without reading bytes. That changes what reproject
-  verifies (it no longer re-hashes files), so it needs an explicit decision —
-  and an offline `paperboy verify-media` could be the replacement integrity
-  check (out of scope here; file it if chosen).
+- **Replay / reproject — decision (operator, 2026-09-28): the no-network
+  rule bends for GCS reads.** When the source store's media lives in GCS,
+  `RawReplayGateway.download_media` streams the object from the configured
+  bucket via `MediaStore.open_read(key)` into the sink, exactly as it reads a
+  local file today, so reproject keeps re-hashing every file (its integrity
+  property is unchanged). The amended invariant, recorded in ADR-0008 and in
+  `docs/features/reproject.md`:
+  - **Still absolute:** reproject never touches Telegram — no session, no
+    `TelethonGateway`, no `Budget` — and never touches `t.me` or
+    `web.archive.org`.
+  - **Allowed:** read-only GETs to the one configured media bucket, with ADC
+    credentials. No writes, no deletes, no other host.
+  - A reproject with a local media store stays fully offline, as today.
 
 ## 4. Tests (write first, see them fail)
 
@@ -103,8 +110,12 @@ So:
   suite.
 - Bucket not in the allow-list → config error at load.
 - `doctor` permission check (fake `testIamPermissions`).
-- Reproject with a GCS-configured source performs zero network I/O (patch
-  the GCS client constructor to raise).
+- Reproject with a GCS-configured source: reads bytes only through
+  `MediaStore.open_read` on the configured bucket (fake records every call:
+  reads only, zero writes/deletes), and still constructs no Telegram client
+  (existing zero-Telegram guard test extended to this configuration).
+- Reproject with a local store performs zero network I/O (patch the GCS
+  client constructor to raise).
 
 ## 5. Ops prerequisites (operator, not code)
 
@@ -118,7 +129,8 @@ So:
 ## 6. Definition of done (smoke on real data)
 
 On the VM with a test prefix (e.g. `paperboy/smoke-<date>/` — objects
-written there are retained for 365 days; keep it to two small files):
+written there are kept for the bucket's full retention span; keep it to two
+small files):
 
 ```
 PAPERBOY_MEDIA_STORE=gs://<bucket>/paperboy/smoke-<date> \

@@ -12,7 +12,8 @@ handed to one implementing agent on its own.
 |---|---|---|---|
 | [`2026-09-28-media-relative-paths-design.md`](2026-09-28-media-relative-paths-design.md) | #62 | 1 | Stored locations must be portable before the store moves to the VM / media to GCS |
 | [`2026-09-28-media-streaming-design.md`](2026-09-28-media-streaming-design.md) | #64, #53 | 1 | A 2.4 GB file must not be held in RAM; the disk must not fill silently |
-| [`2026-09-28-media-list-fetch-design.md`](2026-09-28-media-list-fetch-design.md) | #68 | 2 | The pull is driven by a cross-channel CSV, not one target |
+| [`2026-09-28-pacing-safety-factor-design.md`](2026-09-28-pacing-safety-factor-design.md) | #69 | 2 (first) | Operator policy: double every assumed wait and every server-mandated wait |
+| [`2026-09-28-media-list-fetch-design.md`](2026-09-28-media-list-fetch-design.md) | #68 | 2 (after #69) | The pull is driven by a cross-channel CSV, not one target |
 | [`2026-09-28-media-gcs-backend-design.md`](2026-09-28-media-gcs-backend-design.md) | #63 | 2 (after #68, or in parallel with it) | The VM's disk is smaller than the pull |
 
 ## Run order
@@ -20,8 +21,8 @@ handed to one implementing agent on its own.
 - **Batch 1 — `federated-run`, 2 features in parallel:** #62 and #64 on
   `dev/media-storage`. They share one file (`collectors/media.py`); the
   ownership split in §"Seams" below keeps the conflict to a few lines.
-- **Batch 2:** #68 then #63 (or both in parallel — they touch different
-  layers; see each spec's "Depends on").
+- **Batch 2:** #69 (pacing) first, then #68 and #63 (in parallel is fine —
+  they touch different layers; see each spec's "Depends on").
 - **Mac fallback** is possible after batch 1 + #68: the data volume had
   190 GiB free on 2026-09-28, so the full pull fits but leaves ~44 GiB; P1+P2
   (~90 GB) is comfortable. Set the #64 free-disk floor accordingly. **VM

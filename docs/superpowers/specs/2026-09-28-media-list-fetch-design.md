@@ -2,9 +2,12 @@
 
 **Status:** draft for Gate A, 2026-09-28. **Tracking:** issue #68.
 **Batch:** 2. **Depends on:** #64 (streaming; the pending list holds files up
-to 2.4 GB) and #62 (the report prints stable keys). Independent of #63.
+to 2.4 GB), #62 (the report prints stable keys) and #69 (pacing safety
+factor). Independent of #63.
 **No ADR needed:** a new recipe over the existing `media` collector; storage
-is unchanged.
+is unchanged. (The optional pre-resolved channel context in
+`collect_channel` is a recipe change; note it in ADR-0005's consequences,
+since it adds a replay marker.)
 
 ## 1. Goal
 
@@ -53,7 +56,8 @@ Module: `src/paperboy/media_list.py` —
    files first.
 3. **Each segment is one ordinary pass:** `recipes.collect_channel(...,
    phases=["channel", "media"], media=True)` with `media_msgs` set to the
-   segment's ids. This reuses budget, guardrails, dedup, custody, streaming,
+   segment's ids (later segments of an already-resolved channel skip
+   `channel` — see the decision below). This reuses budget, guardrails, dedup, custody, streaming,
    `--media-max-mb`, the free-disk floor — and **`reproject` replays it with
    no new code**, because each segment is a normal collect run (ADR-0005).
    One gateway (one MTProto session, one `Budget`) is shared across all
@@ -69,13 +73,27 @@ Module: `src/paperboy/media_list.py` —
    `too_large`, `size_mismatch`, `unavailable`, `skipped`). Other collectors
    leave it `None`.
 
-**Open question for the planner — `resolveUsername` volume.** The design
-resolves each channel once per segment (≤ 44 calls here). That's within
-normal limits, but `contacts.resolveUsername` is one of Telegram's most
-flood-limited methods. If the live smoke shows flood waits, the fix is a
-small recipe change: let `collect_channel` accept a pre-resolved
-`input_channel` so later segments of the same channel skip the `channel`
-phase. Measure first; don't build it speculatively.
+**Decision — resolve each channel once per run (operator, 2026-09-28: be
+conservative with the API).** `contacts.resolveUsername` is one of
+Telegram's most flood-limited methods, so the command must not re-resolve a
+channel for every segment (that would be ≤ 44 calls here instead of 11):
+
+- The first segment of a channel runs the `channel` phase as normal; its
+  resolved `input_channel`/`channel_id` are cached in-process for the rest of
+  the command (never persisted — access hashes rotate).
+- Later segments of that channel run `media` only, with the cached context.
+  This needs a small, explicit recipe change: `collect_channel` accepts an
+  optional pre-resolved channel context and, when given, skips the `channel`
+  phase instead of requiring it.
+- **Reproject must still replay those runs.** A media-only run has no
+  channel-phase raws to rebuild context from, so each such run appends one
+  raw marker (e.g. kind `ChannelContextReused`, payload `{channel_id,
+  source_run_id}` — no access hash) that the replay recipe uses to establish
+  context. Acceptance test: reproject parity over a store containing a
+  multi-segment fetch-media run.
+- All pacing goes through `Budget` with the #69 safety factor (effective
+  10 s between `resolveUsername` calls, 2 s between per-file calls).
+- **Depends on #69** landing first.
 
 ## 4. Unresolvable rows
 
