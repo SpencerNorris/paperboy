@@ -261,6 +261,8 @@ async def reproject(
     profile: str,
     phases: list[str] | None,
     log: logging.Logger,
+    *,
+    target_filter: TargetFilter | None = None,
 ) -> ReprojectSummary:
     """Replay every historical collect pass in the source, one run at a time
     (ADR-0005): each run gets its own `ReplayClock`/`RawReplayGateway`/
@@ -270,15 +272,49 @@ async def reproject(
     faithfully re-reprojectable. `out_store` accumulates state across
     replayed runs exactly as the live store did across the real runs
     (`sync_state`, snapshot/metric time series, ...).
+
+    `target_filter` (#70) restricts the replay to the `(run, raw target)`
+    pairs it selects; the rest are not replayed at all, so the output holds no
+    raw rows, projections or media for them.
     """
     runs = source.runs()
     if not runs:
         raise ReprojectError("source raw log is empty — nothing to reproject")
 
+    decisions: dict[str, dict[str, bool]] = {}
+    records_by_run: dict[str, list[ResolveRecord]] = {}
+    if target_filter is not None:
+        for rec in source.resolve_catalogue():
+            records_by_run.setdefault(rec.run_id, []).append(rec)
+        decisions = {rid: target_filter.decide_run(recs) for rid, recs in records_by_run.items()}
+    pairs_replayed = pairs_skipped = runs_touched = 0
+
     results: dict[str, list[CollectResult]] = {}
     phases_seen: list[str] = []
     replayed_any = False
     for run in runs:
+        run_decisions = decisions.get(run.run_id)
+        if target_filter is not None and run_decisions is not None:
+            recs = records_by_run[run.run_id]
+            for rec in recs:
+                log.info(
+                    "reproject: run=%s target=%s channel_id=%s decision=%s",
+                    run.run_id, rec.raw_target,
+                    rec.channel_id if rec.channel_id is not None else "none",
+                    "included" if run_decisions[rec.raw_target] else "excluded",
+                )
+            if is_mixed_run(target_filter, recs):
+                log.warning(
+                    "reproject: run %s mixes channel targets that land in different outputs; "
+                    "its non-channel (stray) resolve is replayed in BOTH",
+                    run.run_id,
+                )
+            kept = sum(run_decisions.values())
+            pairs_replayed += kept
+            pairs_skipped += len(recs) - kept
+            if not kept:
+                continue  # no index build, no replay for a wholly excluded run
+            runs_touched += 1
         _reset_incremental_backfill_state(out_store)
         # Per-run replay settings (plan D6): allow_join=True so a source whose
         # original run used --join replays its discussion sweep
@@ -319,6 +355,8 @@ async def reproject(
                 run.run_id, run.lo, run.hi, run.hi - run.lo + 1,
             )
         for raw_target in run_targets:
+            if run_decisions is not None and not run_decisions[str(raw_target)]:
+                continue  # logged above; belongs to the other output
             replayed_any = True
             clock = ReplayClock()
             gateway = RawReplayGateway(source, clock, run)
@@ -356,6 +394,17 @@ async def reproject(
                     CollectResult(name="target", counts={}, stopped=f"error: {exc}")
                 ]
             results.setdefault(raw_target, []).extend(run_results)
+    if target_filter is not None:
+        log.info(
+            "reproject: targets replayed=%d skipped=%d runs_touched=%d filter=%s ids=%s",
+            pairs_replayed, pairs_skipped, runs_touched, target_filter.mode,
+            sorted(target_filter.ids),
+        )
+        if not replayed_any:
+            raise ReprojectError(
+                f"--{target_filter.mode}-target leaves nothing to replay: every "
+                "(run, target) pair in the source is filtered out"
+            )
     if not replayed_any:
         raise ReprojectError(
             "source has no resolve records in raw_records — nothing to reproject"

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -21,7 +24,7 @@ from paperboy.collectors.media import MediaCollector
 from paperboy.config import load_settings
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ResolveRecord
-from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
+from paperboy.reproject import ReprojectError, TargetFilter, reproject, resolve_target_filter
 from paperboy.store.db import Store
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
@@ -116,6 +119,177 @@ def _add_stray_user_resolve(db: Path, target: str = "@stray") -> None:
             {"_": "contacts.ResolvedPeer", "peer": {"_": "PeerUser", "user_id": 9},
              "chats": [], "users": []},
             "stranger", {"target": target}, observed_at="2026-01-01T00:00:00+00:00",
+        )
+
+
+# --- filtered replay ----------------------------------------------------------
+
+_PAIR_LOG = re.compile(
+    r"reproject: run=(?P<run>\S+) target=(?P<target>\S+) channel_id=(?P<cid>\S+) "
+    r"decision=(?P<decision>included|excluded)"
+)
+
+
+def run_filtered(
+    data_dir: Path, out: Path, *, include=(), exclude=(), caplog=None
+) -> dict:
+    """Call `reproject()` directly (no CLI) and return `{pair: decision}`
+    parsed from the per-pair INFO lines when `caplog` is given."""
+    db = data_dir / "default" / "paperboy.sqlite"
+    settings = load_settings("default", {"data_dir": data_dir})
+    log = logging.getLogger("paperboy.test.split")
+    if caplog is not None:
+        caplog.set_level(logging.INFO, logger=log.name)
+    with ReplaySource.open(db, data_dir / "default") as src, Store.open(out) as store:
+        flt = resolve_target_filter(src, list(include), list(exclude))
+        asyncio.run(reproject(src, store, settings, "default", None, log, target_filter=flt))
+    if caplog is None:
+        return {}
+    return {
+        (m["run"], m["target"]): m["decision"]
+        for rec in caplog.records
+        if (m := _PAIR_LOG.search(rec.getMessage()))
+    }
+
+
+def _count(db: Path, sql: str, *params) -> int:
+    with closing(sqlite3.connect(db)) as conn:
+        return conn.execute(sql, params).fetchone()[0]
+
+
+def _leaks(db: Path, ids: tuple[int, ...]) -> dict[str, int]:
+    marks = ",".join("?" * len(ids))
+    q = {
+        "messages": f"SELECT count(*) FROM messages WHERE channel_id IN ({marks})",
+        "channels": f"SELECT count(*) FROM channels WHERE id IN ({marks})",
+        "raw_ctx": "SELECT count(*) FROM raw_records WHERE "
+                   f"json_extract(context_json,'$.channel_id') IN ({marks})",
+        "raw_resolve": "SELECT count(*) FROM raw_records WHERE lower(kind) LIKE '%resolvedpeer' "
+                       "AND json_extract(context_json,'$.target') = '@beta'",
+        "media": "SELECT count(*) FROM media m JOIN messages s ON m.message_uri=s.uri "
+                 f"WHERE s.channel_id IN ({marks})",
+        "custody": "SELECT count(*) FROM custody_log c JOIN messages s "
+                   f"ON c.source_message_uri=s.uri WHERE s.channel_id IN ({marks})",
+    }
+    out = {}
+    for name, sql in q.items():
+        out[name] = _count(db, sql, *(() if name == "raw_resolve" else ids))
+    return out
+
+
+def test_exclude_target_output_has_no_rows_for_the_channel_or_its_linked_group(tmp_path):
+    seed_two_target_source(tmp_path)
+    full, clean = tmp_path / "full.sqlite", tmp_path / "clean.sqlite"
+    run_filtered(tmp_path, full)
+    run_filtered(tmp_path, clean, exclude=["@beta"])
+    assert _leaks(clean, (BETA_ID, BETA_GROUP_ID)) == dict.fromkeys(
+        ("messages", "channels", "raw_ctx", "raw_resolve", "media", "custody"), 0
+    )
+    # the unfiltered reprojection does carry them (the leak query can fail)
+    assert _leaks(full, (BETA_ID, BETA_GROUP_ID))["messages"] > 0
+    # alpha's projections are identical to an unfiltered reproject's
+    for table, where in (
+        ("messages", "channel_id = 5"), ("channels", "id = 5"),
+        ("media", "message_uri LIKE 'tg:msg:5/%'"),
+        ("custody_log", "source_message_uri LIKE 'tg:msg:5/%'"),
+    ):
+        assert _rows(clean, table, where) == _rows(full, table, where), table
+
+
+def test_include_target_output_has_only_that_channel(tmp_path):
+    seed_two_target_source(tmp_path)
+    out = tmp_path / "beta.sqlite"
+    run_filtered(tmp_path, out, include=["@beta"])
+    assert _count(out, "SELECT count(*) FROM messages WHERE channel_id NOT IN (6, 77)") == 0
+    assert _count(out, "SELECT count(*) FROM messages WHERE channel_id = 77") > 0
+    assert _count(out, "SELECT count(*) FROM messages WHERE channel_id = 6") > 0
+    assert _count(out, "SELECT count(*) FROM channels WHERE id = 5") == 0
+
+
+def test_include_and_exclude_partition_the_source(tmp_path, caplog):
+    seed_two_target_source(tmp_path)
+    inc = run_filtered(tmp_path, tmp_path / "inc.sqlite", include=["@beta"], caplog=caplog)
+    caplog.clear()
+    exc = run_filtered(tmp_path, tmp_path / "exc.sqlite", exclude=["@beta"], caplog=caplog)
+    with ReplaySource.open(tmp_path / "default" / "paperboy.sqlite", tmp_path / "default") as src:
+        catalogue = {(r.run_id, r.raw_target) for r in src.resolve_catalogue()}
+    assert set(inc) == set(exc) == catalogue
+    assert all({inc[p], exc[p]} == {"included", "excluded"} for p in catalogue)
+    # Replay re-records exactly what the source held, run by run, so the two
+    # outputs' raw rows add up to an unfiltered reprojection's.
+    run_filtered(tmp_path, tmp_path / "full.sqlite")
+    raw = "SELECT count(*) FROM raw_records"
+    assert _count(tmp_path / "inc.sqlite", raw) + _count(tmp_path / "exc.sqlite", raw) == _count(
+        tmp_path / "full.sqlite", raw
+    )
+
+
+def test_reproject_summary_line_counts_replayed_and_skipped(tmp_path, caplog):
+    seed_two_target_source(tmp_path)
+    run_filtered(tmp_path, tmp_path / "o.sqlite", exclude=["@beta"], caplog=caplog)
+    summary = [r.getMessage() for r in caplog.records if "targets replayed=" in r.getMessage()]
+    assert summary == [
+        "reproject: targets replayed=1 skipped=1 runs_touched=1 filter=exclude ids=[6]"
+    ]
+
+
+def test_reproject_that_filters_everything_out_is_an_error(tmp_path):
+    seed_two_target_source(tmp_path)
+    with pytest.raises(ReprojectError, match="nothing to replay"):
+        run_filtered(tmp_path, tmp_path / "o.sqlite", exclude=["@alpha", "@beta"])
+
+
+def test_stray_user_resolve_goes_with_the_channel_of_its_run(tmp_path, caplog):
+    db = seed_two_target_source(tmp_path)
+    _add_stray_user_resolve(db)  # lands in @beta's run
+    inc = run_filtered(tmp_path, tmp_path / "inc.sqlite", include=["@beta"], caplog=caplog)
+    caplog.clear()
+    exc = run_filtered(tmp_path, tmp_path / "exc.sqlite", exclude=["@beta"], caplog=caplog)
+    stray = [p for p in inc if p[1] == "@stray"]
+    assert len(stray) == 1
+    assert inc[stray[0]] == "included" and exc[stray[0]] == "excluded"
+    # the stray resolve's raw row is out of the clean output, in the split-out one
+    assert _count(tmp_path / "exc.sqlite",
+                  "SELECT count(*) FROM raw_records WHERE json_extract(context_json,"
+                  "'$.target') = '@stray'") == 0
+    assert _count(tmp_path / "inc.sqlite",
+                  "SELECT count(*) FROM raw_records WHERE json_extract(context_json,"
+                  "'$.target') = '@stray'") == 1
+
+
+def test_stray_in_a_mixed_run_is_replayed_in_both_outputs_with_a_warning(tmp_path, caplog):
+    seed_two_target_source(tmp_path)
+    # Two channel targets in ONE run: rewrite @alpha's raw rows into @beta's run.
+    db = tmp_path / "default" / "paperboy.sqlite"
+    with closing(sqlite3.connect(db)) as conn:
+        beta_run = conn.execute(
+            "SELECT run_id FROM raw_records WHERE json_extract(context_json,'$.target')='@beta'"
+        ).fetchone()[0]
+        conn.execute("UPDATE raw_records SET run_id = ?", (beta_run,))
+        conn.commit()
+    _add_stray_user_resolve(db)
+    for mode in ("include", "exclude"):
+        caplog.clear()
+        decisions = run_filtered(
+            tmp_path, tmp_path / f"{mode}.sqlite", caplog=caplog, **{mode: ["@beta"]}
+        )
+        assert decisions[(beta_run, "@stray")] == "included"
+        assert any(
+            r.levelno == logging.WARNING and beta_run in r.getMessage()
+            and "stray" in r.getMessage().lower()
+            for r in caplog.records
+        ), mode
+
+
+def _rows(db: Path, table: str, where: str) -> list[tuple]:
+    with closing(sqlite3.connect(db)) as conn:
+        cols = [
+            c[1] for c in conn.execute(f"PRAGMA table_info({table})")
+            if c[1] not in ("id", "run_id", "source_raw_id", "raw_id")
+        ]
+        return sorted(
+            conn.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE {where}").fetchall(),
+            key=repr,
         )
 
 
