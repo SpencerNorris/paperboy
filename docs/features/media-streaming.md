@@ -63,7 +63,8 @@ not fill the disk.
   temp copy, so a read-only source works and needs no spare disk. The
   collector finds the destination present (or the same bytes under a legacy
   name) and records rows only; if neither exists the message is counted
-  `skipped` with a warning. Replay also forces `media_min_free_gb=0`. The
+  `skipped` with a warning. Replay never consults the free-disk floor (the
+  collector gates it on `gateway.replay`). The
   sweep therefore runs only in live collect; concurrent live runs on one
   profile are unsupported (one session per auth key).
 - **Durability.** `MediaSink.close()` fsyncs before the rename, so an OS crash

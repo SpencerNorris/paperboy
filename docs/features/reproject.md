@@ -134,7 +134,22 @@ operator can eyeball the correction before swapping files.
   only, so no final-name file is ever created or replaced; the test asserts
   `os.replace` is never called and every stored file's size and sha are
   unchanged. Replay uses a file-less hash-and-count sink (#64), so it writes
-  nothing into the source profile: a read-only source `media/` works (tested).
+  nothing into the source profile: a read-only source profile works (tested
+  by a size+mtime digest of the whole profile before and after).
+- **Log beside `--out`.** `reproject` writes `<out stem>.log` (default
+  `paperboy.reprojected.log`), never into the source profile's
+  `paperboy.log`.
+- **WAL source in a read-only directory.** The source is opened `mode=ro`. A
+  WAL database whose `-shm`/`-wal` sidecars are absent, in a directory the
+  process cannot write, cannot be opened that way (SQLite must create the
+  sidecars; https://sqlite.org/wal.html, "Read-only databases"). `reproject`
+  then falls back to `immutable=1` and logs a WARNING: the source must not be
+  written concurrently while it is read. Both paths are tested. (A source that
+  is being written by a live `collect` should be `.backup`ed first.)
+- **Free-disk floor never consulted in replay** (tested by making
+  `shutil.disk_usage` raise). A stored file that is missing is `skipped` with
+  a WARNING and gets no `media` row. See the "Replay smoke (spec §4.1)" in
+  `media-streaming.md`.
 
 ## Design deviations from the spec (D4, plan §"Locked design decisions")
 

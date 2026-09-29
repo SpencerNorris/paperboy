@@ -61,7 +61,8 @@ receipts, with no internet and no credentials. It does this by **replay**: it
 runs the same collectors as a live collect, but plugs in a *fake Telegram*
 (`RawReplayGateway`) that answers every question by looking up the matching
 receipt. The collectors can't tell the difference, so a rebuild matches what a
-live collect would have produced.
+live collect would have produced. Replay only reads the original profile;
+the rebuilt database and its log are written beside `--out`.
 
 ```
 LIVE COLLECT                           REPLAY (reproject)
