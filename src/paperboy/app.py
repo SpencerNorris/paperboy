@@ -16,7 +16,7 @@ from paperboy.budget import Budget
 from paperboy.config import profile_dir
 from paperboy.gateway import TelethonGateway
 from paperboy.logging_setup import register_secret
-from paperboy.replay import ReplaySource
+from paperboy.replay import ReplaySource, ReplaySourceError
 from paperboy.secrets import SERVICE, KeyringSecrets
 from paperboy.store.db import Store
 
@@ -159,4 +159,8 @@ def build_reproject(
         raise ConfigError(
             f"refusing to overwrite existing {out_path} — move it aside or pass a fresh --out"
         )
-    return ReplaySource.open(source_db, profile_dir(settings, profile)), Store.open(out_path)
+    try:
+        source = ReplaySource.open(source_db, profile_dir(settings, profile))
+    except ReplaySourceError as exc:
+        raise ConfigError(str(exc)) from exc
+    return source, Store.open(out_path)

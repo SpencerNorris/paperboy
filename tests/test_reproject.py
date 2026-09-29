@@ -936,3 +936,69 @@ def test_reproject_keeps_legacy_media_with_non_canonical_suffix(tmp_path, monkey
             for path in paths:
                 assert path.endswith(suffix)
                 assert resolve_key_under(tmp_path / "default", path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Immutable fallback guards (WAL contents, missing file)
+# ---------------------------------------------------------------------------
+
+
+def _wal_source(tmp_path, *, keep_wal: bool):
+    """A WAL DB with a live writer holding its `-wal`. Returns (db, writer)."""
+    db = tmp_path / "src" / "paperboy.sqlite"
+    db.parent.mkdir()
+    w = sqlite3.connect(db)
+    w.execute("PRAGMA journal_mode=WAL")
+    w.execute("PRAGMA wal_autocheckpoint=0")
+    w.execute("CREATE TABLE raw_records (id INTEGER PRIMARY KEY, kind TEXT)")
+    w.execute("INSERT INTO raw_records (kind) VALUES ('x')")
+    w.commit()
+    if not keep_wal:
+        w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return db, w
+
+
+def test_immutable_fallback_refused_when_wal_is_non_empty(tmp_path):
+    from paperboy.replay import ReplaySource, ReplaySourceError
+
+    db, w = _wal_source(tmp_path, keep_wal=True)
+    wal = db.with_name(db.name + "-wal")
+    # Simulate an un-checkpointed WAL surviving without its -shm (crash/copy).
+    snapshot = wal.read_bytes()
+    w.close()
+    for sc in db.parent.glob("paperboy.sqlite-*"):
+        sc.unlink()
+    wal.write_bytes(snapshot)
+    assert wal.stat().st_size > 0
+    db.parent.chmod(0o555)
+    try:
+        with pytest.raises(ReplaySourceError, match="checkpoint"):
+            ReplaySource.open(db, db.parent)
+    finally:
+        db.parent.chmod(0o755)
+
+
+def test_immutable_fallback_taken_when_no_wal_file(tmp_path):
+    from paperboy.replay import ReplaySource
+
+    db, w = _wal_source(tmp_path, keep_wal=False)
+    w.close()
+    for sc in db.parent.glob("paperboy.sqlite-*"):
+        sc.unlink()
+    db.parent.chmod(0o555)
+    try:
+        src = ReplaySource.open(db, db.parent)
+        try:
+            assert src.opened_immutable
+            assert src.conn.execute("SELECT count(*) FROM raw_records").fetchone()[0] == 1
+        finally:
+            src.close()
+    finally:
+        db.parent.chmod(0o755)
+
+
+def test_missing_source_file_propagates_sqlite_error(tmp_path):
+    from paperboy.replay import ReplaySource
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        ReplaySource.open(tmp_path / "nope.sqlite", tmp_path)

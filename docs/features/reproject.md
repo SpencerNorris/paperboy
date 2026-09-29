@@ -144,7 +144,12 @@ operator can eyeball the correction before swapping files.
   process cannot write, cannot be opened that way (SQLite must create the
   sidecars; https://sqlite.org/wal.html, "Read-only databases"). `reproject`
   then falls back to `immutable=1` and logs a WARNING: the source must not be
-  written concurrently while it is read. Both paths are tested. (A source that
+  written concurrently while it is read. `immutable=1` ignores the WAL, so the
+  fallback is taken only for a real, existing source with no `-wal` (or an empty
+  one); a non-empty `-wal` in a non-writable directory is refused with an error
+  telling the operator to checkpoint the source from a writable location or
+  make its directory writable. A missing or corrupt source still fails with
+  SQLite's own error. All paths are tested. (A source that
   is being written by a live `collect` should be `.backup`ed first.)
 - **Free-disk floor never consulted in replay** (tested by making
   `shutil.disk_usage` raise). A stored file that is missing is `skipped` with

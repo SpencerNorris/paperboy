@@ -12,6 +12,7 @@ executed (spec §3) — with the documented deviations D4.1–D4.4 in
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -65,6 +66,10 @@ def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
     return "(" + " OR ".join(parts) + ")", tuple(params)
 
 
+class ReplaySourceError(Exception):
+    """The source DB cannot be replayed safely (operator-actionable)."""
+
+
 class ReplaySource:
     """Read-only access to a source DB's raw log + its content-addressed media.
 
@@ -100,7 +105,9 @@ class ReplaySource:
         we fall back to `immutable=1`, which skips locking and sidecars
         entirely. That is only safe if nothing writes the source while we read
         it; the caller reads `opened_immutable` and logs a WARNING (logging is
-        not configured yet when the source is opened).
+        not configured yet when the source is opened). `immutable=1` also
+        ignores the WAL, so the fallback is refused (ReplaySourceError) when a
+        non-empty `-wal` exists.
         """
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -112,6 +119,22 @@ class ReplaySource:
             conn.close()
             if not any(m in str(exc) for m in ("unable to open", "readonly database")):
                 raise
+            # Only the read-only-directory/missing-sidecar case may fall back.
+            # A missing source file or a writable directory is a genuine
+            # error and must surface as SQLite reported it.
+            if not db_path.is_file() or os.access(db_path.parent, os.W_OK):
+                raise
+            # `immutable=1` ignores the WAL entirely: with a non-empty `-wal`
+            # it would silently miss every un-checkpointed commit.
+            wal = db_path.with_name(db_path.name + "-wal")
+            if wal.exists() and wal.stat().st_size > 0:
+                raise ReplaySourceError(
+                    f"source DB has un-checkpointed data in its -wal file and its directory "
+                    f"is not writable, so it cannot be read safely (immutable mode would "
+                    f"ignore the WAL). Checkpoint the source from a writable location "
+                    f"(PRAGMA wal_checkpoint(TRUNCATE)) or make its directory writable: "
+                    f"{db_path.parent}"
+                ) from exc
 
         conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
