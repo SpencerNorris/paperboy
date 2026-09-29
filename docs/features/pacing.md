@@ -54,6 +54,73 @@ phase resumable.
 
 ## Definition-of-done smoke transcript
 
-Offline and live results are recorded below (redacted per the run rules).
+Pasted tool output, redacted (`@<channel>`, `<scratch>` = scratch data dir on
+a copy of the store made with `sqlite3 .backup`; the real store was never
+written). Unredacted logs: `smoke-69-doctor.log`, `smoke-69.log`,
+`smoke-69b.log` in the scratch dir. Live route: VPN (`utun4`) verified
+before each of the 3 live invocations (cap 5), `PAPERBOY_REQUIRE_PROXY=false`,
+no `--unsafe`/`--join`/`--profiles`, `--max-flood-sleep 60`, no media.
 
-_Pending: filled in by the DoD smoke step._
+### Gates
+
+```
+651 passed in 65.01s (0:01:05)
+All checks passed!
+0 errors, 0 warnings, 0 informations
+```
+
+### Offline
+
+```
+$ paperboy collect --help | grep -E "pacing-factor|max-flood-sleep"
+│ --pacing-factor               <float range> [x>=1.0]  Multiply every request │
+│ --max-flood-sleep             <int range> [x>=0]      Longest single         │
+$ paperboy doctor --help | grep -E "pacing-factor|max-flood-sleep"
+│ --pacing-factor          <float range> [x>=1.0]  Multiply every request      │
+│ --max-flood-sleep        <int range> [x>=0]      Longest single FLOOD_WAIT   │
+$ paperboy collect @x --pacing-factor 0.5
+│ Invalid value for '--pacing-factor': 0.5 is not in the range x>=1.0.         │
+exit=2
+$ pragma table_info(flood_log)   # scratch store, after migration 0005
+(4, 'recorded_at', 'TEXT', 1, None, 0), (5, 'applied_seconds', 'INTEGER', 0, None, 0)
+```
+
+### Live (VPN route check passed before each: both DCs -> `utun4`)
+
+`doctor --profile default --max-flood-sleep 60`: every check `ok`, final line `PASS`.
+
+`collect @<channel> --profile default --phases channel,history --max-rpc 30
+--max-flood-sleep 60` (first run, 3 messages, then a second run on another
+channel already in the store):
+
+```
+INFO     pacing: factor=2.0 default=2.0s contacts.resolveUsername=10.0s; flood ceiling=60s
+INFO     ✓ channel · channels=1 peers=2 · 2s
+INFO     ✓ history · messages=3 revisions=0 tombstones=2 edges=0 · 1s
+```
+
+Consecutive same-method calls from the second run's `paperboy.log` (DEBUG
+`rpc <method> attempt` lines; `users.getFullUser` is the collect preflight's
+self-check, then the channel phase's own call):
+
+```
+2026-09-29T04:12:11.206314+00:00 rpc users.getFullUser attempt 1 (run call #1)
+2026-09-29T04:12:13.208717+00:00 rpc users.getFullUser attempt 1 (run call #7)
+```
+
+Gap 2.002 s (>= 2 s = 1 s base x factor 2.0). No FLOOD_WAIT occurred; no
+retry was exercised live.
+
+```
+$ select method, seconds, applied_seconds from flood_log order by rowid desc limit 5
+channels.getMessages|29|
+channels.getMessages|24|
+channels.getMessages|30|
+channels.getMessages|30|
+channels.getMessages|29|
+```
+
+These five rows are pre-#69 history copied from the real store
+(`applied_seconds` is NULL); this run added none (`count(*)` 17,
+`recorded_at` after this run: 0). Long-wait and retry behaviour is proven by
+the fake-clock tests, not by provoking real floods.
