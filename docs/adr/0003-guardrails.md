@@ -1,6 +1,6 @@
 # ADR-0003: Guardrails and opsec as enforced requirements
 
-**Status:** accepted (2026-08-20)
+**Status:** accepted (2026-08-20); amended 2026-09-28 (#69)
 
 ## Problem
 The tool reads sensitive targets with a real Telegram account under ToS that
@@ -29,3 +29,51 @@ The spec §2/§3 rules are product requirements checked in code:
 - Collectors cannot call the gateway raw — the `Budget` gate is mandatory.
 - Some capabilities are deliberately unreachable; that is the point.
 - The human-side opsec steps the tool cannot perform live in `docs/opsec.md`.
+
+## Amendment (2026-09-28, #69): conservative pacing and patient flood handling
+
+### Context
+The original guardrails paced every method at 1 s and treated any `FLOOD_WAIT`
+over 60 s (or a second consecutive one) as a phase stop. The operator's policy
+is to never push Telegram harder than we believe it tolerates, to honour
+server-mandated waits rather than abandon a phase because a wait is long, and
+to keep phases resumable.
+
+### Options considered
+- (a) Keep 1 s pacing and the 60 s stop threshold.
+- (b) Multiply server-mandated waits by a safety factor.
+- (c) Apply the factor only to intervals *we* assume, add a small margin to
+  server waits, and sleep through long waits up to an operator-set ceiling.
+  **Chosen.**
+
+### Decision
+- Every interval `Budget` enforces is `base x pacing_factor` (`--pacing-factor`,
+  `PAPERBOY_PACING_FACTOR`, default 2.0, minimum 1.0). Base intervals are
+  *assumptions*, not measured limits: `contacts.resolveUsername` 5 s, every
+  other method 1 s; `--profile-interval` and the web collector scale the same way.
+- A server `FLOOD_WAIT` of `s` seconds is waited as `applied = ceil(s x 1.1) + 5`.
+  The margin avoids re-calling at the exact instant the window closes; it is
+  not a multiplier because the server's number is not a guess.
+  `flood_log` records both `seconds` and `applied_seconds`; the persisted
+  cooldown uses `applied`.
+- The ceiling is `flood_sleep_threshold` (default raised 60 -> 3600 s,
+  `--max-flood-sleep`). `applied <= ceiling` is slept through with an INFO
+  heartbeat every 60 s; `applied > ceiling` persists the cooldown and stops the
+  phase (the next run waits it out).
+- Up to 3 consecutive flood waits per call are slept and retried; a 4th stops
+  the phase. Transient network errors retry 3 times at 5/10/20 s x factor;
+  a 4th stops the phase. Every retry counts toward `max_rpc_per_run`.
+- Unchanged: `PEER_FLOOD` / `FROZEN_METHOD_INVALID` / `AUTH_KEY_DUPLICATED` are
+  hard stops; Telethon's own `flood_sleep_threshold: 0` stays, so every wait
+  passes through `Budget`.
+
+### Consequences
+- Runs are slower by default (2x) and can sleep up to an hour per wait; the
+  heartbeat keeps that visible. Operators wanting the old behaviour pass
+  `--pacing-factor 1 --max-flood-sleep 60`.
+- Retried calls re-invoke the factory, so streaming callers must reset state
+  per attempt.
+
+### Notes
+Spec: `docs/superpowers/specs/2026-09-28-pacing-safety-factor-design.md`.
+Plan: `docs/superpowers/plans/2026-09-28-pacing-safety-factor.md`. Issue #69.

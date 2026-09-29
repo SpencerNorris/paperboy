@@ -6,6 +6,7 @@ every real object gets built here so tests can monkeypatch one seam
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -131,6 +132,9 @@ async def build_gateway(
     """
     client = build_client(settings, secrets, profile)
     budget = Budget(settings, store, method_intervals=profile_method_intervals(settings))
+    logging.getLogger("paperboy.app").info(
+        "pacing: %s; flood ceiling=%ds", budget.describe_pacing(), settings.flood_sleep_threshold
+    )
     await client.connect()
     return TelethonGateway(client, budget)
 

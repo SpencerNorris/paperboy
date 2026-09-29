@@ -27,8 +27,9 @@ from paperboy.web.client import WebClient, WebGetter
 from paperboy.web.tme_parser import TmePost, parse_tme_page
 from paperboy.web.wayback import cdx_timestamp_to_iso, parse_cdx_rows
 
-# Safety bound on `?before=` pagination depth and the pacing delay between
+# Safety bound on `?before=` pagination depth and the BASE pacing delay between
 # HTTP requests — code constants (spec: not user config), like the allow-list.
+# The delay actually applied is base x `Settings.pacing_factor` (#69).
 _MAX_TME_PAGES = 50
 _WAYBACK_CDX_LIMIT = 10000  # cap the CDX response (durov has ~775k captures = 112MB unbounded)
 _DEFAULT_MIN_INTERVAL_SECONDS = 1.0
@@ -112,6 +113,8 @@ class WebCollector:
     ) -> None:
         self._client = client
         self._min_interval = min_interval
+        # Base x `pacing_factor`; set from the run's settings in `collect()`.
+        self._interval = min_interval
         self._sleep: Callable[[float], None] = sleep or time.sleep
 
     def applies_to(self, target: Target) -> bool:
@@ -123,10 +126,11 @@ class WebCollector:
         return self._client
 
     def _paced_get(self, client: WebGetter, url: str) -> httpx.Response:
-        self._sleep(self._min_interval)
+        self._sleep(self._interval)
         return client.get(url)
 
     async def collect(self, ctx: CollectContext) -> CollectResult:
+        self._interval = self._min_interval * ctx.settings.pacing_factor
         username = _resolve_username(ctx)
         client = self._get_client(ctx)
         channel_id = _resolve_channel_id(ctx, username)

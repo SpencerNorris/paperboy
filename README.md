@@ -137,7 +137,7 @@ The collecting account's own record is scrubbed from exports.
 |---|---|
 | `paperboy auth` | Interactive login; saves the session to the Keychain. |
 | `paperboy doctor` | Opsec preflight; blocks `collect` on failure unless `--unsafe`. |
-| `paperboy collect TARGET [--phases …] [--unsafe] [--profile P]` | Collect channel metadata, history, the linked group's roster, and per-user profiles. |
+| `paperboy collect TARGET [--phases …] [--unsafe] [--pacing-factor F] [--max-flood-sleep S] [--profile P]` | Collect channel metadata, history, the linked group's roster, and per-user profiles. |
 | `paperboy collect TARGET --media [--media-since 180d\|2026-03-22] [--media-msgs 8554,8600-8602] [--media-max-mb N]` | Also download message media (opt-in). `--media-since` limits it to posts dated at/after a cutoff (a duration back from now, or an ISO date in UTC); `--media-msgs` to chosen message ids; `--media-max-mb` skips any file Telegram records as larger than N MB, before downloading. Large channels can hold hundreds of GB of video, so scope it. |
 | `paperboy collect TARGET --profiles [--profile-budget N]` | Also run full profile enrichment (`getFullUser`, photo history, avatars) — the expensive opt-in on top of the always-on `getUsers` triage. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
@@ -159,7 +159,8 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 | `PROXY` | *(unset)* | `socks5://…` or `mtproxy://…` to route Telegram traffic. |
 | `REQUIRE_PROXY` | `true` | `doctor` fails (and `collect` refuses) without a proxy. |
 | `MIN_SESSION_AGE_DAYS` | `7` | Guards bulk work on fresh accounts. |
-| `FLOOD_SLEEP_THRESHOLD` | `60` | Sleep through `FLOOD_WAIT`s ≤ this; stop the phase above it. |
+| `FLOOD_SLEEP_THRESHOLD` | `3600` | Sleep through `FLOOD_WAIT`s whose applied wait (`ceil(s×1.1)+5`) is ≤ this; stop the phase above it (`--max-flood-sleep`). |
+| `PACING_FACTOR` | `2.0` | Multiplies every request interval we assume (min 1.0; `--pacing-factor`). Not applied to server-mandated waits. See [`docs/features/pacing.md`](docs/features/pacing.md). |
 | `MAX_RPC_PER_RUN` | `20000` | Hard per-run request cap. |
 | `ALLOW_JOIN` / `ALLOW_PHONE_LOOKUP` | `false` | Off-by-default flag-gated behaviors (Phase 2). |
 
