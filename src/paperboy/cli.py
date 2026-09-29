@@ -452,10 +452,11 @@ def reproject(
     except composition.ConfigError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from None
-    # Only now that the profile is validated: configure_logging mkdirs the
-    # profile dir, so doing it earlier manufactured `data/<typo>/` for a
-    # profile build_reproject was about to reject (#33 round-2 smoke case 8).
-    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    # The log lives beside the output, never in the source profile: replay
+    # must not write there (#64 §2.3, a read-only profile must work).
+    # `build_reproject` has already validated the profile and created
+    # `out_path`'s parent, so this cannot manufacture `data/<typo>/`.
+    configure_logging(out_path.with_suffix(".log"), console=True)
     log = logging.getLogger("paperboy.cli")
     try:
         with source, out_store:

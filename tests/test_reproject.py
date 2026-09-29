@@ -186,6 +186,30 @@ def test_cli_reproject_custom_out_path(tmp_path, monkeypatch):
     assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
 
 
+def test_reproject_logs_beside_the_output_not_into_the_source_profile(tmp_path, monkeypatch):
+    """The source profile is read-only to replay (#64 §2.3): the log goes next
+    to `--out`, and the default `--out` gives `paperboy.reprojected.log`."""
+    asyncio.run(run_full_collect(tmp_path))
+    profile = tmp_path / "default"
+    log_before = (profile / "paperboy.log").read_bytes() if (profile / "paperboy.log").exists() else None
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    result = runner.invoke(
+        app, ["reproject", "--profile", "default", "--out", str(elsewhere / "out.sqlite")]
+    )
+    assert result.exit_code == 0, result.output
+    out_log = elsewhere / "out.log"
+    assert out_log.exists() and out_log.read_text().strip()
+    after = (profile / "paperboy.log").read_bytes() if (profile / "paperboy.log").exists() else None
+    assert after == log_before
+
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert (profile / "paperboy.reprojected.log").exists()
+
+
 def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkeypatch):
     # A source archive can carry more than one resolved target across its
     # history (successive `collect` runs against different inputs, found
