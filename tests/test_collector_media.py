@@ -350,7 +350,7 @@ async def test_media_msgs_downloads_only_listed_messages(tmp_path):
 @pytest.mark.asyncio
 async def test_media_max_mb_skips_oversized_before_downloading(tmp_path, caplog):
     settings = load_settings("default", {"data_dir": tmp_path, "media_max_mb": 1})
-    gw = FakeGateway({"media": {1: b"small", 2: b"big"}})
+    gw = FakeGateway({"media": {1: b"s" * 1_000_000, 2: b"big"}})
     with Store.open(tmp_path / "db.sqlite") as st:
         _seed(st, _sized_doc(1, 1_000_000))       # exactly 1 MB: allowed
         _seed(st, _sized_doc(2, 1_000_001))       # over the cap: skipped, never fetched

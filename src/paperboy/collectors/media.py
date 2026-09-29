@@ -18,6 +18,14 @@ identical bytes — either way, `media.sha256` is the primary key, so only the
 first-seen message for a given file owns the `media` row; every later
 occurrence (by content-id or by hash) still gets its own `custody_log` row.
 
+Streaming (#64): each download is streamed through a `MediaSink` into
+`<media>/.incoming/<uuid>.part` (bounded memory, sha256 computed
+incrementally), then atomically renamed to its content-addressed name — a
+crash never leaves a partial file under a final name. Stale `.part` files
+(> 1 h) from a dead run are swept at phase start. Before each download a
+free-disk floor (`--media-min-free-gb`, #53) is checked against
+`free - declared size`; crossing it stops the phase cleanly.
+
 EXIF/metadata extraction (`media.exif_json`) is out of scope for this pass —
 it needs a dependency decision (Pillow/exifread/...) not yet made — left
 NULL; tracked as a follow-up.
@@ -25,10 +33,13 @@ NULL; tracked as a follow-up.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import mimetypes
+import os
+import shutil
+import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,9 +49,11 @@ from paperboy.config import profile_dir
 from paperboy.media_keys import (
     find_existing_key,
     is_valid_ext,
+    media_dir,
     media_key,
     resolve_media_key,
 )
+from paperboy.media_sink import MediaSink, MediaSinkWriteError, MediaSizeExceeded
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -52,6 +65,58 @@ if TYPE_CHECKING:
 # (see `channel.py`/`ids.py`). Every other media kind (webpage/geo/contact/
 # poll/venue/...) has nothing to download and is left alone.
 _DOWNLOADABLE_KINDS = {"messagemediaphoto": "photo", "messagemediadocument": "document"}
+
+
+_INCOMING_DIR = ".incoming"
+_STALE_PART_SECONDS = 3600
+
+
+class DiskFloorStop(PhaseStop):
+    """Free disk (minus the next file's declared size) is below the configured
+    floor. Raised before any RPC for that file; a `PhaseStop`, so recipes end
+    the phase cleanly, and a distinct type so #68 can end the whole command."""
+
+
+def _prepare_media_root(root: Path) -> Path:
+    """Create `root` and `root/.incoming` (same filesystem as the final
+    location, so the finishing rename is atomic); return the incoming dir."""
+    incoming = root / _INCOMING_DIR
+    incoming.mkdir(parents=True, exist_ok=True)
+    return incoming
+
+
+def _sweep_incoming(
+    incoming: Path, *, now: float, max_age: int = _STALE_PART_SECONDS
+) -> tuple[int, int]:
+    """Delete `*.part` files older than `max_age` seconds (left by a crashed
+    run); return `(files removed, bytes removed)`."""
+    removed = freed = 0
+    for part in incoming.glob("*.part"):
+        try:
+            st = part.stat()
+            if st.st_mtime < now - max_age:
+                part.unlink()
+                removed += 1
+                freed += st.st_size
+        except FileNotFoundError:
+            continue
+    return removed, freed
+
+
+def _free_bytes(root: Path) -> int:
+    """Free bytes on the volume holding `root`."""
+    return shutil.disk_usage(root).free
+
+
+def _unlink_quiet(path: Path) -> None:
+    """Remove `path` if it is still there (it is gone after a successful rename)."""
+    path.unlink(missing_ok=True)
+
+
+def _finalize(temp: Path, dest: Path) -> None:
+    """Atomically move the finished temp file to its content-addressed name."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(temp, dest)
 
 
 def _content_key(media: dict) -> tuple[str, int] | None:
@@ -74,9 +139,12 @@ def _content_key(media: dict) -> tuple[str, int] | None:
 def _recorded_size(media: dict) -> int | None:
     """The byte size Telegram recorded for this media, if the stored dict has
     one — `document.size`, or for a photo its largest size variant (the one
-    `download_media` fetches): the max over each `PhotoSize.size` and each
-    `PhotoSizeProgressive.sizes` entry. `None` when no size is recorded, so a
-    `--media-max-mb` cap never skips a file it can't prove is too big.
+    `download_media` fetches): the max over each `PhotoSize.size`, each
+    `PhotoSizeProgressive.sizes` entry and each animated-photo `VideoSize.size`
+    (Telethon sorts video sizes after every photo size, so they can be the
+    variant it fetches). For a photo this is an upper bound, not an exact
+    size. `None` when no size is recorded, so a `--media-max-mb` cap never
+    skips a file it can't prove is too big.
     """
     kind = (media.get("_") or "").lower()
     if kind == "messagemediadocument":
@@ -88,6 +156,9 @@ def _recorded_size(media: dict) -> int | None:
             if isinstance(variant.get("size"), int):
                 candidates.append(variant["size"])
             candidates.extend(v for v in variant.get("sizes") or [] if isinstance(v, int))
+        for variant in (media.get("photo") or {}).get("video_sizes") or []:
+            if isinstance(variant.get("size"), int):
+                candidates.append(variant["size"])
         return max(candidates) if candidates else None
     return None
 
@@ -147,8 +218,15 @@ class MediaCollector:
         channel_id = ctx.channel_id
         counts = {
             "downloaded": 0, "duplicates": 0, "unavailable": 0,
-            "skipped_kind": 0, "skipped": 0,
+            "skipped_kind": 0, "skipped": 0, "size_mismatch": 0,
         }
+
+        media_root = media_dir(ctx.settings, ctx.profile)
+        incoming = _prepare_media_root(media_root)
+        swept, swept_bytes = _sweep_incoming(incoming, now=time.time())
+        if swept:
+            ctx.log.info("media: swept %d stale part file(s), %d bytes", swept, swept_bytes)
+        floor_bytes = int(ctx.settings.media_min_free_gb * 10**9)
 
         content_index = self._load_content_index(ctx, channel_id)
 
@@ -237,59 +315,75 @@ class MediaCollector:
                 counts["too_large"] += 1
                 continue
 
+            if floor_bytes:
+                free = _free_bytes(media_root)
+                if free - (size or 0) < floor_bytes:
+                    raise DiskFloorStop(
+                        f"media: free disk {free / 1e9:.2f} GB minus declared "
+                        f"{(size or 0) / 1e6:.1f} MB is below the "
+                        f"{ctx.settings.media_min_free_gb:g} GB floor "
+                        "(--media-min-free-gb)",
+                        counts=counts,
+                    )
+
+            temp = incoming / f"{uuid.uuid4().hex}.part"
             try:
-                data = await ctx.gateway.download_media(
-                    ctx.input_channel, {"id": row["msg_id"], "media": media}
-                )
-            except SkipAndRecord as exc:
-                # A per-file skip (e.g. file_reference expired twice) must not
-                # abort the whole media phase — skip this one file and continue.
-                ctx.log.warning("media: skipping msg %s: %s", row["msg_id"], exc)
-                counts["skipped"] += 1
-                continue
-            if data is None:
-                counts["unavailable"] += 1
-                continue
+                try:
+                    outcome = await self._stream_one(
+                        ctx, row["msg_id"], media, kind, size, temp
+                    )
+                except MediaSinkWriteError as exc:
+                    # A full disk / EIO is not transient: stop the phase rather
+                    # than re-download (the sink error is deliberately not an OSError).
+                    raise PhaseStop(
+                        f"media: cannot write to the media directory: {exc}",
+                        counts=counts,
+                    ) from exc
+                if isinstance(outcome, str):
+                    counts[outcome] += 1
+                    continue
+                sha, received = outcome
+                existing = self._lookup_by_sha(ctx, sha)
+                if existing is not None:
+                    # Safety-net dedup: two distinct document/photo ids hashed to
+                    # the same bytes (or `key` was None, e.g. a malformed dict).
+                    # Same D3 rationale as the content_index hit above.
+                    self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
+                    counts["duplicates"] += 1
+                    if key is not None:
+                        content_index[key] = (sha, existing)
+                    continue
 
-            sha = hashlib.sha256(data).hexdigest()
-            existing = self._lookup_by_sha(ctx, sha)
-            if existing is not None:
-                # Safety-net dedup: two distinct document/photo ids hashed to
-                # the same bytes (or `key` was None, e.g. a malformed dict).
-                # Same D3 rationale as the content_index hit above.
-                self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
-                counts["duplicates"] += 1
-                if key is not None:
-                    content_index[key] = (sha, existing)
-                continue
-
-            mime_type: str | None
-            file_name: str | None
-            attributes: list | None
-            if kind == "photo":
-                mime_type, file_name, attributes = "image/jpeg", None, None
-            else:
-                mime_type, file_name, attributes = _document_attrs(media)
-            ext = _guess_ext(kind, mime_type, file_name)
-            loc = media_key(sha, ext)
-            path = resolve_media_key(ctx.settings, ctx.profile, loc)
-            # Content-addressed: an existing path is already the right bytes.
-            # Guards replay idempotency (spec §4 — reproject never re-writes a
-            # media file) and spares a live re-run a redundant write too.
-            if not path.exists():
-                # The same bytes may already sit under a different extension -
-                # a pre-#62 file whose legacy suffix this version would not
-                # re-derive. Reuse that location instead of writing a second
-                # copy (and keep the reprojected row faithful to the source).
-                existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
-                if existing_key is not None:
-                    loc = existing_key
+                mime_type: str | None
+                file_name: str | None
+                attributes: list | None
+                if kind == "photo":
+                    mime_type, file_name, attributes = "image/jpeg", None, None
                 else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
+                    mime_type, file_name, attributes = _document_attrs(media)
+                ext = _guess_ext(kind, mime_type, file_name)
+                loc = media_key(sha, ext)
+                path = resolve_media_key(ctx.settings, ctx.profile, loc)
+                # Content-addressed: an existing path is already the right bytes.
+                # Guards replay idempotency (spec §4 — reproject never re-writes a
+                # media file) and spares a live re-run a redundant write too.
+                if not path.exists():
+                    # The same bytes may already sit under a different extension -
+                    # a pre-#62 file whose legacy suffix this version would not
+                    # re-derive. Reuse that location instead of writing a second
+                    # copy (and keep the reprojected row faithful to the source).
+                    existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
+                    if existing_key is not None:
+                        loc = existing_key
+                    else:
+                        _finalize(temp, path)
+            finally:
+                # A no-op after a successful rename; otherwise discards the
+                # partial/duplicate temp so nothing lingers under `.incoming/`.
+                _unlink_quiet(temp)
 
             raw_payload = {
-                "sha256": sha, "kind": kind, "size": len(data), "mime_type": mime_type,
+                "sha256": sha, "kind": kind, "size": received, "mime_type": mime_type,
                 "file_name": file_name, "path": loc, "message_uri": row["uri"],
             }
             downloaded_at = ctx.clock.for_payload(raw_payload)
@@ -297,7 +391,7 @@ class MediaCollector:
                 "INSERT INTO media (sha256, message_uri, kind, mime_type, size, file_name, "
                 "attributes_json, path, downloaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    sha, row["uri"], kind, mime_type, len(data), file_name,
+                    sha, row["uri"], kind, mime_type, received, file_name,
                     dumps(attributes) if attributes is not None else None,
                     loc, downloaded_at,
                 ),
@@ -313,6 +407,52 @@ class MediaCollector:
                 content_index[key] = (sha, loc)
 
         return CollectResult(name=self.name, counts=counts)
+
+    async def _stream_one(
+        self,
+        ctx: CollectContext,
+        msg_id: int,
+        media: dict,
+        kind: str,
+        declared: int | None,
+        temp: Path,
+    ) -> str | tuple[str, int]:
+        """Stream one message's media into `temp`. Returns the `counts` key of
+        a non-download outcome (`skipped`/`unavailable`/`size_mismatch`), or
+        `(sha256, received bytes)` of a complete file. A `MediaSinkWriteError`
+        (local disk failure) propagates to the caller.
+
+        `declared` caps the stream (a longer one raises `MediaSizeExceeded`
+        mid-transfer, never after buffering). Only a *document* has an exact
+        declared size, so only a short document is a mismatch; a photo's
+        declared size is an upper bound (see `_recorded_size`).
+        """
+        assert ctx.input_channel is not None  # guarded at the top of `collect`
+        try:
+            with MediaSink(temp, limit=declared) as sink:
+                available = await ctx.gateway.download_media(
+                    ctx.input_channel, {"id": msg_id, "media": media}, sink
+                )
+        except SkipAndRecord as exc:
+            # A per-file skip (e.g. file_reference expired twice) must not
+            # abort the whole media phase — skip this one file and continue.
+            ctx.log.warning("media: skipping msg %s: %s", msg_id, exc)
+            return "skipped"
+        except MediaSizeExceeded as exc:
+            ctx.log.warning(
+                "media: msg %s streamed %d bytes, more than the declared %d; discarded",
+                msg_id, exc.received, exc.declared,
+            )
+            return "size_mismatch"
+        if not available:
+            return "unavailable"
+        if kind == "document" and declared is not None and sink.size != declared:
+            ctx.log.warning(
+                "media: msg %s streamed %d bytes, declared %d; discarded",
+                msg_id, sink.size, declared,
+            )
+            return "size_mismatch"
+        return sink.sha256, sink.size
 
     def _load_content_index(
         self, ctx: CollectContext, channel_id: int
