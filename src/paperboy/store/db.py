@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
@@ -28,6 +29,8 @@ from typing import Self
 from uuid import uuid4
 
 from paperboy.ids import to_iso, utc_now_iso
+
+log = logging.getLogger("paperboy.store")
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -67,7 +70,31 @@ class Store:
         conn.execute("PRAGMA foreign_keys=ON")
         store = cls(conn)
         store._apply_migrations()
+        leftovers = store.unnormalised_media_counts()
+        if any(leftovers.values()):
+            # Counts only, never a path (ADR-0007): rows that lack their own sha
+            # cannot be normalised and are never guessed.
+            log.warning(
+                "media locations not in key form (ADR-0007): media=%d custody_log=%d",
+                leftovers["media"],
+                leftovers["custody_log"],
+            )
         return store
+
+    def unnormalised_media_counts(self) -> dict[str, int]:
+        """Rows in `media`/`custody_log` whose `path` is not its canonical key
+        `media/<sha[:2]>/<sha><ext>` (NULL, lacking its own sha, or a legacy
+        form that migration 0006 has not rewritten)."""
+        counts: dict[str, int] = {}
+        for table in ("media", "custody_log"):
+            row = self.conn.execute(
+                f"SELECT count(*) FROM {table} "  # noqa: S608 - fixed table names
+                "WHERE path IS NULL OR instr(path, sha256) = 0 "
+                "OR path <> 'media/' || substr(sha256, 1, 2) || '/' "
+                "|| substr(path, instr(path, sha256))"
+            ).fetchone()
+            counts[table] = row[0]
+        return counts
 
     def _apply_migrations(self) -> None:
         self.conn.execute(
