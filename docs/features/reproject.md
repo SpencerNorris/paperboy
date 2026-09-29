@@ -186,8 +186,67 @@ types with their TL namespace (`contacts.resolvedPeer` for `ResolvedPeer`,
 `ChannelDifference*`) but not others (`Message`, `ChatInvite*`,
 `SponsoredMessage`, `MediaDownload`, ...) — collectors record
 `payload.get("_", ...)` verbatim, so every kind lookup in `replay.py` matches
-a bare kind *or* any `<namespace>.<kind>` suffix (`_kind_clause`), not an
-exact string.
+a bare kind *or* any `<namespace>.<kind>` suffix (`kind_matches`, the Python
+twin of the SQL `_kind_clause` that the per-run walk still uses — see
+"Performance" below), not an exact string.
+
+## Performance — per-run raw index (#75)
+
+**Problem (measured).** Every replayed request used to be one SQL lookup shaped
+`lower(kind) = ? OR lower(kind) LIKE '%.k'` plus `json_extract(context_json,
+…)` plus `id BETWEEN run.lo AND run.hi`. `EXPLAIN QUERY PLAN` showed
+`SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)`: every
+lookup read every row of the run, `payload_json` included. On a `.backup` copy
+of the real store (65,827 raw rows, 65 runs, largest run 27,567 rows) one
+`MediaDownload` lookup that finds nothing took 6-11 s, and the store has
+~44,000 media-bearing messages, so the `media` phase was projected in days.
+
+**Mechanism (chosen: M5).** `ReplaySource.index(run)` walks the run's rowid
+window **once** (`RunIndex.WALK_SQL`, the only range query left) and keeps one
+small `RawEntry` per row (`id`, lower-cased kind, tier, `observed_at`, parsed
+context, and for message kinds `CAST($.id AS INTEGER)`, for web kinds `$.url`;
+never the payload). Every gateway method, `resolve`, `iter_history`, the
+`get_channel_difference` nested-message match and stamp, the web replay client
+and the phase-detection helpers (`resolve_targets`, `linked_group_ids`,
+`has_kind`, `has_context_channel`, `has_context_value`) answer from that index;
+a hit then fetches its payload by rowid (`SEARCH ... (rowid=?)`). One run is
+resident at a time (the next run replaces it). Results are identical by
+construction: same rows, same `id` order, payload text read verbatim, the SQL
+`CAST` kept in the walk, `NULL` never matching. The reproject parity suite is
+unchanged and green.
+
+| # | Option | Media lookup, a miss | Migration |
+|---|--------|----------------------|-----------|
+| M0 | today: `LIKE` + rowid range | 9.4-10 s (planner probe) | no |
+| M1 | `kind IN (exact spellings)` on the existing kind index | 61 ms first, ~0 after; message-kind lookups stay O(run) (1.1-1.6 s) and lose the early exit on hits | no |
+| M2/M3/M4 | new `(kind, id)`, expression, or `json_extract` indexes | 0.3-0.8 ms | yes, and one index per lookup shape |
+| **M5** | **per-run in-memory index** | **17,654 lookups in 13-20 ms** (build ~4-5 s once per run) | **no** |
+
+**Why not an index.** `ReplaySource` opens the source `mode=ro` (or
+`immutable=1`) and never migrates it — only the *output* goes through
+`Store.open`. An index migration would therefore silently not exist on an old,
+read-only or hand-copied source, which is exactly the case reproject serves.
+M5 needs nothing from the source, and it is the only option that also fixes
+`iter_history` (2.8-3.9 s per page x 252 pages on the biggest run before),
+`get_messages` misses, the diff's nested lookups and the once-per-run
+`has_context_value` / `MAX(observed_at)` walks. No schema, index or raw change,
+so no ADR (ADR-0005 has a one-line note) and no `docs/data-model.md` change.
+
+**Memory and logging.** About 0.9 KB per row (23.7 MB for the 27,567-row run,
+Python overhead included). Each run logs one INFO line from `paperboy.replay`:
+`replay index run=… rows=… message_rows=… context_bytes=… approx_bytes=…
+elapsed=…`, and a WARNING when one run's estimate exceeds 512 MB
+(`replay.INDEX_WARN_BYTES`). There is no hard cap and no failure.
+
+**Tests.** `tests/test_replay_index.py`: `kind_matches` equals the SQL clause
+over the stored spellings; entries are id-ordered and bucketed; `None` never
+matches; the SQL `CAST` semantics; one walk per run; the INFO/WARNING lines; a
+gateway lookup issues no `raw_records` SQL beyond one rowid point-fetch; a
+50,000-row run (5,000 media-bearing) with a timing bound; namespaced kinds.
+
+### Definition of done — offline transcript (#75)
+
+PENDING: filled in by the DoD run (below, once the full reproject completes).
 
 ## Round-trip equality contract (D5)
 

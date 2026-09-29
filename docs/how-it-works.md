@@ -78,6 +78,10 @@ only the new database.
 
 Replay goes **run by run**: each past `collect` is one "run", replayed in order
 ([ADR-0005](adr/0005-run-structure.md)).
+While replaying a run, the fake Telegram reads that run's receipts into an
+in-memory index once and answers every question from it (instead of
+re-scanning the run for each one), which is what lets a rebuild scale to a
+real archive.
 
 Detail: [`features/reproject.md`](features/reproject.md).
 

@@ -135,6 +135,8 @@ Option A, with structural-marker inference for legacy rows.
 
 ## Notes
 
+- Replay lookups are served from a per-run in-memory index (#75) — no schema or
+  raw change; see `docs/features/reproject.md`, "Performance — per-run raw index".
 - Diagnosis and evidence: issue #33 (escalation comment, 2026-08-26).
 - Related: #34 (non-channel resolution must be a `SkipAndRecord`, not a
   crash — surfaced by the same smoke), #36 (custody residual, above — its
