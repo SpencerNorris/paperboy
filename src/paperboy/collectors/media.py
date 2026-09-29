@@ -214,8 +214,21 @@ class MediaCollector:
 
     name = "media"
 
-    def __init__(self, *, copy_on_replay: bool = False) -> None:
+    def __init__(
+        self, *, copy_on_replay: bool = False, outcomes: dict[str, str] | None = None
+    ) -> None:
         self._copy_on_replay = copy_on_replay
+        # `outcomes` (#68) is a caller-owned dict this collector fills, message
+        # uri -> `downloaded | duplicate | too_large | size_mismatch |
+        # unavailable | skipped`, for every row it considers. A live dict, not a
+        # field of `CollectResult`, because a `DiskFloorStop`/`HardStop`
+        # discards the result yet the caller still needs the rows finished
+        # before the stop.
+        self._outcomes = outcomes
+
+    def _note(self, uri: str, outcome: str) -> None:
+        if self._outcomes is not None:
+            self._outcomes[uri] = outcome
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
@@ -314,6 +327,7 @@ class MediaCollector:
             kind = DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
             if kind is None:
                 counts["skipped_kind"] += 1
+                self._note(row["uri"], "skipped")
                 continue
 
             key = content_key(media)
@@ -324,6 +338,7 @@ class MediaCollector:
                 # observation, not "now".
                 self._record_custody(ctx, path, sha, row["uri"], row["first_seen"])
                 counts["duplicates"] += 1
+                self._note(row["uri"], "duplicate")
                 continue
 
             size = recorded_size(media)
@@ -335,6 +350,7 @@ class MediaCollector:
                     row["msg_id"], size / 1e6, ctx.settings.media_max_mb,
                 )
                 counts["too_large"] += 1
+                self._note(row["uri"], "too_large")
                 continue
 
             if floor_bytes and writes:
@@ -363,6 +379,7 @@ class MediaCollector:
                     ) from exc
                 if isinstance(outcome, str):
                     counts[outcome] += 1
+                    self._note(row["uri"], outcome)
                     continue
                 sha, received = outcome
                 existing = self._lookup_by_sha(ctx, sha)
@@ -372,6 +389,7 @@ class MediaCollector:
                     # Same D3 rationale as the content_index hit above.
                     self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
                     counts["duplicates"] += 1
+                    self._note(row["uri"], "duplicate")
                     if key is not None:
                         content_index[key] = (sha, existing)
                     continue
@@ -406,6 +424,7 @@ class MediaCollector:
                             row["msg_id"], sha,
                         )
                         counts["skipped"] += 1
+                        self._note(row["uri"], "skipped")
                         continue
                     else:
                         _finalize(temp, path)
@@ -436,6 +455,7 @@ class MediaCollector:
                 observed_at=downloaded_at,
             )
             counts["downloaded"] += 1
+            self._note(row["uri"], "downloaded")
             if key is not None:
                 content_index[key] = (sha, loc)
 
