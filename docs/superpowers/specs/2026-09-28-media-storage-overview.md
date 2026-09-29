@@ -57,22 +57,38 @@ each spec's Definition of Done, against Telegram with the collecting account,
    that need existing media files (#70) may symlink `<scratch>/default/media`
    to the real media dir and must show its file count and total size
    unchanged before/after.
-2. **Read-only, guarded.** Never `--unsafe`, `--join` or `--profiles`. If
-   `doctor` blocks (e.g. no proxy configured), do not override — record the
-   smoke as pending with the doctor output.
-3. **Caps per feature:** ≤ 5 live invocations; each with `--max-rpc 60` or
+2. **Read-only, guarded.** Never `--unsafe`, `--join` or `--profiles`, and
+   never configure a proxy. The operator's machine protects Telegram egress
+   with a system VPN instead (operator decision 2026-09-28: with the VPN up,
+   a proxy adds nothing), so run every live command with
+   `PAPERBOY_REQUIRE_PROXY=false` — `doctor` then reports the proxy check as
+   disabled and otherwise gates as usual. If `doctor` blocks for any other
+   reason, do not override — record the smoke as pending with the doctor
+   output.
+3. **VPN egress check before every live invocation.** Telegram traffic must
+   leave through the VPN tunnel. Immediately before each live command, run:
+   ```
+   for ip in 149.154.167.51 91.108.56.130; do printf '%s -> ' $ip; route -n get $ip | awk '/interface:/{print $2}'; done
+   ```
+   (two public Telegram data-centre addresses). Both must route via a tunnel
+   interface (`utun*`, `ipsec*` or `ppp*`). If either shows a physical
+   interface (`en*`) or the lookup fails, **don't run the command** — the VPN
+   is down — and treat it as a stop condition (§5). Paste the check output
+   with each smoke transcript.
+4. **Caps per feature:** ≤ 5 live invocations; each with `--max-rpc 60` or
    lower; ≤ 3 media files and ≤ 3 GB downloaded in total; only channels
    already in the store, and never the investigation being split out (#70).
-4. **Stop conditions:** any `FLOOD_WAIT` over 60 s, `PEER_FLOOD`,
-   `FROZEN_METHOD_INVALID`, or an auth/session error → stop, record it on
+5. **Stop conditions:** any `FLOOD_WAIT` over 60 s, `PEER_FLOOD`,
+   `FROZEN_METHOD_INVALID`, an auth/session error, or a failed VPN egress
+   check (§3) → stop, record it on
    the feature's issue, and make **no further live calls for the rest of the
    night** (later features mark their live smokes pending). Never retry to
    "get a clean run".
-5. **Public repo — redact.** In commits, PR bodies and issue comments, write
+6. **Public repo — redact.** In commits, PR bodies and issue comments, write
    channels as `@<channel>` and message ids as `<id>`; never paste usernames,
    channel ids, titles or message text. Keep the unredacted transcript in the
    scratch dir and reference its filename.
-6. Scratch outputs stay in the scratch dir for the operator's review — don't
+7. Scratch outputs stay in the scratch dir for the operator's review — don't
    delete them.
 
 ## Shared constraints (from CLAUDE.md; non-negotiable)

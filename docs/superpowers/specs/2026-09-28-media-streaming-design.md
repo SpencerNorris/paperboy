@@ -105,7 +105,7 @@ store, not yet downloaded, with a memory measurement:
 PAPERBOY_DATA_DIR=<scratch> /usr/bin/time -l uv run paperboy collect @<channel> \
     --phases channel,media --media-msgs <video-id>,<photo-id> --max-rpc 60
 ```
-Paste (redacted per protocol §5): the collect table, `maximum resident set
+Paste (redacted per protocol §6): the collect table, `maximum resident set
 size` from `time -l` (must be far below the file size), `shasum -a 256` of
 the stored file matching its `media.sha256`, and `ls media/.incoming` empty.
 Then re-run the same command and show `duplicates` counted with no new

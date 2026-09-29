@@ -46,6 +46,13 @@ request. You **can** be:
 
 - Configure a **proxy** (`proxy = "socks5://…"` or `mtproxy://…`); `require_proxy`
   is on by default and the tool refuses to connect without one.
+- **Or run behind a system VPN** and set `PAPERBOY_REQUIRE_PROXY=false`: with
+  the VPN carrying all traffic, a proxy adds nothing. paperboy cannot see the
+  VPN, so verifying it is on you — before a run, confirm Telegram's
+  data-centre addresses route through the tunnel:
+  `route -n get 149.154.167.51 | grep interface` (and `91.108.56.130`) must
+  show a tunnel interface (`utun*` on macOS), not `en*`. A VPN that drops
+  mid-run silently exposes your real IP; prefer one with a kill switch.
 - **Consistency beats exoticism**: a stable exit in the number's region looks
   like a normal user; churning exits looks like a compromised account. Register
   and operate through the *same* proxy. Tor exits are often blocked. A paid VPN
