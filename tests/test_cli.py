@@ -39,7 +39,7 @@ def _fixtures():
 def test_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup"):
+    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup", "fetch-media"):
         assert cmd in result.stdout
 
 

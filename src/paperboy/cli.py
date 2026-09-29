@@ -27,8 +27,18 @@ from paperboy.config import (
 )
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
+from paperboy.fetch_media import FetchSummary, fetch_media, initial_results, write_report
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
+from paperboy.media_list import (
+    OFFLINE_OUTCOMES,
+    ClassifiedRow,
+    MediaListError,
+    Segment,
+    classify_rows,
+    parse_media_list,
+    plan_segments,
+)
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
@@ -346,6 +356,166 @@ async def _run_collect(
     return await collect_channel(
         gateway, store, settings, target, phase_list, log, media=media, web=web, profile=profile
     )
+
+
+def _gb(nbytes: int) -> str:
+    return f"{nbytes / 1e9:.2f}"
+
+
+def _print_plan(classified: list[ClassifiedRow], segments: list[Segment]) -> None:
+    """The two offline tables: outcome -> rows -> declared GB, and the segment
+    plan. Channels appear by numeric id only (logs/consoles reference targets
+    by id)."""
+    by_outcome: dict[str, list[ClassifiedRow]] = {}
+    for c in classified:
+        by_outcome.setdefault(c.outcome, []).append(c)
+    outcomes = Table(title="fetch-media: offline classification")
+    outcomes.add_column("outcome")
+    outcomes.add_column("rows", justify="right")
+    outcomes.add_column("declared GB", justify="right")
+    for name in OFFLINE_OUTCOMES:
+        rows = by_outcome.get(name, [])
+        outcomes.add_row(name, str(len(rows)), _gb(sum(c.declared_bytes or 0 for c in rows)))
+    total_bytes = sum(c.declared_bytes or 0 for c in classified)
+    outcomes.add_row("total", str(len(classified)), _gb(total_bytes))
+    console.print(outcomes)
+
+    plan = Table(title="fetch-media: segment plan (list order)")
+    for column in ("segment", "priority", "channel id", "rows", "declared GB"):
+        plan.add_column(column, justify="right" if column != "priority" else "left")
+    for i, seg in enumerate(segments, start=1):
+        plan.add_row(
+            str(i), seg.priority or "-", str(seg.channel_id), str(len(seg.rows)),
+            _gb(sum(c.declared_bytes or 0 for c in seg.rows)),
+        )
+    console.print(plan)
+
+
+def _print_summary(summary: FetchSummary) -> None:
+    table = Table(title="fetch-media: result")
+    table.add_column("outcome")
+    table.add_column("rows", justify="right")
+    for name, n in sorted(summary.counts.items()):
+        table.add_row(name, str(n))
+    table.add_row("bytes downloaded", str(summary.bytes_downloaded))
+    console.print(table)
+
+
+async def _run_fetch(settings, secrets, profile, store, classified, log, report_path):
+    gateway = await composition.build_gateway(settings, secrets, profile, store)
+    if not settings.unsafe:
+        checks = await run_doctor(gateway, settings)
+        if doctor_blocks(checks):
+            write_report(report_path, store, initial_results(classified))
+            console.print(
+                "[red]doctor preflight failed[/] — refusing to fetch. "
+                "Run `paperboy doctor` for details, or pass --unsafe to override."
+            )
+            raise typer.Exit(code=1)
+    return await fetch_media(
+        gateway, store, settings, classified, log, profile=profile, report_path=report_path
+    )
+
+
+@app.command(name="fetch-media")
+def fetch_media_cmd(
+    list_file: Annotated[
+        Path, typer.Argument(metavar="LIST", help="CSV with a `uri` column, or one URI per line.")
+    ],
+    profile: str = typer.Option("default", "--profile"),
+    media_max_mb: int = typer.Option(
+        None, "--media-max-mb", min=1, help="Skip any file larger than this many MB."
+    ),
+    media_min_free_gb: float = typer.Option(
+        None, "--media-min-free-gb", min=0.0,
+        help="Stop when free disk, minus the next file's declared size, would fall below "
+             "this many GB (default 5).",
+    ),
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            "--report",
+            help="Where to write the per-row report CSV "
+                 "(default <data_dir>/<profile>/fetch-media-<timestamp>.csv).",
+        ),
+    ] = None,
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Classify offline and print the plan; no keychain, no network, no report.",
+    ),
+    max_rpc: int = typer.Option(None, "--max-rpc"),
+    unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
+) -> None:
+    """Download media for an ordered list of message URIs across channels
+    (resumable; every input row gets an outcome in the report)."""
+    try:
+        rows = parse_media_list(list_file)
+    except (MediaListError, OSError) as exc:
+        console.print(f"[red]{list_file}: {exc}[/]")
+        raise typer.Exit(code=1) from None
+
+    overrides: dict[str, object] = {}
+    if media_max_mb is not None:
+        overrides["media_max_mb"] = media_max_mb
+    if media_min_free_gb is not None:
+        overrides["media_min_free_gb"] = media_min_free_gb
+    if max_rpc is not None:
+        overrides["max_rpc_per_run"] = max_rpc
+    if pacing_factor is not None:
+        overrides["pacing_factor"] = pacing_factor
+    if max_flood_sleep is not None:
+        overrides["flood_sleep_threshold"] = max_flood_sleep
+    if unsafe:
+        overrides["unsafe"] = True
+    settings = load_settings(profile, overrides)
+
+    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    log = logging.getLogger("paperboy.cli")
+    with composition.build_store(settings, profile) as store:
+        classified = classify_rows(store, rows)
+        segments = plan_segments(store, classified)
+        unresolvable = {c.channel_id for c in classified if c.outcome == "unresolvable"}
+        for channel_id in sorted(i for i in unresolvable if i is not None):
+            log.warning(
+                "fetch-media: channel %s has no stored username and cannot be resolved; "
+                "its rows are reported unresolvable", channel_id,
+            )
+        _print_plan(classified, segments)
+        if dry_run:
+            return
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        report_path = report or profile_dir(settings, profile) / f"fetch-media-{stamp}.csv"
+        try:
+            # Fail before any segment, not after hours of downloading.
+            report_path.open("w", encoding="utf-8").close()
+        except OSError as exc:
+            console.print(f"[red]cannot write the report {report_path}: {exc}[/]")
+            raise typer.Exit(code=1) from None
+
+        if segments:
+            summary = _run_async_or_exit(
+                _run_fetch(
+                    settings, composition.build_secrets(profile), profile, store,
+                    classified, log, report_path,
+                )
+            )
+        else:
+            summary = asyncio.run(
+                fetch_media(
+                    None, store, settings, classified, log,
+                    profile=profile, report_path=report_path,
+                )
+            )
+
+    _print_summary(summary)
+    console.print(f"report: {report_path}")
+    if summary.stop_reason:
+        console.print(f"[red]stopped early: {summary.stop_reason}[/] — re-run to resume.")
+    if not summary.complete:
+        raise typer.Exit(code=1)
 
 
 @app.command()
