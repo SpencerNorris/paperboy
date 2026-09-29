@@ -16,9 +16,9 @@ phase resumable.
 - `--pacing-factor F` / `PAPERBOY_PACING_FACTOR` (default `2.0`, minimum `1.0`;
   values below 1 are rejected at settings load / CLI parse, exit 2). On
   `collect` and `doctor`. (`auth` never builds a `Budget`, so it has no flag;
-  `fetch-media` inherits via `Settings`.)
+  `fetch-media` takes both flags too.)
 - `--max-flood-sleep S` / `PAPERBOY_FLOOD_SLEEP_THRESHOLD` (default `3600`,
-  `0` = stop on every flood). On `collect` and `doctor`.
+  `0` = stop on every flood). On `collect`, `doctor` and `fetch-media`.
 
 ## Behaviour
 

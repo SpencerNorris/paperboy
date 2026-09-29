@@ -121,10 +121,40 @@ disk. Steps and caveats: [`features/reproject.md`](features/reproject.md).
 
 ## 6. The media pull
 
-Large media pulls (#68, `fetch-media --list`) download straight into the
-target profile's `media/`, once. Downloads stream to disk in chunks, so a
-2.4 GB video never sits in memory, and a free-disk floor stops the run before
-the disk fills (#64).
+Large media pulls download straight into the target profile's `media/`, once.
+Downloads stream to disk in chunks, so a 2.4 GB video never sits in memory,
+and a free-disk floor stops the run before the disk fills (#64).
+
+`paperboy fetch-media LIST` (#68) pulls media for a prioritised list of
+messages that can span many channels. In plain terms:
+
+1. **Read the list.** Each row names one message. If any row is malformed the
+   whole command stops before touching anything and says which lines.
+2. **Sort the rows offline.** Against what is already stored, every row is
+   labelled: already downloaded, not in the store, no media, deleted, a
+   channel we cannot look up by name, or still to do. No network is used, so
+   `--dry-run` can show this for the whole list for free.
+3. **Cut the to-do rows into segments.** One segment is "this priority, this
+   channel", in the order they first appear in the list, so all the important
+   rows are fetched before the rest. Inside a segment files come in message-id
+   order.
+4. **Run each segment as an ordinary collect run** over the same session. A
+   channel is looked up by name once per command (that call is one of
+   Telegram's most rate-limited); later segments of the same channel reuse the
+   result and leave a small note in the receipts, `ChannelContextReused`
+   (channel id and the run that did the lookup, never the access hash). Each
+   segment also notes which message ids it was allowed to fetch
+   (`MediaSelection`).
+5. **Replay follows the notes.** `reproject` reads those two notes to rebuild
+   exactly the same `media` and `custody_log` rows, offline, with no new
+   tables.
+6. **A report for every row.** The report CSV has one line per input row and
+   what happened to it. If the command stops early (a hard stop, the disk
+   floor, a long Telegram wait) the rows it did not reach say
+   `not_attempted`; run the same command again and it picks up where it left
+   off, because finished rows now read `already_stored`.
+
+Details, outcomes and stop rules: [`features/fetch-media.md`](features/fetch-media.md).
 
 ## 7. Where to read next
 

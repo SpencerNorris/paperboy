@@ -256,3 +256,11 @@ LIVE (overview protocol; ≤ 5 invocations, plan uses 2; ≤ 3 files, ≤ 3 GB; 
 3. **Outcomes:** a caller-owned `MediaCollector(outcomes=dict)`, as planned.
 4. **`deleted`:** accepted as a sixth offline outcome.
 5. **Live-call cap:** the no-network re-run counts against the 5-call cap (conservative).
+
+## Implementation notes (added during the run)
+
+Deviations found while implementing, all recorded in `docs/features/fetch-media.md`:
+
+- Replay of a scoped media phase needs the ids: the recipe now writes a `MediaSelection` raw whenever `media_msgs` is set and `media` runs, and reproject walks only those ids (the plan's parity test failed with `duplicates=2` without it).
+- `detect_phases` no longer infers `history` for a run with no message and no `getChannelDifference` raw; replaying it wrote a synthetic difference raw the source never had.
+- The driver wraps the `channel` collector in a guard so a handle that resolves to a different channel id is skipped before `media` can fetch the segment ids from the wrong channel.

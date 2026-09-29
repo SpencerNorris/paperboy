@@ -172,6 +172,25 @@ operator can eyeball the correction before swapping files.
   a WARNING and gets no `media` row. See the "Replay smoke (spec §4.1)" in
   `media-streaming.md`.
 
+## Replaying `fetch-media` runs (#68)
+
+A `fetch-media` segment is an ordinary run with two differences that replay
+must honour. (1) A segment that reuses an already-resolved channel has no
+`channel` phase and no `ResolvedPeer` of its own; it carries a
+`ChannelContextReused` marker, and `reproject` replays it as a media-only run:
+the channel id and tier come from the marker, the access hash and the target
+spelling from the *source* run's `ResolvedPeer` (an unknown or unresolved
+source run is a `ReprojectSourceError`, never guessed). Under
+`--include-target`/`--exclude-target` the marker's channel id decides. (2) A
+media phase scoped to specific ids records them as a `MediaSelection` raw, and
+replay walks only those ids, so a repost that the live run never considered
+gets no dedup custody row on replay. Phase detection no longer infers
+`history` for a run with no message and no `getChannelDifference` raw (a
+`--phases channel` run, a first `fetch-media` segment): replaying it appended
+a synthetic difference raw the source did not have. Tests:
+`tests/test_reproject_fetch_media.py` (round-trip parity over a two-channel,
+four-segment run with a repost that is off the list).
+
 ## Splitting a mixed profile (#70)
 
 **Problem.** One `paperboy.sqlite` mixes two investigations (a channel of an

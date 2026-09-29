@@ -38,9 +38,12 @@ untouched. #75 replay lookup performance is on
 `docs/features/reproject.md`). #70 profile split is on `feat/profile-split`
 (PR pending; `reproject --include-target/--exclude-target/--out-profile`,
 `scripts/unreferenced_media.py`, replay now verifies each media sha; no
-migration — `docs/features/reproject.md` "Splitting a mixed profile"). Next:
-#68 `fetch-media --list`. Order and protocol:
-`docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+migration — `docs/features/reproject.md` "Splitting a mixed profile"). #68
+`fetch-media LIST` is on `feat/fetch-media-list` (PR pending;
+`docs/features/fetch-media.md`): ordered cross-channel media pull, offline
+classification, resolve-once-per-channel with a `ChannelContextReused` replay
+marker, `MediaSelection` raw so reproject walks the same rows; no migration.
+Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
 
@@ -105,7 +108,8 @@ migration — `docs/features/reproject.md` "Splitting a mixed profile"). Next:
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
 [--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S]`
-(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `status [TARGET]`, `export TARGET
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv]` (ordered cross-channel
+media pull, #68 — `docs/features/fetch-media.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out

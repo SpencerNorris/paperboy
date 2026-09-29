@@ -49,6 +49,12 @@ Every Telegram object exactly as received, before any normalization.
 | `context_json` | TEXT | Optional capture context (e.g. resolve target, request params). |
 | `payload_json` | TEXT | The full TL object as JSON (`to_dict()`). |
 
+Two kinds are written by paperboy itself rather than received (#68, no schema
+change, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`;
+a `fetch-media` segment that reused an already-resolved channel) and
+`MediaSelection` (`{msg_ids}`; the message ids a scoped media phase was allowed
+to walk). `reproject` reads them to replay those runs exactly.
+
 ## Entities (current state)
 
 ### `channels` — the channel/supergroup itself
