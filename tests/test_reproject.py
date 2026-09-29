@@ -662,6 +662,28 @@ def test_reproject_skips_a_missing_stored_file_with_a_warning(tmp_path, monkeypa
     assert sorted(str(p.relative_to(media)) for p in media.rglob("*")) == before
 
 
+def test_reproject_skips_a_corrupt_stored_file_with_a_warning(tmp_path, monkeypatch):
+    """A stored file whose bytes no longer hash to its receipt (#70) is skipped
+    with a WARNING naming the sha, not filed under the wrong name."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        src_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    media = tmp_path / "default" / "media"
+    victim = sorted(p for p in media.rglob("*") if p.is_file())[0]
+    victim.write_bytes(b"x" + victim.read_bytes()[1:])  # same size, one byte changed
+    before = {p: p.read_bytes() for p in media.rglob("*") if p.is_file()}
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media - 1
+    log = (tmp_path / "default" / "paperboy.reprojected.sqlite.log").read_text().splitlines()
+    warned = [ln for ln in log if "does not match its receipt" in ln]
+    assert len(warned) == 1 and victim.stem[:12] in warned[0]
+    assert {p: p.read_bytes() for p in media.rglob("*") if p.is_file()} == before
+
+
 def test_reproject_ignores_the_live_free_disk_floor(tmp_path, monkeypatch):
     """The free-disk floor protects the disk from downloads; replay downloads
     nothing, so it must never even consult the disk: `shutil.disk_usage`

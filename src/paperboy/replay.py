@@ -891,6 +891,13 @@ class RawReplayGateway:
             raise SkipAndRecord(f"replay: media file missing for sha {sha}")
         sink.reset()
         stream_file_into(path, sink, chunk_size=_CHUNK)
+        # The collector trusts the streamed fingerprint (it names the row and,
+        # when copying into another profile, the file): a rotted or swapped
+        # file must be a recorded skip, never a row filed under the wrong sha.
+        if sink.sha256 != sha:
+            raise SkipAndRecord(
+                f"replay: media file for sha {sha[:12]} does not match its receipt"
+            )
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
         return True
