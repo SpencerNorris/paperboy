@@ -22,7 +22,7 @@ def _seed(tmp_path):
     """A minimal raw log: self, resolve, full, three messages (one edited),
     a probe MessageEmpty, one diff, one recommendation set, one MediaDownload."""
     db = tmp_path / "src.sqlite"
-    media_root = tmp_path / "media"
+    profile_root = tmp_path
     with Store.open(db) as st:
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None,
                    observed_at="2026-01-01T00:00:00+00:00")
@@ -58,21 +58,21 @@ def _seed(tmp_path):
                    "stranger", {"channel_id": CID},
                    observed_at="2026-01-01T00:05:00+00:00")
         sha = "ab" + "0" * 62
-        path = media_root / sha[:2] / f"{sha}.txt"
+        path = profile_root / "media" / sha[:2] / f"{sha}.txt"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"file contents")
         st.add_raw("MediaDownload",
                    {"sha256": sha, "kind": "document", "size": 13,
                     "mime_type": "text/plain", "file_name": "a.txt",
-                    "path": str(path), "message_uri": f"tg:msg:{CID}/2"},
+                    "path": f"media/{sha[:2]}/{sha}.txt", "message_uri": f"tg:msg:{CID}/2"},
                    "stranger", {"channel_id": CID, "msg_id": 2},
                    observed_at="2026-01-01T00:06:00+00:00")
-    return db, media_root
+    return db, profile_root
 
 
 def _gateway(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     clock = ReplayClock()
     # The seeded fixtures are single-run (no begin_run/run_id involved), so
     # this is the source's one (legacy-labeled) run — behavior is unchanged
@@ -180,8 +180,8 @@ async def test_doctor_methods_are_not_replayable(tmp_path):
 
 
 def test_source_helpers(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     run = src.runs()[0]
     assert src.resolve_targets(run) == ["@durov"]
     assert src.linked_group_ids(run) == {555}
@@ -189,8 +189,8 @@ def test_source_helpers(tmp_path):
 
 
 def test_source_is_read_only(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     with pytest.raises(sqlite3.OperationalError):
         src.conn.execute("DELETE FROM raw_records")
 
@@ -208,7 +208,7 @@ def test_runs_groups_by_run_id_in_capture_order(tmp_path):
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
         st.begin_run("bbb")
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     runs = src.runs()
     assert [(r.run_id, r.lo, r.hi) for r in runs] == [("aaa", 1, 2), ("bbb", 3, 3)]
 
@@ -220,7 +220,7 @@ def test_runs_segments_legacy_rows_at_self_markers(tmp_path):
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 2), ("legacy-0002", 3, 4),
     ]
@@ -250,7 +250,7 @@ def test_runs_handles_a_source_predating_the_run_id_column(tmp_path):
     conn.commit()
     conn.close()
 
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     runs = src.runs()
     assert [(r.run_id, r.lo, r.hi) for r in runs] == [("legacy-0001", 1, 2)]
 
@@ -274,7 +274,7 @@ def test_runs_absorbs_leading_rows_written_before_the_first_self_marker(tmp_path
         # A genuinely new pass: its own self marker cuts a real boundary.
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
     ]
@@ -300,7 +300,7 @@ def test_runs_absorbs_resolve_before_self_at_every_boundary(tmp_path):
         st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 8),
     ]
@@ -341,7 +341,7 @@ def test_runs_does_not_split_a_run_on_a_foreign_single_row_intrusion(tmp_path):
                    {"channel_id": 5, "msg_id": 2})
         st.add_raw("MediaDownload", {"sha256": "c" * 64}, "stranger",
                    {"channel_id": 5, "msg_id": 3})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [("legacy-0001", 1, 7)]
 
 
@@ -360,7 +360,7 @@ def test_runs_still_cuts_a_genuine_boundary_after_a_foreign_intrusion(tmp_path):
         # A genuine second pass: its own self marker cuts a real boundary.
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 3}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
     ]
@@ -379,7 +379,7 @@ def test_runs_raises_on_a_genuinely_interleaved_stamped_run_id(tmp_path):
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.begin_run("aaa")
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     with pytest.raises(ReprojectSourceError, match="aaa"):
         src.runs()
 
@@ -399,7 +399,7 @@ def test_runs_splits_consecutive_all_opening_passes(tmp_path):
             st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
                        {"target": "@x"})
             st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 3), ("legacy-0002", 4, 6), ("legacy-0003", 7, 9),
     ]
@@ -417,7 +417,7 @@ def test_runs_splits_consecutive_resolve_full_self_passes(tmp_path):
                        {"target": "@x"})
             st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
             st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 3), ("legacy-0002", 4, 6),
     ]
@@ -432,7 +432,38 @@ def test_runs_mixed_legacy_then_stamped(tmp_path):
         st.begin_run("ccc")
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 2), ("ccc", 3, 4),
     ]
+
+
+def _set_payload_path(db, kind, value):
+    """Rewrite the seeded payload's stored location (simulates a pre-#62 archive)."""
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', ?) "
+            "WHERE kind = ?",
+            (value, kind),
+        )
+
+
+@pytest.mark.asyncio
+async def test_download_media_normalises_legacy_absolute_payload_path(tmp_path):
+    db, _ = _seed(tmp_path)
+    sha = "ab" + "0" * 62
+    gone = tmp_path / "gone" / "data" / "default" / "media" / sha[:2] / f"{sha}.txt"
+    _set_payload_path(db, "MediaDownload", str(gone))  # the directory is never created
+    src = ReplaySource.open(db, tmp_path)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    assert await gw.download_media({"channel_id": CID}, {"id": 2}) == b"file contents"
+
+
+@pytest.mark.asyncio
+async def test_download_media_payload_without_sha_is_a_skip(tmp_path):
+    db, _ = _seed(tmp_path)
+    _set_payload_path(db, "MediaDownload", "bogus.bin")
+    src = ReplaySource.open(db, tmp_path)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with pytest.raises(SkipAndRecord):
+        await gw.download_media({"channel_id": CID}, {"id": 2})

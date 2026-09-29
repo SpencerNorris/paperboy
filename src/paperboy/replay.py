@@ -23,6 +23,7 @@ import httpx
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
+from paperboy.media_keys import normalize_legacy_location, resolve_key_under
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
@@ -64,11 +65,15 @@ def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
 
 
 class ReplaySource:
-    """Read-only access to a source DB's raw log + its content-addressed media."""
+    """Read-only access to a source DB's raw log + its content-addressed media.
 
-    def __init__(self, conn: sqlite3.Connection, media_root: Path) -> None:
+    `profile_root` is the source *profile directory*: media keys
+    (`media/<xx>/<sha><ext>`, ADR-0007) resolve against it.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, profile_root: Path) -> None:
         self.conn = conn
-        self.media_root = media_root
+        self.profile_root = profile_root
         # A real archive captured before this feature existed (ADR-0005) has
         # only pre-0003 migrations applied — `raw_records` has no `run_id`
         # column at all yet, not merely NULL values in it. `ReplaySource` is
@@ -80,10 +85,10 @@ class ReplaySource:
         )
 
     @classmethod
-    def open(cls, db_path: Path, media_root: Path) -> Self:
+    def open(cls, db_path: Path, profile_root: Path) -> Self:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
-        return cls(conn, media_root)
+        return cls(conn, profile_root)
 
     def close(self) -> None:
         self.conn.close()
@@ -508,6 +513,17 @@ class RawReplayGateway:
             )
         return self._serve(row)
 
+    def _resolve_payload_file(self, stored: str, sha: str) -> Path:
+        """Resolve a `MediaDownload`/`AvatarDownload` payload's location under the
+        source profile dir (ADR-0007). Payloads written before #62 hold absolute or
+        cwd-relative paths; they are normalised by their sha, never trusted as
+        paths. An unusable value is a recorded skip, not a reproject abort."""
+        try:
+            key = normalize_legacy_location(stored, sha)
+        except ValueError as exc:
+            raise SkipAndRecord(f"replay: unusable media location for sha {sha}") from exc
+        return resolve_key_under(self._src.profile_root, key)
+
     async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
         row = self._latest(
             ("mediadownload",),
@@ -519,16 +535,10 @@ class RawReplayGateway:
             return None
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
-        path = Path(payload["path"])
+        path = self._resolve_payload_file(payload["path"], sha)
         # A small local disk stat/read on an offline, single-user CLI tool —
         # not worth a trio/anyio dependency for.
         if not path.exists():  # noqa: ASYNC240
-            # A different profile than the one that captured it (spec §4):
-            # re-derive the content-addressed location under THIS source's
-            # media root rather than trusting the stored (possibly foreign)
-            # absolute path.
-            path = self._src.media_root / sha[:2] / (sha + Path(payload["path"]).suffix)
-        if not path.exists():
             raise SkipAndRecord(f"replay: media file missing for sha {sha}")
         data = path.read_bytes()
         self._clock.begin_batch()
@@ -666,10 +676,8 @@ class RawReplayGateway:
             return None
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
-        path = Path(payload["path"])
+        path = self._resolve_payload_file(payload["path"], sha)
         if not path.exists():  # noqa: ASYNC240 — same rationale as download_media
-            path = self._src.media_root / sha[:2] / f"{sha}.jpg"
-        if not path.exists():
             raise SkipAndRecord(f"replay: avatar file missing for sha {sha}")
         data = path.read_bytes()
         self._clock.begin_batch()

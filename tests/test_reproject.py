@@ -29,7 +29,7 @@ runner = CliRunner()
 @pytest.mark.asyncio
 async def test_detect_phases_reflects_recorded_raw_kinds(tmp_path):
     db = await run_full_collect(tmp_path)
-    src = ReplaySource.open(db, tmp_path / "default" / "media")
+    src = ReplaySource.open(db, tmp_path / "default")
     phases = detect_phases(src, src.runs()[0])
     assert phases[:2] == ["channel", "history"]
     assert "graph" in phases and "web" in phases and "media" in phases
@@ -46,7 +46,7 @@ async def test_detect_phases_minimal_source(tmp_path):
             parse_target("@durov"), phases=["channel", "history"],
             log=logging.getLogger("t"),
         )
-    src = ReplaySource.open(db, tmp_path / "default" / "media")
+    src = ReplaySource.open(db, tmp_path / "default")
     assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
 
 
@@ -446,7 +446,7 @@ def test_source_without_graph_reprojects_without_graph(tmp_path, monkeypatch):
     db1 = asyncio.run(
         _collect_with_fixtures(tmp_path, full_collect_fixtures(), ["channel", "history"])
     )
-    src = ReplaySource.open(db1, tmp_path / "default" / "media")
+    src = ReplaySource.open(db1, tmp_path / "default")
     assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
     src.close()
 

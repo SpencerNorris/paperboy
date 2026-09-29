@@ -159,5 +159,4 @@ def build_reproject(
         raise ConfigError(
             f"refusing to overwrite existing {out_path} — move it aside or pass a fresh --out"
         )
-    media_root = profile_dir(settings, profile) / "media"
-    return ReplaySource.open(source_db, media_root), Store.open(out_path)
+    return ReplaySource.open(source_db, profile_dir(settings, profile)), Store.open(out_path)
