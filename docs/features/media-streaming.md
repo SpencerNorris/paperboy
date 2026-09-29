@@ -76,7 +76,7 @@ not fill the disk.
 See the smoke transcript below (redacted; the unredacted transcripts stay in
 the operator's scratch directory).
 
-### Live smoke (3 of the 5 permitted invocations)
+### Live smoke (4 of the 5 permitted invocations)
 
 Runs 1 and 2 ran at commit 95c98d8; run 3 ran at `b0a00f8`, the last commit
 that touches `src/` (later commits are docs only). Runs 1-2 are still valid
@@ -135,8 +135,8 @@ $ find <scratch>/default/media -type f -newer smoke-64-run1.txt
 The second run made no `upload.getFile` request (only the channel-phase
 RPCs), and `.incoming/` stayed empty.
 
-Invocation 3, at `b0a00f8` (VPN check first, same result: both addresses via
-`utun4`), a second ~1.0 GB video (`<id>`, same channel, no custody row before),
+Invocation 3, at `b0a00f8` (its VPN check output was not saved in the
+transcript file; invocation 4 below repeats the check and keeps it), a second ~1.0 GB video (`<id>`, same channel, no custody row before),
 `--media-msgs <id>` only. Transcript: `smoke-64-run3.txt`.
 
 ```
@@ -152,8 +152,21 @@ $ ls -la <scratch>/default/media/.incoming -> total 0 (empty)
 ```
 
 Peak RSS 77.4 MB for a 1,005,068,556-byte file (7.7% of the file size) on the
-final code. Feature totals: 3 files, about 2.0 GB downloaded; 3 of 5 live
-invocations used.
+final code.
+
+Invocation 4, at the final commit `36b8fab` (dedup re-run of invocation 3's
+command; HEAD sha and VPN check are the first lines of `smoke-64-run4.txt`):
+
+```
+HEAD: 36b8fab...
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+media · downloaded=0 duplicates=1 unavailable=0 ... size_mismatch=0 ...
+       14.61 real ; 103219200 maximum resident set size
+$ ls -la <scratch>/default/media/.incoming -> total 0 (empty)
+```
+
+Feature totals: 3 files, about 2.0 GB downloaded; 4 of 5 live invocations used.
 
 ### Replay smoke (spec 4.1): reproject reads the media, and writes nothing
 
