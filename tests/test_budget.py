@@ -215,7 +215,7 @@ async def test_per_method_interval_paces_only_that_method(tmp_path):
 
     clock = Clock()
     slept: list[float] = []
-    s = load_settings("default", {})
+    s = load_settings("default", {"pacing_factor": 1.0})
     with Store.open(tmp_path / "p.sqlite") as st:
         b = Budget(
             s, st, clock=clock, sleeper=lambda x: slept.append(x), min_interval=1.0,

@@ -23,10 +23,16 @@ from paperboy.store.db import Store
 
 T = TypeVar("T")
 
-# Conservative default pacing between two calls to the *same* method, absent
-# any other guidance. Spec §13.10 (sequential `getFullUser` flood onset) is
-# unverified at the time of writing; 1 req/s is a safe starting point.
+# BASE pacing between two calls to the *same* method. These are our own
+# assumptions about what Telegram tolerates, not measured limits (ADR-0003
+# amendment, #69): every interval actually enforced is base x
+# `Settings.pacing_factor`. Spec §13.10 (sequential `getFullUser` flood onset)
+# is unverified; 1 req/s is the starting assumption.
 DEFAULT_MIN_INTERVAL_SECONDS = 1.0
+
+# Per-method base overrides where we assume a method is more tightly limited.
+# `contacts.resolveUsername` is among Telegram's most flood-limited methods.
+BASE_METHOD_INTERVALS: dict[str, float] = {"contacts.resolveUsername": 5.0}
 
 
 class HardStop(Exception):
@@ -74,7 +80,9 @@ class Budget:
     calls) or an async one like `asyncio.sleep` (awaited) — `Budget` detects
     which by checking whether the call returns an awaitable.
 
-    `method_intervals` overrides the pace for specific methods
+    `min_interval` and `method_intervals` are BASE intervals; the interval
+    actually enforced is base x `settings.pacing_factor` (`effective_interval`).
+    `method_intervals` overrides `BASE_METHOD_INTERVALS` for specific methods
     (`--profile-interval` → `users.getFullUser`/`photos.getUserPhotos`);
     flood cooldowns and the run cap apply regardless.
     """
@@ -94,9 +102,27 @@ class Budget:
         self._clock: _Clock = clock or _RealClock()
         self._sleeper: Callable[[float], object] = sleeper or self._default_sleep
         self._min_interval = min_interval
-        self._method_intervals: dict[str, float] = dict(method_intervals or {})
+        self._factor = settings.pacing_factor
+        self._method_intervals: dict[str, float] = {
+            **BASE_METHOD_INTERVALS,
+            **(method_intervals or {}),
+        }
         self._count = 0
         self._last_call: dict[str, float] = {}
+
+    def effective_interval(self, method: str) -> float:
+        """Seconds enforced between two calls to `method`: base x pacing factor."""
+        return self._method_intervals.get(method, self._min_interval) * self._factor
+
+    def describe_pacing(self) -> str:
+        """One-line summary of the pacing in force (logged at gateway construction)."""
+        default = self._min_interval * self._factor
+        parts = [f"factor={self._factor}", f"default={default}s"]
+        for method in sorted(self._method_intervals):
+            interval = self.effective_interval(method)
+            if interval != default:
+                parts.append(f"{method}={interval}s")
+        return " ".join(parts)
 
     @staticmethod
     def _default_sleep(seconds: float) -> Awaitable[None]:
@@ -147,7 +173,7 @@ class Budget:
             )
         self._count += 1
 
-        interval = self._method_intervals.get(method, self._min_interval)
+        interval = self.effective_interval(method)
         last = self._last_call.get(method)
         if last is not None:
             delta = self._clock.time() - last
