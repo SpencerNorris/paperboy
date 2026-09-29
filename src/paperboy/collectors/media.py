@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 # case-insensitively like every other `_`-discriminator check in this repo
 # (see `channel.py`/`ids.py`). Every other media kind (webpage/geo/contact/
 # poll/venue/...) has nothing to download and is left alone.
-_DOWNLOADABLE_KINDS = {"messagemediaphoto": "photo", "messagemediadocument": "document"}
+DOWNLOADABLE_KINDS = {"messagemediaphoto": "photo", "messagemediadocument": "document"}
 
 
 _INCOMING_DIR = ".incoming"
@@ -119,7 +119,7 @@ def _finalize(temp: Path, dest: Path) -> None:
     os.replace(temp, dest)
 
 
-def _content_key(media: dict) -> tuple[str, int] | None:
+def content_key(media: dict) -> tuple[str, int] | None:
     """A pre-download proxy for file identity: Telegram's own document/photo
     `id`, stable across every message carrying the same underlying file.
     `None` for a non-downloadable media kind or a malformed/id-less dict.
@@ -136,7 +136,7 @@ def _content_key(media: dict) -> tuple[str, int] | None:
     return None
 
 
-def _recorded_size(media: dict) -> int | None:
+def recorded_size(media: dict) -> int | None:
     """The byte size Telegram recorded for this media, if the stored dict has
     one — `document.size`, or for a photo its largest size variant (the one
     `download_media` fetches): the max over each `PhotoSize.size`, each
@@ -311,12 +311,12 @@ class MediaCollector:
 
         for row in rows:
             media = json.loads(row["media_json"]) if row["media_json"] else {}
-            kind = _DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
+            kind = DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
             if kind is None:
                 counts["skipped_kind"] += 1
                 continue
 
-            key = _content_key(media)
+            key = content_key(media)
             if key is not None and key in content_index:
                 sha, path = content_index[key]
                 # A dedup hit derives from the STORED message row, not a
@@ -326,7 +326,7 @@ class MediaCollector:
                 counts["duplicates"] += 1
                 continue
 
-            size = _recorded_size(media)
+            size = recorded_size(media)
             if max_bytes is not None and size is not None and size > max_bytes:
                 # `--media-max-mb` (issue #53): decided from the size Telegram
                 # recorded, before a single byte is fetched.
@@ -458,7 +458,7 @@ class MediaCollector:
         `declared` caps the stream (a longer one raises `MediaSizeExceeded`
         mid-transfer, never after buffering). Only a *document* has an exact
         declared size, so only a short document is a mismatch; a photo's
-        declared size is an upper bound (see `_recorded_size`).
+        declared size is an upper bound (see `recorded_size`).
         """
         assert ctx.input_channel is not None  # guarded at the top of `collect`
         try:
@@ -505,7 +505,7 @@ class MediaCollector:
         index: dict[tuple[str, int], tuple[str, str]] = {}
         for r in rows:
             media = json.loads(r["media_json"]) if r["media_json"] else {}
-            key = _content_key(media)
+            key = content_key(media)
             if key is not None:
                 index[key] = (r["sha256"], r["path"])
         return index
