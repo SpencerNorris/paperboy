@@ -290,7 +290,8 @@ peak memory footprint     109085224 bytes
 index lines               65 (one per run); largest: rows=27567 message_rows=27341
                           context_bytes=727748 approx_bytes=17267948 elapsed=5.03s
 media phase (first run with downloads) downloaded=150 duplicates=0
-media phase (last)                     downloaded=0 duplicates=449 unavailable=5
+media phase (a later run)               downloaded=0 duplicates=449 unavailable=5
+media phase (final run)                downloaded=2 duplicates=169 unavailable=6403
 ```
 
 | table | source (backup) | reprojected (output) |
