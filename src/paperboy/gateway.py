@@ -10,7 +10,7 @@ call routed through `Budget.call`).
 from __future__ import annotations
 
 import base64
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     )
 
     from paperboy.budget import Budget
+    from paperboy.media_sink import MediaSink
 
 
 class Gateway(Protocol):
@@ -66,12 +67,17 @@ class Gateway(Protocol):
         """`account.getPrivacy` for one key (`phone`/`lastseen`/`photo`) — `{"rules": [...]}`."""
         ...
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
-        """Download one message's media (`upload.getFile`, via Telethon's own
-        `download_media` helper) as raw bytes — `None` if the media is gone/
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
+        """Stream one message's media (`upload.getFile`, via Telethon's own
+        `download_media` helper) into `sink` — `False` if the media is gone/
         unavailable server-side. `message` need only carry enough to
         re-resolve the live message (its `id`); read-only, never mutates
-        anything on Telegram's side."""
+        anything on Telegram's side. May raise `SkipAndRecord` or
+        `MediaSizeExceeded` (the sink's declared-size limit). Every attempt
+        begins with `sink.reset()`, so a retried download never appends to a
+        partial one (#64)."""
         ...
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
@@ -144,7 +150,8 @@ class Gateway(Protocol):
     async def download_user_photo(self, photo: dict) -> bytes | None:
         """Download one `Photo` from `get_user_photos` (largest size) as raw
         bytes via `upload.getFile`; `None` if gone. Raises `SkipAndRecord`
-        when its `file_reference` has expired. Read-only."""
+        when its `file_reference` has expired. Read-only. Still returns bytes:
+        avatars are < ~1 MB, so streaming them is out of scope (#64)."""
         ...
 
     async def get_message_reactions_list(
@@ -165,7 +172,10 @@ class FakeGateway:
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
     `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`;
     missing key → `SkipAndRecord`, was `KeyError`),
-    `media` (a `{msg_id: bytes}` lookup for `download_media`).
+    `media` (a `{msg_id: bytes | Callable[[], Iterable[bytes]] | None |
+    BaseException}` lookup for `download_media`: bytes are streamed into the
+    sink in three slices, a callable supplies the chunks lazily so a large
+    stream never sits in memory, `None`/missing → unavailable).
     `channel_recommendations`, `sponsored_messages`, `chat_invite` (a
     `{hash: dict}` lookup). Any of these three graph-collector fixture
     values may instead be a `BaseException` instance (e.g. a `SkipAndRecord`)
@@ -299,14 +309,27 @@ class FakeGateway:
         if isinstance(value, BaseException):
             raise value
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
         self.calls.append("download_media")
         del input_channel
         self.download_media_calls.append(message["id"])
         value = self._fx.get("media", {}).get(message["id"])
+        if value is None:
+            return False
         if isinstance(value, BaseException):
             raise value
-        return value
+        sink.reset()
+        if callable(value):
+            chunks = cast("Iterable[bytes]", value())
+            for chunk in chunks:
+                sink.write(chunk)
+        else:
+            step = max(1, len(value) // 3)
+            for i in range(0, len(value), step):
+                sink.write(value[i : i + step])
+        return True
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         self.calls.append("get_channel_recommendations")
@@ -723,16 +746,25 @@ class TelethonGateway:
         )
         return result.to_dict()
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
-        """Re-fetch the live message (`channels.getMessages`) and download its
-        media in-memory (`file=bytes` tells Telethon to return bytes instead
-        of writing to disk). A fresh fetch carries a fresh `file_reference`;
-        if the download still races an expiry (`FileReferenceExpiredError`
-        isn't in `errors.classify`'s tables, so `Budget.call` re-raises it
-        verbatim rather than converting it), re-fetch once more and retry
-        exactly once. A second consecutive expiry is converted to
-        `SkipAndRecord` here — skip this one file, spec §8's "no exception
-        is swallowed" honored by recording *why*, not by crashing the run.
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
+        """Re-fetch the live message (`channels.getMessages`) and stream its
+        media into `sink` (`file=sink`: Telethon writes each chunk to any
+        object with `write`, so memory stays at one chunk however large the
+        file). A fresh fetch carries a fresh `file_reference`; if the download
+        still races an expiry (`FileReferenceExpiredError` isn't in
+        `errors.classify`'s tables, so `Budget.call` re-raises it verbatim
+        rather than converting it), re-fetch once more and retry exactly
+        once. A second consecutive expiry is converted to `SkipAndRecord`
+        here — skip this one file, spec §8's "no exception is swallowed"
+        honored by recording *why*, not by crashing the run.
+
+        Every attempt starts with `sink.reset()`: `Budget.call` re-invokes the
+        factory after a RETRY-class error (budget.py), and the file-reference
+        retry re-enters it too, so a retried download must never append to a
+        partial one or hash garbage. `MediaSizeExceeded` (raised by the sink)
+        is not an `OSError`, so `Budget` re-raises it without retrying.
         """
         from telethon.errors import FileReferenceExpiredError
         from telethon.tl.functions.channels import GetMessagesRequest
@@ -762,28 +794,26 @@ class TelethonGateway:
             # runtime behavior change.
             return cast(Message, result.messages[0]) if result.messages else None
 
-        async def _download(tl_message: Message) -> bytes | None:
-            # `file=bytes` is Telethon's own documented idiom for "download
-            # in-memory and return it as a bytestring" — untyped in its
-            # stubs (`hints.FileLike` has no meta-type case for it), so the
-            # `Any` cast is a stub gap, not a real type mismatch.
-            return cast(
-                bytes | None,
-                await self.budget.call(
-                    "upload.getFile",
-                    lambda: self.client.download_media(tl_message, file=cast(Any, bytes)),
-                ),
-            )
+        async def _download(tl_message: Message) -> bool:
+            def _attempt() -> Awaitable[object]:
+                sink.reset()  # every Budget attempt starts clean (budget.py)
+                # `hints.FileLike` has no protocol case for a duck-typed
+                # writer, so the `Any` cast is a stub gap, not a real type
+                # mismatch. Telethon returns `None` when there is nothing to
+                # download (non-Photo/Document, empty size).
+                return self.client.download_media(tl_message, file=cast(Any, sink))
+
+            return await self.budget.call("upload.getFile", _attempt) is not None
 
         tl_message = await _fetch_message()
         if tl_message is None:
-            return None
+            return False
         try:
             return await _download(tl_message)
         except FileReferenceExpiredError:
             tl_message = await _fetch_message()
             if tl_message is None:
-                return None
+                return False
             try:
                 return await _download(tl_message)
             except FileReferenceExpiredError as exc:

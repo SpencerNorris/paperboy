@@ -144,3 +144,15 @@ def test_pacing_factor_env_and_cli_precedence(monkeypatch):
     monkeypatch.setenv("PAPERBOY_PACING_FACTOR", "3")
     assert load_settings("default", {}).pacing_factor == 3.0
     assert load_settings("default", {"pacing_factor": 1.5}).pacing_factor == 1.5
+
+
+def test_media_min_free_gb_default_env_and_bounds(monkeypatch):
+    from pydantic import ValidationError
+
+    monkeypatch.delenv("PAPERBOY_MEDIA_MIN_FREE_GB", raising=False)
+    assert load_settings("default", {}).media_min_free_gb == 5.0
+    monkeypatch.setenv("PAPERBOY_MEDIA_MIN_FREE_GB", "1.5")
+    assert load_settings("default", {}).media_min_free_gb == 1.5
+    assert load_settings("default", {"media_min_free_gb": 0}).media_min_free_gb == 0
+    with pytest.raises(ValidationError):
+        load_settings("default", {"media_min_free_gb": -1})

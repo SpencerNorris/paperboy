@@ -124,13 +124,37 @@ operator can eyeball the correction before swapping files.
   Asserted in test by monkeypatching all three real constructors to raise.
 - **Zero credentials.** No keychain access anywhere on this path (asserted
   by monkeypatching `keyring.get_password` to raise).
-- **No media re-download or re-write.** `download_media` reads bytes back
-  from the source profile's content-addressed store: each payload's location
-  is resolved as a media key under the source profile dir (ADR-0007), and
-  legacy absolute/cwd-relative payloads are normalised by their sha, so a
-  moved profile dir still replays; a live collect's own
-  write-if-not-exists guard (added as part of this feature) makes the
-  guarantee free to verify by monkeypatching `Path.write_bytes` to raise.
+- **No media re-download or re-write of final files.** `download_media`
+  streams the stored file back from the source profile's content-addressed
+  store into the collector's `MediaSink` (re-verifying its sha on the way
+  through): each payload's location is resolved as a media key under the
+  source profile dir (ADR-0007), and legacy absolute/cwd-relative payloads
+  are normalised by their sha, so a moved profile dir still replays. The
+  collector then finds the destination already present and records rows
+  only, so no final-name file is ever created or replaced; the test asserts
+  `os.replace` is never called and every stored file's size and sha are
+  unchanged. Replay uses a file-less hash-and-count sink (#64), so it writes
+  nothing into the source profile: a read-only source profile works (tested
+  by a size+mtime digest of the whole profile before and after).
+- **Log beside `--out`.** `reproject` writes `<out filename>.log` (`x.sqlite.log`, `x.log.log`;
+  never equal to the output DB; default `paperboy.reprojected.sqlite.log`), never into the source profile's
+  `paperboy.log`.
+- **WAL source in a read-only directory.** The source is opened `mode=ro`. A
+  WAL database whose `-shm`/`-wal` sidecars are absent, in a directory the
+  process cannot write, cannot be opened that way (SQLite must create the
+  sidecars; https://sqlite.org/wal.html, "Read-only databases"). `reproject`
+  then falls back to `immutable=1` and logs a WARNING: the source must not be
+  written concurrently while it is read. `immutable=1` ignores the WAL, so the
+  fallback is taken only for a real, existing source with no `-wal` (or an empty
+  one); a non-empty `-wal` in a non-writable directory is refused with an error
+  telling the operator to checkpoint the source from a writable location or
+  make its directory writable. A missing or corrupt source still fails with
+  SQLite's own error. All paths are tested. (A source that
+  is being written by a live `collect` should be `.backup`ed first.)
+- **Free-disk floor never consulted in replay** (tested by making
+  `shutil.disk_usage` raise). A stored file that is missing is `skipped` with
+  a WARNING and gets no `media` row. See the "Replay smoke (spec §4.1)" in
+  `media-streaming.md`.
 
 ## Design deviations from the spec (D4, plan §"Locked design decisions")
 

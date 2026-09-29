@@ -4,13 +4,16 @@ involved."""
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from paperboy import replay
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
+from paperboy.media_sink import MediaSink
 from paperboy.replay import RawReplayGateway, ReplaySource, ReprojectSourceError
 from paperboy.store.db import Store
 
@@ -160,9 +163,31 @@ async def test_sponsored_reconstructs_envelope_or_empty(tmp_path):
 async def test_download_media_reads_content_addressed_file(tmp_path):
     gw, clock = _gateway(tmp_path)
     del clock
-    data = await gw.download_media(IC, {"id": 2})
-    assert data == b"file contents"
-    assert await gw.download_media(IC, {"id": 3}) is None  # no record -> unavailable
+    with MediaSink(tmp_path / "t.part") as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
+    assert (tmp_path / "t.part").read_bytes() == b"file contents"
+    with MediaSink(tmp_path / "u.part") as sink2:
+        # no record -> unavailable
+        assert await gw.download_media(IC, {"id": 3}, sink2) is False
+    assert sink2.size == 0
+
+
+@pytest.mark.asyncio
+async def test_download_media_streams_in_chunks(tmp_path, monkeypatch):
+    gw, _ = _gateway(tmp_path)
+    monkeypatch.setattr(replay, "_CHUNK", 4)
+    writes: list[int] = []
+
+    class Recording(MediaSink):
+        def write(self, chunk: bytes) -> int:
+            writes.append(len(chunk))
+            return super().write(chunk)
+
+    with Recording(tmp_path / "t.part") as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert len(writes) == 4  # 13 bytes in 4-byte reads
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
 
 
 @pytest.mark.asyncio
@@ -456,7 +481,9 @@ async def test_download_media_normalises_legacy_absolute_payload_path(tmp_path):
     _set_payload_path(db, "MediaDownload", str(gone))  # the directory is never created
     src = ReplaySource.open(db, tmp_path)
     gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
-    assert await gw.download_media({"channel_id": CID}, {"id": 2}) == b"file contents"
+    with MediaSink(tmp_path / "t.part") as sink:
+        assert await gw.download_media({"channel_id": CID}, {"id": 2}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
 
 
 @pytest.mark.asyncio
@@ -465,5 +492,5 @@ async def test_download_media_payload_without_sha_is_a_skip(tmp_path):
     _set_payload_path(db, "MediaDownload", "bogus.bin")
     src = ReplaySource.open(db, tmp_path)
     gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
-    with pytest.raises(SkipAndRecord):
-        await gw.download_media({"channel_id": CID}, {"id": 2})
+    with MediaSink(tmp_path / "t.part") as sink, pytest.raises(SkipAndRecord):
+        await gw.download_media({"channel_id": CID}, {"id": 2}, sink)

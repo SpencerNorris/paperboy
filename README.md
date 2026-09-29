@@ -138,11 +138,11 @@ The collecting account's own record is scrubbed from exports.
 | `paperboy auth` | Interactive login; saves the session to the Keychain. |
 | `paperboy doctor` | Opsec preflight; blocks `collect` on failure unless `--unsafe`. |
 | `paperboy collect TARGET [--phases …] [--unsafe] [--pacing-factor F] [--max-flood-sleep S] [--profile P]` | Collect channel metadata, history, the linked group's roster, and per-user profiles. |
-| `paperboy collect TARGET --media [--media-since 180d\|2026-03-22] [--media-msgs 8554,8600-8602] [--media-max-mb N]` | Also download message media (opt-in). `--media-since` limits it to posts dated at/after a cutoff (a duration back from now, or an ISO date in UTC); `--media-msgs` to chosen message ids; `--media-max-mb` skips any file Telegram records as larger than N MB, before downloading. Large channels can hold hundreds of GB of video, so scope it. |
+| `paperboy collect TARGET --media [--media-since 180d\|2026-03-22] [--media-msgs 8554,8600-8602] [--media-max-mb N] [--media-min-free-gb G]` | Also download message media (opt-in). `--media-since` limits it to posts dated at/after a cutoff (a duration back from now, or an ISO date in UTC); `--media-msgs` to chosen message ids; `--media-max-mb` skips any file Telegram records as larger than N MB, before downloading. `--media-min-free-gb` (default 5) stops the media phase cleanly when free disk on the media volume, minus the next file's declared size, would fall below G GB (`0` disables). Downloads are streamed to disk, not buffered in memory. Large channels can hold hundreds of GB of video, so scope it. |
 | `paperboy collect TARGET --profiles [--profile-budget N]` | Also run full profile enrichment (`getFullUser`, photo history, avatars) — the expensive opt-in on top of the always-on `getUsers` triage. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
 | `paperboy export TARGET --format jsonl --out DIR [--profile P]` | Export to JSONL. |
-| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. |
+| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. Never writes into the source profile: the log goes beside `--out` (`paperboy.reprojected.sqlite.log` by default), and a read-only source profile works. |
 | `paperboy watch` / `paperboy lookup` | Phase 2 — not implemented (exit with a notice). |
 
 `TARGET` accepts `@username`, `t.me/name`, `t.me/name/123`, an invite link, or a
@@ -159,6 +159,7 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 | `PROXY` | *(unset)* | `socks5://…` or `mtproxy://…` to route Telegram traffic. |
 | `REQUIRE_PROXY` | `true` | `doctor` fails (and `collect` refuses) without a proxy. |
 | `MIN_SESSION_AGE_DAYS` | `7` | Guards bulk work on fresh accounts. |
+| `MEDIA_MIN_FREE_GB` | `5.0` | Free-disk floor for the media phase (`--media-min-free-gb`); `0` disables. |
 | `FLOOD_SLEEP_THRESHOLD` | `3600` | Sleep through `FLOOD_WAIT`s whose applied wait (`ceil(s×1.1)+5`) is ≤ this; stop the phase above it (`--max-flood-sleep`). |
 | `PACING_FACTOR` | `2.0` | Multiplies every request interval we assume (min 1.0; `--pacing-factor`). Not applied to server-mandated waits. See [`docs/features/pacing.md`](docs/features/pacing.md). |
 | `MAX_RPC_PER_RUN` | `20000` | Hard per-run request cap. |
@@ -170,7 +171,9 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
 ./data/<profile>/        # in the repo dir by default; gitignored
   paperboy.sqlite     # system of record: raw_records + normalized tables + FTS5
   paperboy.log        # credential-redacted JSON log
+  paperboy.reprojected.sqlite(.log)  # `reproject` output and its log (default --out)
   media/              # (Phase 2) downloaded files, content-addressed
+    .incoming/        # in-flight downloads (*.part), swept after 1 h
 ```
 
 The default data dir is `./data` (relative to where you run `paperboy`), so
@@ -251,6 +254,7 @@ uv run pyright            # type-check
 - [`docs/data-model.md`](docs/data-model.md) — the database codebook (every table and column).
 - [`docs/features/collect-channel.md`](docs/features/collect-channel.md) — the core feature, with the live smoke transcript.
 - [`docs/features/pacing.md`](docs/features/pacing.md) — request pacing and FLOOD_WAIT handling.
+- [`docs/features/media-streaming.md`](docs/features/media-streaming.md) — streamed media downloads, declared-size guard, free-disk floor, replay-untouched-source.
 - [`docs/features/person-layer.md`](docs/features/person-layer.md) — participants and profile enrichment.
 - [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript.
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.

@@ -12,6 +12,7 @@ executed (spec §3) — with the documented deviations D4.1–D4.4 in
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.media_keys import normalize_legacy_location, resolve_key_under
+from paperboy.media_sink import MediaSink, stream_file_into
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
@@ -64,6 +66,10 @@ def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
     return "(" + " OR ".join(parts) + ")", tuple(params)
 
 
+class ReplaySourceError(Exception):
+    """The source DB cannot be replayed safely (operator-actionable)."""
+
+
 class ReplaySource:
     """Read-only access to a source DB's raw log + its content-addressed media.
 
@@ -71,8 +77,12 @@ class ReplaySource:
     (`media/<xx>/<sha><ext>`, ADR-0007) resolve against it.
     """
 
-    def __init__(self, conn: sqlite3.Connection, profile_root: Path) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, profile_root: Path, *, opened_immutable: bool = False
+    ) -> None:
         self.conn = conn
+        # True when the source could only be opened with `immutable=1` (see `open`).
+        self.opened_immutable = opened_immutable
         self.profile_root = profile_root
         # A real archive captured before this feature existed (ADR-0005) has
         # only pre-0003 migrations applied — `raw_records` has no `run_id`
@@ -86,9 +96,49 @@ class ReplaySource:
 
     @classmethod
     def open(cls, db_path: Path, profile_root: Path) -> Self:
+        """Open the source strictly read-only, never writing to its directory.
+
+        Plain `mode=ro` is preferred. A WAL database in a directory the process
+        cannot write to (a read-only archive, a mounted snapshot) cannot be
+        opened that way when its `-shm`/`-wal` sidecars are absent: SQLite must
+        create them (https://sqlite.org/wal.html, "Read-only databases"). Then
+        we fall back to `immutable=1`, which skips locking and sidecars
+        entirely. That is only safe if nothing writes the source while we read
+        it; the caller reads `opened_immutable` and logs a WARNING (logging is
+        not configured yet when the source is opened). `immutable=1` also
+        ignores the WAL, so the fallback is refused (ReplaySourceError) when a
+        non-empty `-wal` exists.
+        """
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
-        return cls(conn, profile_root)
+        try:
+            return cls(conn, profile_root)
+        except sqlite3.OperationalError as exc:
+            # Both messages occur for the missing-sidecar case (which one
+            # depends on the SQLite build / first statement issued).
+            conn.close()
+            if not any(m in str(exc) for m in ("unable to open", "readonly database")):
+                raise
+            # Only the read-only-directory/missing-sidecar case may fall back.
+            # A missing source file or a writable directory is a genuine
+            # error and must surface as SQLite reported it.
+            if not db_path.is_file() or os.access(db_path.parent, os.W_OK):
+                raise
+            # `immutable=1` ignores the WAL entirely: with a non-empty `-wal`
+            # it would silently miss every un-checkpointed commit.
+            wal = db_path.with_name(db_path.name + "-wal")
+            if wal.exists() and wal.stat().st_size > 0:
+                raise ReplaySourceError(
+                    f"source DB has un-checkpointed data in its -wal file and its directory "
+                    f"is not writable, so it cannot be read safely (immutable mode would "
+                    f"ignore the WAL). Checkpoint the source from a writable location "
+                    f"(PRAGMA wal_checkpoint(TRUNCATE)) or make its directory writable: "
+                    f"{db_path.parent}"
+                ) from exc
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn.row_factory = sqlite3.Row
+        return cls(conn, profile_root, opened_immutable=True)
 
     def close(self) -> None:
         self.conn.close()
@@ -314,6 +364,12 @@ class ReplaySource:
         ).fetchone() is not None
 
 
+# Read size when streaming a stored media file into the sink: reproject
+# re-verifies every file's sha on the way through without holding a whole
+# file in memory.
+_CHUNK = 1 << 20
+
+
 class RawReplayGateway:
     """`Gateway` served from a raw log, scoped to ONE historical `ReplayRun`
     (ADR-0005) — every query below is additionally bounded to
@@ -321,6 +377,10 @@ class RawReplayGateway:
     most one matching record, same as a live RPC has one now. Never touches
     the network — there is no client, no session, no `Budget` anywhere in
     this class."""
+
+    # Tells collectors this is a replay: they must not write to the source
+    # profile (e.g. the media collector uses file-less hashing sinks).
+    replay = True
 
     def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None:
         self._src = source
@@ -524,7 +584,9 @@ class RawReplayGateway:
             raise SkipAndRecord(f"replay: unusable media location for sha {sha}") from exc
         return resolve_key_under(self._src.profile_root, key)
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
         row = self._latest(
             ("mediadownload",),
             "json_extract(context_json, '$.channel_id') = ? "
@@ -532,7 +594,7 @@ class RawReplayGateway:
             (input_channel["channel_id"], message["id"]),
         )
         if row is None:
-            return None
+            return False
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
         path = self._resolve_payload_file(payload["path"], sha)
@@ -540,10 +602,11 @@ class RawReplayGateway:
         # not worth a trio/anyio dependency for.
         if not path.exists():  # noqa: ASYNC240
             raise SkipAndRecord(f"replay: media file missing for sha {sha}")
-        data = path.read_bytes()
+        sink.reset()
+        stream_file_into(path, sink, chunk_size=_CHUNK)
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
-        return data
+        return True
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         row = self._latest(

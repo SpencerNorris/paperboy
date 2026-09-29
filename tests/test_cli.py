@@ -394,7 +394,8 @@ def test_collect_media_since_rejects_bad_value(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("flag", "value"), [("--media-msgs", "abc"), ("--media-max-mb", "0")]
+    ("flag", "value"),
+    [("--media-msgs", "abc"), ("--media-max-mb", "0"), ("--media-min-free-gb", "-1")],
 )
 def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     result = runner.invoke(
@@ -404,6 +405,25 @@ def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     )
     assert result.exit_code != 0
     assert flag.lstrip("-") in _plain_output(result)
+
+
+def test_collect_media_min_free_gb_reaches_settings(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del secrets, profile, store
+        seen["settings"] = settings
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_floor", "--media",
+         "--media-min-free-gb", "0.5", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert seen["settings"].media_min_free_gb == 0.5
 
 
 def test_collect_exits_nonzero_when_the_target_itself_cannot_be_used(tmp_path, monkeypatch):
