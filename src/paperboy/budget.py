@@ -254,6 +254,7 @@ class Budget:
             if attempt == 1:
                 await self._pace(method)
             self._last_call[method] = self._clock.time()
+            log.debug("rpc %s attempt %d (run call #%d)", method, attempt, self._count)
 
             try:
                 return await factory()

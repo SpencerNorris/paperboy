@@ -217,6 +217,19 @@ async def test_every_attempt_counts_toward_max_rpc(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_every_attempt_is_logged_at_debug(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="paperboy.budget")
+    b, st, _ = _budget(tmp_path)
+    with st:
+        await b.call("users.getUsers", _flaky(FakeFlood(1)))
+    lines = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+    assert lines == [
+        "rpc users.getUsers attempt 1 (run call #1)",
+        "rpc users.getUsers attempt 2 (run call #2)",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_hard_stop_and_skip_are_not_retried(tmp_path):
     from telethon.errors import ChatAdminRequiredError
 
