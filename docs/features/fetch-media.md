@@ -156,7 +156,7 @@ Redaction: channels are `@<channel>`, ids `<id>`; unredacted transcripts stay in
 
 ```
 $ uv run pytest -q
-929 passed in 84.02s (0:01:24)
+929 passed in 89.57s (0:01:29)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
@@ -197,21 +197,93 @@ assert both constructors are never called). Command:
 
 No `pacing:` line appears (no gateway was built).
 
-**Offline, the operator's full list on the `.backup` copy: PENDING.** The
-permission classifier refused the command that runs `--dry-run` over the
-operator's private list (reason given: "Sensitive-Source Provenance"), so this
-agent did not read that list in any form and did not try another route. Nothing
-is claimed about its counts. To close it, the operator runs:
-`PAPERBOY_DATA_DIR=<scratch>/68 paperboy fetch-media <list> --dry-run --profile default`
-on a `sqlite3 .backup` copy and checks that the outcome table has `unresolvable`
-for the split-out investigation's linked group, and no `pacing:` log line.
+**Offline, the operator's full list on a `sqlite3 .backup` copy** (`<list>`, 1,719
+rows; `PAPERBOY_DATA_DIR=<scratch>/68 paperboy fetch-media <list> --dry-run --profile default`;
+exit 0; ids redacted; unredacted output in `<scratch>/68/full-dryrun.unredacted.txt`):
 
-**Live, 3-row slice and its re-run: PENDING** for the same reason (the smoke slice
-is chosen from that list, and the run rules forbid choosing rows any other way).
-No live call was made: the live-call counter is 0 of 5, no `STOP-LIVE` flag was
-set, and the VPN check was not reached. Not a code failure; the driver, resume
-(`already_stored` with no gateway) and report paths are covered offline by
-`tests/test_fetch_media.py` and `tests/test_cli_fetch_media.py`.
+```
+[..] WARNING  fetch-media: channel <id> has no stored username and cannot be
+              resolved; its rows are reported unresolvable
+  fetch-media: offline classification
+┏━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
+┃ outcome        ┃ rows ┃ declared GB ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
+│ duplicate_row  │    0 │        0.00 │
+│ not_in_store   │    0 │        0.00 │
+│ deleted        │    0 │        0.00 │
+│ no_media       │    0 │        0.00 │
+│ unresolvable   │   40 │        0.05 │
+│ already_stored │   99 │       12.36 │
+│ pending        │ 1580 │      149.80 │
+│ total          │ 1719 │      162.22 │
+└────────────────┴──────┴─────────────┘
+```
+
+The segment plan has 36 segments (P1 x9, P2 x8, P3 x9, PH x10; every row of the
+`pending` count is in exactly one segment; the largest is 294 rows). The single
+channel with no stored username (its 40 rows) is the linked group that was split
+out into a separate investigation: it is reported `unresolvable` and never
+fetched. `already_stored` is 99, equal to the catalogue's own "already
+downloaded" flag on this store (the plan's earlier 118 estimate does not hold
+against the actual store). `grep -c "pacing:"` on the unredacted output is 0: no
+gateway was built.
+
+**Live, 3-row slice** (photo + 2 videos, 2 channels already in the store, each
+<= 20 MB, chosen offline from `<list>` and copied to `<scratch>/68/list-smoke.csv`).
+Its `--dry-run` reports `pending` 3, `already_stored` 0, 2 segments (PH 1 row, P1 2
+rows), 0.02 GB declared. Before each live invocation: `STOP-LIVE` absent,
+live-call counter 0 then 1 (of 5), and
+
+```
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+```
+
+Invocation 1: `PAPERBOY_REQUIRE_PROXY=false paperboy fetch-media <scratch>/68/list-smoke.csv --profile default --max-rpc 60 --max-flood-sleep 60 --report <scratch>/68/report-1.csv`
+(exit 0, 18 RPCs of the 60 cap, no FLOOD_WAIT). Segment log excerpt:
+
+```
+fetch-media: segment 1/2 priority=PH channel=<id> rows=1 end: {'downloaded': 1}
+fetch-media: segment 2/2 priority=P1 channel=<id> rows=2 end: {'downloaded': 2}
+fetch-media: {'downloaded': 3}; <bytes> bytes downloaded; report report-1.csv
+      fetch-media: result
+┃ outcome          ┃  rows ┃
+│ downloaded       │     3 │
+│ bytes downloaded │ <n>   │
+```
+
+Report (`report-1.csv`, URIs redacted, sha256/key abbreviated):
+
+```
+line_no,uri,outcome,sha256,key
+2,tg:msg:<id>/<id>,downloaded,45f4f24f...7112,media/45/45f4f24f....jpg
+3,tg:msg:<id>/<id>,downloaded,79d8c006...,media/79/79d8c006....mp4
+4,tg:msg:<id>/<id>,downloaded,c46d95eb...78bb,media/c4/c46d95eb....mp4
+```
+
+- `SELECT count(*) FROM raw_records WHERE kind='ChannelContextReused'` = 0. Each
+  channel had a single segment, so no channel was resolved twice and no marker was
+  needed (the marker appears only when a channel spans several segments; that path is
+  covered by `tests/test_recipe_context.py` and `tests/test_reproject_fetch_media.py`).
+- `ls -A <scratch>/68/default/media/.incoming | wc -l` = 0.
+- `shasum -a 256` of the third file =
+  `c46d95eb04b4decfb2e392fb1277a96026e668fbe297674970e5e6b02b4578bb`, equal to its
+  `media.sha256`.
+- The single `pacing:` line (`factor=2.0 default=2.0s`) appears in this run, where
+  a gateway is built.
+
+Invocation 2 (same command, `--report <scratch>/68/report-2.csv`, counter 1 then 2
+of 5, VPN check repeated and both `utun4`): exit 0, no `pacing:` line (no gateway
+built), no RPC.
+
+```
+| already_stored   |    3 |      (offline classification: pending 0)
+| bytes downloaded |    0 |
+report-2.csv: 3 rows, all already_stored
+```
+
+Totals: 2 of 5 live invocations, 3 files, well under the 3 GB cap. No STOP
+condition was hit; `STOP-LIVE` was never created.
 
 ### Docs updated
 
