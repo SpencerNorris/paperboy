@@ -19,6 +19,8 @@ from paperboy.store.db import Store
 
 CID = 100
 IC = {"channel_id": CID, "access_hash": 7}
+# The receipt's sha must be the stored bytes' real sha: replay verifies it (#70).
+FILE_SHA = hashlib.sha256(b"file contents").hexdigest()
 
 
 def _seed(tmp_path):
@@ -60,7 +62,7 @@ def _seed(tmp_path):
                              "chats": [{"_": "Channel", "id": 200, "access_hash": 9}]},
                    "stranger", {"channel_id": CID},
                    observed_at="2026-01-01T00:05:00+00:00")
-        sha = "ab" + "0" * 62
+        sha = FILE_SHA
         path = profile_root / "media" / sha[:2] / f"{sha}.txt"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"file contents")
@@ -476,8 +478,8 @@ def _set_payload_path(db, kind, value):
 @pytest.mark.asyncio
 async def test_download_media_normalises_legacy_absolute_payload_path(tmp_path):
     db, _ = _seed(tmp_path)
-    sha = "ab" + "0" * 62
-    gone = tmp_path / "gone" / "data" / "default" / "media" / sha[:2] / f"{sha}.txt"
+    sha = FILE_SHA
+    gone =tmp_path / "gone" / "data" / "default" / "media" / sha[:2] / f"{sha}.txt"
     _set_payload_path(db, "MediaDownload", str(gone))  # the directory is never created
     src = ReplaySource.open(db, tmp_path)
     gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
@@ -494,3 +496,50 @@ async def test_download_media_payload_without_sha_is_a_skip(tmp_path):
     gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
     with MediaSink(tmp_path / "t.part") as sink, pytest.raises(SkipAndRecord):
         await gw.download_media({"channel_id": CID}, {"id": 2}, sink)
+
+
+@pytest.mark.asyncio
+async def test_download_media_rejects_a_file_whose_sha_differs_from_the_receipt(tmp_path):
+    db, root = _seed(tmp_path)
+    (root / "media" / FILE_SHA[:2] / f"{FILE_SHA}.txt").write_bytes(b"file c0ntents")  # bit rot
+    src = ReplaySource.open(db, root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with MediaSink(None) as sink, pytest.raises(SkipAndRecord, match="does not match"):
+        await gw.download_media(IC, {"id": 2}, sink)
+
+
+def test_resolve_catalogue_maps_targets_to_channel_ids(tmp_path):
+    from tests.test_profile_split import seed_two_target_source
+
+    db = seed_two_target_source(tmp_path)
+    run1, run2 = ReplaySource.open(db, tmp_path / "default").runs()[:2]
+    with Store.open(db) as st:
+        # A foreign resolve that landed on a USER (ADR-0005 "stray intrusion"):
+        # in run 2's rowid window, so no channel id, no username.
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer", "peer": {"_": "PeerUser", "user_id": 9},
+                    "chats": [], "users": []},
+                   "stranger", {"target": "@stray"}, observed_at="2026-01-01T00:00:00+00:00")
+    src = ReplaySource.open(db, tmp_path / "default")
+    records = src.resolve_catalogue()
+    assert [(r.run_id, r.raw_target, r.channel_id, r.username) for r in records] == [
+        (run1.run_id, "@alpha", 5, "alpha"),
+        (run2.run_id, "@beta", 6, "beta"),
+        (run2.run_id, "@stray", None, None),
+    ]
+    assert src.linked_group_map() == {6: 77}
+
+
+def test_resolve_catalogue_private_channel_has_no_username(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None,
+                   observed_at="2026-01-01T00:00:00+00:00")
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer",
+                    "peer": {"_": "PeerChannel", "channel_id": 8},
+                    "chats": [{"_": "Channel", "id": 8, "access_hash": 7}]},
+                   "stranger", {"target": "t.me/+abcdef"},
+                   observed_at="2026-01-01T00:00:01+00:00")
+    [rec] = ReplaySource.open(db, tmp_path).resolve_catalogue()
+    assert (rec.channel_id, rec.username) == (8, None)

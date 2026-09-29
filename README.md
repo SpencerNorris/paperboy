@@ -142,7 +142,7 @@ The collecting account's own record is scrubbed from exports.
 | `paperboy collect TARGET --profiles [--profile-budget N]` | Also run full profile enrichment (`getFullUser`, photo history, avatars) — the expensive opt-in on top of the always-on `getUsers` triage. |
 | `paperboy status [TARGET] [--profile P]` | Summarize stored data. |
 | `paperboy export TARGET --format jsonl --out DIR [--profile P]` | Export to JSONL. |
-| `paperboy reproject [--out PATH] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. Never writes into the source profile: the log goes beside `--out` (`paperboy.reprojected.sqlite.log` by default), and a read-only source profile works. Each run's receipts are read into an in-memory index once (an INFO `replay index …` line reports its size), so it scales to a real archive. |
+| `paperboy reproject [--out PATH \| --out-profile NAME] [--include-target T … \| --exclude-target T …] [--phases …] [--profile P]` | Rebuild every projection from `raw_records` into a fresh DB — offline, no network, no credentials. Never writes into the source profile: the log goes beside `--out` (`paperboy.reprojected.sqlite.log` by default), and a read-only source profile works. **Split a mixed profile** (#70): `--exclude-target T` replays everything but `T`, `--include-target T` only `T` (`@name`, `name` or a channel id; matched by resolved channel id; a linked group follows its parent); `--out-profile NAME` writes `data/NAME/paperboy.sqlite` and copies the media it references into `data/NAME/media/`. `scripts/unreferenced_media.py --profile P` lists (never deletes) the media a store no longer references. Each run's receipts are read into an in-memory index once (an INFO `replay index …` line reports its size), so it scales to a real archive. |
 | `paperboy watch` / `paperboy lookup` | Phase 2 — not implemented (exit with a notice). |
 
 `TARGET` accepts `@username`, `t.me/name`, `t.me/name/123`, an invite link, or a
@@ -172,6 +172,9 @@ Secrets (`api_hash`, session) live only in the Keychain. Key settings:
   paperboy.sqlite     # system of record: raw_records + normalized tables + FTS5
   paperboy.log        # credential-redacted JSON log
   paperboy.reprojected.sqlite(.log)  # `reproject` output and its log (default --out)
+  paperboy.split.sqlite(.log)        # an operator-chosen `--out` (e.g. `--exclude-target`), swapped in by hand
+                                     # `reproject --out-profile NAME` instead creates data/NAME/ with its
+                                     # own paperboy.sqlite, paperboy.sqlite.log and media/
   media/              # (Phase 2) downloaded files, content-addressed
     .incoming/        # in-flight downloads (*.part), swept after 1 h
 ```
@@ -256,7 +259,7 @@ uv run pyright            # type-check
 - [`docs/features/pacing.md`](docs/features/pacing.md) — request pacing and FLOOD_WAIT handling.
 - [`docs/features/media-streaming.md`](docs/features/media-streaming.md) — streamed media downloads, declared-size guard, free-disk floor, replay-untouched-source.
 - [`docs/features/person-layer.md`](docs/features/person-layer.md) — participants and profile enrichment.
-- [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript.
+- [`docs/features/reproject.md`](docs/features/reproject.md) — rebuild projections from raw, offline, with the real-archive smoke transcript; splitting a mixed profile (#70).
 - [`docs/research/telegram-extraction-surface.md`](docs/research/telegram-extraction-surface.md) — what the Telegram API does and does not expose, by access tier.
 - [`docs/superpowers/specs/2026-08-20-paperboy-design.md`](docs/superpowers/specs/2026-08-20-paperboy-design.md) — the design.
 - [`docs/adr/`](docs/adr/) — architecture decisions (library, storage, guardrails, sync).

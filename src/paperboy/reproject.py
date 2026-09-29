@@ -8,6 +8,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from typing import Literal
 
 from paperboy.clock import ReplayClock
 from paperboy.collectors.base import CollectResult
@@ -19,15 +20,138 @@ from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.participants import ParticipantsCollector
 from paperboy.collectors.profiles import ProfilesCollector
 from paperboy.collectors.web import WebCollector
-from paperboy.config import Settings
+from paperboy.config import Settings, profile_dir
 from paperboy.recipes import collect_channel
-from paperboy.replay import RawReplayGateway, RawReplayWebClient, ReplayRun, ReplaySource
+from paperboy.replay import (
+    RawReplayGateway,
+    RawReplayWebClient,
+    ReplayRun,
+    ReplaySource,
+    ResolveRecord,
+)
 from paperboy.store.db import Store, dumps
-from paperboy.targets import parse_target
+from paperboy.targets import Target, TargetKind, UnsupportedTarget, parse_target
 
 
 class ReprojectError(Exception):
     """Operator-facing reproject failure (empty source, bad --out)."""
+
+
+@dataclass(frozen=True)
+class TargetFilter:
+    """Which historical `(run, raw target)` pairs a reproject replays (#70).
+
+    `ids` are RESOLVED channel ids, never spellings: `@x` and `x` are the same
+    target. A linked discussion group needs no entry of its own; it is
+    collected inside its parent's pair."""
+
+    mode: Literal["include", "exclude"]
+    ids: frozenset[int]
+
+    def replays(self, channel_id: int) -> bool:
+        return (channel_id in self.ids) == (self.mode == "include")
+
+    def decide_run(self, records: list[ResolveRecord]) -> dict[str, bool]:
+        """`{raw target: replay?}` for the pairs of ONE run.
+
+        A pair that resolved to a channel is decided by `replays`. A pair with
+        no channel id (it resolved to a user, a stray intrusion, ADR-0005)
+        inherits the run's channel decisions: all replayed -> replayed, none
+        -> dropped, a mixed run keeps it in BOTH outputs (the caller warns).
+        A stray alone in its run has no channel to follow: it replays under
+        `exclude` (as an unfiltered reproject would) and not under `include`."""
+        channel_decisions = {
+            r.raw_target: self.replays(r.channel_id)
+            for r in records if r.channel_id is not None
+        }
+        followed = set(channel_decisions.values())
+        if len(followed) == 1:
+            stray = followed.pop()
+        elif followed:  # mixed run: kept in both outputs
+            stray = True
+        else:  # no channel pair in the run to follow
+            stray = self.mode == "exclude"
+        return {
+            r.raw_target: channel_decisions[r.raw_target] if r.channel_id is not None else stray
+            for r in records
+        }
+
+
+def is_mixed_run(filter_: TargetFilter, records: list[ResolveRecord]) -> bool:
+    """A run whose channel pairs are split between the outputs AND that holds a
+    stray (non-channel) pair, which then lands in both."""
+    channel = {filter_.replays(r.channel_id) for r in records if r.channel_id is not None}
+    return len(channel) > 1 and any(r.channel_id is None for r in records)
+
+
+def _describe_source_targets(source: ReplaySource, records: list[ResolveRecord]) -> str:
+    channels: dict[int, str | None] = {}
+    for r in records:
+        if r.channel_id is not None:
+            channels[r.channel_id] = r.username or channels.get(r.channel_id)
+    linked = source.linked_group_map()
+    parts = []
+    for cid, username in channels.items():
+        label = f"@{username} ({cid})" if username else f"channel {cid}"
+        if cid in linked:
+            label += f" [+ linked group {linked[cid]}]"
+        parts.append(label)
+    non_channel = sum(1 for r in records if r.channel_id is None)
+    return (
+        "this source contains: " + (", ".join(parts) or "no channels")
+        + f"; {non_channel} resolve(s) to non-channel peers"
+    )
+
+
+def resolve_target_filter(
+    source: ReplaySource, include: list[str], exclude: list[str]
+) -> TargetFilter | None:
+    """Turn `--include-target`/`--exclude-target` values into a `TargetFilter`
+    over resolved channel ids, or None when neither was given.
+
+    Accepted: `@username`, `username`, `t.me/username` (case-insensitive,
+    matched against the resolved channel's username AND the spelling the
+    target was originally collected with) or a bare channel id. Anything the
+    source never resolved to a channel is an error listing what it contains."""
+    if include and exclude:
+        raise ReprojectError("--include-target and --exclude-target are mutually exclusive")
+    specs = include or exclude
+    if not specs:
+        return None
+    records = source.resolve_catalogue()
+    ids: set[int] = set()
+    for spec in specs:
+        try:
+            wanted = parse_target(spec)
+        except UnsupportedTarget as exc:
+            raise ReprojectError(f"cannot use {spec!r} as a target: {exc}") from None
+        if wanted.kind not in (TargetKind.USERNAME, TargetKind.PEER_ID):
+            raise ReprojectError(
+                f"cannot use {spec!r} as a target: only @username or a channel id"
+            )
+        matched = {
+            r.channel_id for r in records
+            if r.channel_id is not None and _record_matches(r, wanted)
+        }
+        if not matched:
+            raise ReprojectError(
+                f"unknown target {spec!r}; {_describe_source_targets(source, records)}"
+            )
+        ids |= matched
+    return TargetFilter("include" if include else "exclude", frozenset(ids))
+
+
+def _record_matches(record: ResolveRecord, wanted: Target) -> bool:
+    if wanted.kind is TargetKind.PEER_ID:
+        return record.channel_id == int(wanted.value)
+    name = wanted.value.lower()
+    if record.username and record.username.lower() == name:
+        return True
+    try:
+        original = parse_target(record.raw_target)
+    except UnsupportedTarget:
+        return False
+    return original.kind is TargetKind.USERNAME and original.value.lower() == name
 
 
 REPROJECT_TABLES = (
@@ -137,6 +261,9 @@ async def reproject(
     profile: str,
     phases: list[str] | None,
     log: logging.Logger,
+    *,
+    target_filter: TargetFilter | None = None,
+    out_profile: str | None = None,
 ) -> ReprojectSummary:
     """Replay every historical collect pass in the source, one run at a time
     (ADR-0005): each run gets its own `ReplayClock`/`RawReplayGateway`/
@@ -146,15 +273,62 @@ async def reproject(
     faithfully re-reprojectable. `out_store` accumulates state across
     replayed runs exactly as the live store did across the real runs
     (`sync_state`, snapshot/metric time series, ...).
+
+    `target_filter` (#70) restricts the replay to the `(run, raw target)`
+    pairs it selects; the rest are not replayed at all, so the output holds no
+    raw rows, projections or media for them.
+
+    `out_profile` (#70) names the profile the output store lives in: the media
+    phase then COPIES each referenced file from the source profile into
+    `<data_dir>/<out_profile>/media/` (the only case replay writes files, and
+    never under the source profile). Without it media is only re-hashed.
     """
     runs = source.runs()
     if not runs:
         raise ReprojectError("source raw log is empty — nothing to reproject")
+    if out_profile is not None and (
+        profile_dir(settings, out_profile).resolve() == source.profile_root.resolve()
+    ):
+        raise ReprojectError(
+            f"--out-profile {out_profile!r} is the source profile itself; "
+            "a reproject never writes into its source"
+        )
+    media_profile = out_profile if out_profile is not None else profile
+
+    decisions: dict[str, dict[str, bool]] = {}
+    records_by_run: dict[str, list[ResolveRecord]] = {}
+    if target_filter is not None:
+        for rec in source.resolve_catalogue():
+            records_by_run.setdefault(rec.run_id, []).append(rec)
+        decisions = {rid: target_filter.decide_run(recs) for rid, recs in records_by_run.items()}
+    pairs_replayed = pairs_skipped = runs_touched = 0
 
     results: dict[str, list[CollectResult]] = {}
     phases_seen: list[str] = []
     replayed_any = False
     for run in runs:
+        run_decisions = decisions.get(run.run_id)
+        if target_filter is not None and run_decisions is not None:
+            recs = records_by_run[run.run_id]
+            for rec in recs:
+                log.info(
+                    "reproject: run=%s target=%s channel_id=%s decision=%s",
+                    run.run_id, rec.raw_target,
+                    rec.channel_id if rec.channel_id is not None else "none",
+                    "included" if run_decisions[rec.raw_target] else "excluded",
+                )
+            if is_mixed_run(target_filter, recs):
+                log.warning(
+                    "reproject: run %s mixes channel targets that land in different outputs; "
+                    "its non-channel (stray) resolve is replayed in BOTH",
+                    run.run_id,
+                )
+            kept = sum(run_decisions.values())
+            pairs_replayed += kept
+            pairs_skipped += len(recs) - kept
+            if not kept:
+                continue  # no index build, no replay for a wholly excluded run
+            runs_touched += 1
         _reset_incremental_backfill_state(out_store)
         # Per-run replay settings (plan D6): allow_join=True so a source whose
         # original run used --join replays its discussion sweep
@@ -195,6 +369,8 @@ async def reproject(
                 run.run_id, run.lo, run.hi, run.hi - run.lo + 1,
             )
         for raw_target in run_targets:
+            if run_decisions is not None and not run_decisions[str(raw_target)]:
+                continue  # logged above; belongs to the other output
             replayed_any = True
             clock = ReplayClock()
             gateway = RawReplayGateway(source, clock, run)
@@ -204,13 +380,13 @@ async def reproject(
                 ParticipantsCollector(), ProfilesCollector(),
                 GraphCollector(),
                 WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
-                MediaCollector(),
+                MediaCollector(copy_on_replay=out_profile is not None),
             ]
             try:
                 run_results = await collect_channel(
                     gateway, out_store, replay_settings, parse_target(raw_target),
                     list(run_phases), log,
-                    collectors=collectors, profile=profile, clock=clock,
+                    collectors=collectors, profile=media_profile, clock=clock,
                     run_id=run.run_id,
                 )
             except Exception as exc:
@@ -232,6 +408,17 @@ async def reproject(
                     CollectResult(name="target", counts={}, stopped=f"error: {exc}")
                 ]
             results.setdefault(raw_target, []).extend(run_results)
+    if target_filter is not None:
+        log.info(
+            "reproject: targets replayed=%d skipped=%d runs_touched=%d filter=%s ids=%s",
+            pairs_replayed, pairs_skipped, runs_touched, target_filter.mode,
+            sorted(target_filter.ids),
+        )
+        if not replayed_any:
+            raise ReprojectError(
+                f"--{target_filter.mode}-target leaves nothing to replay: every "
+                "(run, target) pair in the source is filtered out"
+            )
     if not replayed_any:
         raise ReprojectError(
             "source has no resolve records in raw_records — nothing to reproject"

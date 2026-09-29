@@ -35,9 +35,11 @@ profile-relative media keys (ADR-0007; migration 0006) have merged. #64 media st
 `size_mismatch`, `--media-min-free-gb` (#53), replay leaves the source
 untouched. #75 replay lookup performance is on
 `perf/replay-lookup` (PR pending; per-run in-memory raw index, no migration —
-`docs/features/reproject.md`). Next:
-#70 profile split, #68
-`fetch-media --list`. Order and protocol:
+`docs/features/reproject.md`). #70 profile split is on `feat/profile-split`
+(PR pending; `reproject --include-target/--exclude-target/--out-profile`,
+`scripts/unreferenced_media.py`, replay now verifies each media sha; no
+migration — `docs/features/reproject.md` "Splitting a mixed profile"). Next:
+#68 `fetch-media --list`. Order and protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
@@ -107,8 +109,10 @@ untouched. #75 replay lookup performance is on
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out
-PATH] [--phases a,b,c]` needs none of that — it never touches the network or
-the keychain, only a source `paperboy.sqlite`'s `raw_records`. `watch`/
+PATH | --out-profile NAME] [--include-target T | --exclude-target T] [--phases a,b,c]`
+needs none of that — it never touches the network or the keychain, only a
+source `paperboy.sqlite`'s `raw_records` (the target flags split a mixed
+profile, #70; `scripts/unreferenced_media.py --profile P` lists orphaned media). `watch`/
 `lookup` exit 1 with a "Phase 2" message — not implemented yet.
 
 ## Workflow

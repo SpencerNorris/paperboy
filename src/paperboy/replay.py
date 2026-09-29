@@ -11,6 +11,7 @@ executed (spec §3) — with the documented deviations D4.1–D4.4 in
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import json
 import logging
@@ -27,6 +28,7 @@ import httpx
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
+from paperboy.ids import primary_username
 from paperboy.media_keys import normalize_legacy_location, resolve_key_under
 from paperboy.media_sink import MediaSink, stream_file_into
 from paperboy.store.db import dumps
@@ -51,6 +53,33 @@ class ReplayRun:
     run_id: str
     lo: int  # first raw rowid of the pass (inclusive)
     hi: int  # last raw rowid of the pass (inclusive)
+
+
+@dataclass(frozen=True)
+class ResolveRecord:
+    """One `(run, raw target)` pair as `ResolvedPeer` recorded it (#70).
+
+    `channel_id` is the channel the target resolved to, or None when it
+    resolved to a non-channel peer (a user, a basic group). `username` is that
+    channel's current public username, None for a private channel."""
+
+    run_id: str
+    raw_target: str
+    channel_id: int | None
+    username: str | None
+
+
+def _resolved_channel(payload: dict) -> tuple[int | None, str | None]:
+    """`(channel id, username)` a `ResolvedPeer` payload resolved to; `(None,
+    None)` when the peer is not a channel (the same test `channel.py` applies
+    live, so a target the live collect would skip is unmatchable here too)."""
+    channel_id = (payload.get("peer") or {}).get("channel_id")
+    if not isinstance(channel_id, int):
+        return None, None
+    for chat in payload.get("chats") or []:
+        if isinstance(chat, dict) and chat.get("id") == channel_id:
+            return channel_id, primary_username(chat)
+    return channel_id, None
 
 
 def _kind_clause(kinds: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
@@ -538,6 +567,58 @@ class ReplaySource:
                 seen.setdefault(target)
         return list(seen)
 
+    def resolve_catalogue(self) -> list[ResolveRecord]:
+        """Every `(run, raw target)` pair with the channel id it resolved to,
+        from ONE pass over the `ResolvedPeer` rows (no per-run index builds, so
+        validating a `--include/--exclude-target` costs a query, not a
+        replay). Pairs are keyed and ordered exactly as `resolve_targets` does
+        (first-seen order, `_as_sqlite_json_value` on the context target); a
+        pair resolved twice in one run keeps its latest resolution, as
+        `RawReplayGateway.resolve` serves it."""
+        runs = self.runs()
+        los = [r.lo for r in runs]
+        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
+        pairs: dict[tuple[str, str], ResolveRecord] = {}
+        for row in self.conn.execute(
+            "SELECT id, context_json, payload_json FROM raw_records "
+            f"WHERE {kind_sql} ORDER BY id",
+            kind_params,
+        ):
+            i = bisect.bisect_right(los, row["id"]) - 1
+            if i < 0 or row["id"] > runs[i].hi:
+                continue  # in no run: never replayed, never catalogued
+            run = runs[i]
+            try:
+                ctx = json.loads(row["context_json"]) if row["context_json"] else {}
+            except ValueError:
+                raise ReprojectSourceError(
+                    f"raw record id={row['id']} in run {run.run_id} has malformed context_json"
+                ) from None
+            target = _as_sqlite_json_value(ctx.get("target") if isinstance(ctx, dict) else None)
+            if target is None:
+                continue
+            channel_id, username = _resolved_channel(json.loads(row["payload_json"]))
+            pairs[(run.run_id, str(target))] = ResolveRecord(
+                run.run_id, str(target), channel_id, username
+            )
+        return list(pairs.values())
+
+    def linked_group_map(self) -> dict[int, int]:
+        """`{channel id: linked discussion group id}` from every `ChatFull`
+        (latest wins) — so an unknown-target error can say which ids are a
+        parent's linked group (#70)."""
+        kind_sql, kind_params = _kind_clause(("chatfull",))
+        linked: dict[int, int] = {}
+        for row in self.conn.execute(
+            "SELECT json_extract(context_json, '$.channel_id') AS cid, "
+            "json_extract(payload_json, '$.full_chat.linked_chat_id') AS gid "
+            f"FROM raw_records WHERE {kind_sql} ORDER BY id",
+            kind_params,
+        ):
+            if isinstance(row["cid"], int) and isinstance(row["gid"], int) and row["gid"]:
+                linked[row["cid"]] = row["gid"]
+        return linked
+
     def linked_group_ids(self, run: ReplayRun) -> set[int]:
         chatfulls = self.index(run).entries(("chatfull",))
         linked: set[int] = set()
@@ -810,6 +891,13 @@ class RawReplayGateway:
             raise SkipAndRecord(f"replay: media file missing for sha {sha}")
         sink.reset()
         stream_file_into(path, sink, chunk_size=_CHUNK)
+        # The collector trusts the streamed fingerprint (it names the row and,
+        # when copying into another profile, the file): a rotted or swapped
+        # file must be a recorded skip, never a row filed under the wrong sha.
+        if sink.sha256 != sha:
+            raise SkipAndRecord(
+                f"replay: media file for sha {sha[:12]} does not match its receipt"
+            )
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
         return True
