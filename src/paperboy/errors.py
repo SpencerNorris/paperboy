@@ -136,6 +136,17 @@ def _hard_stop_error_classes() -> tuple[type[Exception], ...]:
     )
 
 
+def is_flood_wait(exc: BaseException) -> bool:
+    """True for a server-mandated wait (`FloodWaitError`, or the `FakeFlood` double).
+
+    `Budget` uses this to own the sleep-vs-stop decision itself (it compares the
+    *applied* wait, not the raw seconds, against the ceiling — #69).
+    """
+    from telethon.errors import FloodWaitError
+
+    return isinstance(exc, FloodWaitError | FakeFlood)
+
+
 def classify(exc: BaseException, threshold: int = DEFAULT_FLOOD_SLEEP_THRESHOLD) -> Disposition:
     """Map one RPC exception to a `Disposition` per spec §8.
 

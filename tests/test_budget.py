@@ -94,10 +94,12 @@ async def test_short_flood_wait_sleeps_and_retries(tmp_path):
 
         result = await b.call("messages.getHistory", flaky)
         assert result == "ok"
-        assert slept == [3]
-        row = st.conn.execute("select method, seconds from flood_log").fetchone()
+        assert slept == [9]  # ceil(3 * 1.1) + 5
+        row = st.conn.execute(
+            "select method, seconds, applied_seconds from flood_log"
+        ).fetchone()
         assert row["method"] == "messages.getHistory"
-        assert row["seconds"] == 3
+        assert (row["seconds"], row["applied_seconds"]) == (3, 9)
 
 
 @pytest.mark.asyncio
@@ -111,8 +113,8 @@ async def test_long_flood_wait_raises_phase_stop_and_persists_cooldown(tmp_path)
 
         with pytest.raises(PhaseStop):
             await b.call("messages.getHistory", boom)
-        row = st.conn.execute("select seconds from flood_log").fetchone()
-        assert row["seconds"] == 999
+        row = st.conn.execute("select seconds, applied_seconds from flood_log").fetchone()
+        assert (row["seconds"], row["applied_seconds"]) == (999, 1104)  # ceil(999*1.1)+5
 
 
 @pytest.mark.asyncio
@@ -254,7 +256,7 @@ async def test_per_method_interval_composes_with_flood_handling(tmp_path):
             return "ok"
 
         assert await b.call("users.getFullUser", flaky) == "ok"
-        assert 3 in slept
+        assert 9 in slept
         assert st.conn.execute("select count(*) from flood_log").fetchone()[0] == 1
 
 

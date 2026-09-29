@@ -1,27 +1,53 @@
 """The `Budget` gate: every Telegram RPC passes through here (ADR-0003).
 
-Enforces, in order, on every call: a per-run RPC cap, a per-method minimum
-call interval, and any persisted flood cooldown for that method — then runs
-the call and classifies failures per spec §8. A short `FLOOD_WAIT` is slept
-through and retried once; everything else becomes one of `SkipAndRecord`,
-`PhaseStop`, or `HardStop` so the recipe layer can react without a collector
-ever having to know a Telethon error class.
+Enforces, in order, on every call: a per-run RPC cap (every attempt counts), a
+per-method minimum call interval (base x `pacing_factor`), and any persisted
+flood cooldown for that method — then runs the call and classifies failures
+per spec §8. Patient by design (ADR-0003 amendment, #69): a `FLOOD_WAIT` is
+waited as `ceil(s x 1.1) + 5` seconds and retried, up to 3 consecutive floods
+per call, as long as that applied wait is within the `flood_sleep_threshold`
+ceiling; transient network errors retry 3 times at 5/10/20 s x factor.
+Everything else becomes one of `SkipAndRecord`, `PhaseStop`, or `HardStop` so
+the recipe layer can react without a collector ever having to know a Telethon
+error class.
 """
 
 from __future__ import annotations
 
 import inspect
+import logging
 import time as time_module
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
 from paperboy.config import Settings
-from paperboy.errors import Disposition, classify
+from paperboy.errors import Disposition, classify, is_flood_wait
 from paperboy.ids import to_iso
 from paperboy.store.db import Store
 
 T = TypeVar("T")
+
+log = logging.getLogger("paperboy.budget")
+
+# A server-mandated FLOOD_WAIT of `s` seconds is waited as ceil(s x 1.1) + 5.
+# The margin (10 % plus 5 s) exists so we never re-call at the exact instant the
+# server's window closes; it is a margin, not a multiplier, because the server's
+# number is not a guess of ours.
+FLOOD_MARGIN_NUMERATOR = 11  # x1.1, kept in integers to avoid float ceil error
+FLOOD_MARGIN_DENOMINATOR = 10
+FLOOD_MARGIN_EXTRA_SECONDS = 5
+
+MAX_FLOOD_RETRIES = 3  # consecutive floods slept and retried per call; a 4th stops the phase
+MAX_TRANSIENT_RETRIES = 3  # network-error retries per call; a 4th stops the phase
+TRANSIENT_BACKOFF_SECONDS = (5, 10, 20)  # base delays, x pacing_factor
+HEARTBEAT_SECONDS = 60  # long sleeps are chunked and logged at this cadence
+
+
+def flood_applied_seconds(seconds: int) -> int:
+    """The wait actually applied for a server `FLOOD_WAIT` of `seconds`."""
+    scaled = -(-seconds * FLOOD_MARGIN_NUMERATOR // FLOOD_MARGIN_DENOMINATOR)  # ceil
+    return scaled + FLOOD_MARGIN_EXTRA_SECONDS
 
 # BASE pacing between two calls to the *same* method. These are our own
 # assumptions about what Telegram tolerates, not measured limits (ADR-0003
@@ -137,11 +163,20 @@ class Budget:
         if seconds > 0:
             await _maybe_await(self._sleeper(seconds))
 
-    def _record_flood(self, method: str, seconds: int) -> None:
-        until = self._clock.time() + seconds
+    def _record_flood(self, method: str, seconds: int, applied: int) -> None:
+        """Persist a flood: the server's `seconds`, our `applied` wait, and the
+        cooldown deadline (`until`) derived from `applied`."""
+        until = self._clock.time() + applied
         self.store.conn.execute(
-            "INSERT INTO flood_log(method, until, seconds, recorded_at) VALUES (?, ?, ?, ?)",
-            (method, to_iso(datetime.fromtimestamp(until, tz=UTC)), seconds, self._now_iso()),
+            "INSERT INTO flood_log(method, until, seconds, applied_seconds, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                method,
+                to_iso(datetime.fromtimestamp(until, tz=UTC)),
+                seconds,
+                applied,
+                self._now_iso(),
+            ),
         )
 
     def _active_cooldown_seconds(self, method: str) -> float:
@@ -166,13 +201,8 @@ class Budget:
         # RETRY should never reach here — call() handles it before this point.
         raise AssertionError(f"unexpected disposition for re-raise: {disposition}")
 
-    async def call(self, method: str, factory: Callable[[], Awaitable[T]]) -> T:
-        if self._count >= self.settings.max_rpc_per_run:
-            raise HardStop(
-                f"max_rpc_per_run ({self.settings.max_rpc_per_run}) reached at {method!r}"
-            )
-        self._count += 1
-
+    async def _pace(self, method: str) -> None:
+        """Wait out this method's minimum interval and any persisted flood cooldown."""
         interval = self.effective_interval(method)
         last = self._last_call.get(method)
         if last is not None:
@@ -184,45 +214,94 @@ class Budget:
         if cooldown:
             await self._sleep(cooldown)
 
-        self._last_call[method] = self._clock.time()
+    def _take_rpc(self, method: str) -> None:
+        """Count one attempt against `max_rpc_per_run` (retries count too)."""
+        if self._count >= self.settings.max_rpc_per_run:
+            raise HardStop(
+                f"max_rpc_per_run ({self.settings.max_rpc_per_run}) reached at {method!r}"
+            )
+        self._count += 1
 
-        try:
-            return await factory()
-        except Exception as exc:
-            threshold = self.settings.flood_sleep_threshold
-            disposition = classify(exc, threshold=threshold)
-            if disposition is Disposition.PHASE_STOP:
-                # A FLOOD_WAIT over threshold: persist the cooldown (so a
-                # later call to this method — this run or the next — waits
-                # it out via `_active_cooldown_seconds`) and stop the phase.
-                self._record_flood(method, getattr(exc, "seconds", 0))
-                raise self._to_exception(disposition, exc) from exc
-            if disposition is not Disposition.RETRY:
-                raise self._to_exception(disposition, exc) from exc
+    async def _sleep_with_heartbeat(self, method: str, total: int) -> None:
+        """Sleep `total` seconds in chunks, logging INFO progress for long waits.
 
-            # `seconds` is only meaningful for a genuine FloodWaitError/
-            # FakeFlood retry; a transient ConnectionError/TimeoutError/OSError
-            # also classifies as RETRY but has no `.seconds`, so `getattr`
-            # falls back to 0 — guard `_record_flood` so those don't pollute
-            # `flood_log` with spurious (until=now, seconds=0) rows.
-            seconds = getattr(exc, "seconds", 0)
-            if seconds > 0:
-                self._record_flood(method, seconds)
-            await self._sleep(seconds)
+        Driven by a counter rather than the clock, so it behaves identically on
+        a fake clock. No line is logged after the final chunk, and none at all
+        for a wait shorter than one heartbeat.
+        """
+        remaining = total
+        while remaining > 0:
+            chunk = min(HEARTBEAT_SECONDS, remaining)
+            await self._sleep(chunk)
+            remaining -= chunk
+            if total >= HEARTBEAT_SECONDS and remaining > 0:
+                log.info(
+                    "flood wait on %s: %ds remaining of %ds total", method, remaining, total
+                )
+
+    async def call(self, method: str, factory: Callable[[], Awaitable[T]]) -> T:
+        """Run one RPC through the gate, retrying flood waits and transient errors.
+
+        `factory` is re-invoked for every attempt, so it must build a fresh
+        awaitable (and reset any streaming sink) each time.
+        """
+        floods = 0
+        transients = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            self._take_rpc(method)
+            if attempt == 1:
+                await self._pace(method)
             self._last_call[method] = self._clock.time()
+
             try:
                 return await factory()
-            except Exception as exc2:
-                d2 = classify(exc2, threshold=threshold)
-                if d2 is Disposition.RETRY:
-                    # A second consecutive flood wait is not retried again in
-                    # the same call — treat it as a phase stop so the caller
-                    # doesn't spin. The next run will see the persisted
-                    # cooldown via `_active_cooldown_seconds`.
-                    seconds2 = getattr(exc2, "seconds", 0)
-                    if seconds2 > 0:
-                        self._record_flood(method, seconds2)
-                    raise PhaseStop(str(exc2)) from exc2
-                if d2 is Disposition.PHASE_STOP:
-                    self._record_flood(method, getattr(exc2, "seconds", 0))
-                raise self._to_exception(d2, exc2) from exc2
+            except Exception as exc:
+                if is_flood_wait(exc):
+                    floods += 1
+                    await self._handle_flood(method, exc, floods)
+                    self._last_call[method] = self._clock.time()
+                    continue
+
+                disposition = classify(exc, threshold=self.settings.flood_sleep_threshold)
+                if disposition is not Disposition.RETRY:
+                    raise self._to_exception(disposition, exc) from exc
+
+                # A transient ConnectionError/TimeoutError/OSError: no
+                # `.seconds`, so it never touches `flood_log`.
+                transients += 1
+                if transients > MAX_TRANSIENT_RETRIES:
+                    raise PhaseStop(str(exc)) from exc
+                delay = TRANSIENT_BACKOFF_SECONDS[transients - 1] * self._factor
+                log.warning(
+                    "transient error on %s (%s); retry attempt %d/%d after %gs",
+                    method, type(exc).__name__, transients, MAX_TRANSIENT_RETRIES, delay,
+                )
+                await self._sleep(delay)
+
+    async def _handle_flood(self, method: str, exc: BaseException, floods: int) -> None:
+        """Record a FLOOD_WAIT, then either sleep it out or stop the phase.
+
+        The cooldown is persisted (based on the *applied* wait) before the
+        decision, so a later call to this method — this run or the next — waits
+        it out via `_active_cooldown_seconds` even when we stop here. The
+        ceiling is compared against the applied wait, not the raw seconds.
+        """
+        seconds = getattr(exc, "seconds", 0)
+        applied = flood_applied_seconds(seconds)
+        self._record_flood(method, seconds, applied)
+        if applied > self.settings.flood_sleep_threshold:
+            raise PhaseStop(
+                f"FLOOD_WAIT {seconds}s (applied {applied}s) exceeds the "
+                f"{self.settings.flood_sleep_threshold}s ceiling at {method!r}"
+            ) from exc
+        if floods > MAX_FLOOD_RETRIES:
+            raise PhaseStop(
+                f"FLOOD_WAIT on {method!r} repeated {floods} times in one call"
+            ) from exc
+        log.warning(
+            "FLOOD_WAIT %ds on %s: waiting %ds; retry attempt %d/%d",
+            seconds, method, applied, floods, MAX_FLOOD_RETRIES,
+        )
+        await self._sleep_with_heartbeat(method, applied)
