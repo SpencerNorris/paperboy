@@ -60,7 +60,12 @@ not fill the disk.
 - **Reproject.** `RawReplayGateway.download_media` streams the stored file
   through the sink (re-verifying its sha); the collector finds the
   destination present and discards the temp copy. Cost: one transient extra
-  write per replayed file (see `docs/features/reproject.md`).
+  write per replayed file (see `docs/features/reproject.md`). Replay forces
+  `media_min_free_gb=0`: it downloads nothing, and ENOSPC on the temp copy
+  already stops the phase, so a rebuild never depends on host free space.
+- **Durability.** `MediaSink.close()` fsyncs before the rename, so an OS crash
+  cannot leave a partial file under a final name; a failed close during
+  exception unwinding is logged, never allowed to mask the original error.
 
 ## Definition of done
 

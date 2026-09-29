@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
+import os
 import shutil
 from pathlib import Path
 from types import TracebackType
 from typing import IO
+
+log = logging.getLogger(__name__)
 
 
 class MediaSizeExceeded(Exception):
@@ -90,7 +94,12 @@ class MediaSink:
             raise MediaSinkWriteError(_describe(exc)) from exc
 
     def close(self) -> None:
+        """Flush, fsync and close, so a later rename never exposes bytes that
+        an OS crash could still lose."""
         try:
+            if not self._fh.closed:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
             self._fh.close()
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
@@ -117,7 +126,16 @@ class MediaSink:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+            return
+        # Already unwinding: a failed close must not replace the original
+        # exception (e.g. a per-file size mismatch becoming a phase stop).
+        try:
+            self.close()
+        except MediaSinkWriteError as close_exc:
+            log.warning("media sink close failed while handling %s: %s",
+                        exc_type.__name__, close_exc)
 
 
 def stream_file_into(path: Path, sink: MediaSink, *, chunk_size: int = 1 << 20) -> None:

@@ -98,3 +98,35 @@ def test_stream_file_into_copies_in_chunks(tmp_path: Path) -> None:
         stream_file_into(src, sink, chunk_size=4)
     assert Recording.writes == 3
     assert sink.sha256 == hashlib.sha256(b"0123456789").hexdigest()
+
+
+def test_close_fsyncs_before_closing(tmp_path, monkeypatch):
+    import os
+
+    synced: list[int] = []
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd))
+    with MediaSink(tmp_path / "f.part") as sink:
+        sink.write(b"abc")
+    assert len(synced) == 1
+
+
+def test_failed_close_does_not_mask_the_original_exception(tmp_path, monkeypatch):
+    import os
+
+    def _enospc(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", _enospc)
+    with pytest.raises(MediaSizeExceeded), MediaSink(tmp_path / "f.part", limit=2) as sink:
+        sink.write(b"abc")
+
+
+def test_failed_close_without_prior_error_still_raises(tmp_path, monkeypatch):
+    import os
+
+    def _enospc(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", _enospc)
+    with pytest.raises(MediaSinkWriteError), MediaSink(tmp_path / "f.part") as sink:
+        sink.write(b"abc")

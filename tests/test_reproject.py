@@ -530,6 +530,24 @@ def test_reproject_never_rewrites_media_files(tmp_path, monkeypatch):
     assert list((media / ".incoming").iterdir()) == []
 
 
+def test_reproject_ignores_the_live_free_disk_floor(tmp_path, monkeypatch):
+    """The free-disk floor protects the disk from downloads; replay downloads
+    nothing, so a nearly-full host must not change what a reproject rebuilds."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+
+    import paperboy.collectors.media as media_mod
+
+    monkeypatch.setattr(media_mod, "_free_bytes", lambda root: 0)
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
+
+
 # ---------------------------------------------------------------------------
 # Revision R (ADR-0005): the two-run round-trip gate (#33)
 # ---------------------------------------------------------------------------
