@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from typer.testing import CliRunner
 from paperboy.budget import PhaseStop
 from paperboy.cli import app
 from paperboy.config import load_settings
+from paperboy.media_keys import is_media_key, resolve_key_under
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource
 from paperboy.reproject import detect_phases
@@ -686,3 +688,36 @@ def test_reproject_does_not_truncate_a_backward_multi_run_backfill(tmp_path, mon
     assert sweep["max_id_seen"] == 1000
     assert sweep["pending_high"] == 1000
     assert sweep["backfill_complete"] is True
+
+
+def test_reproject_from_moved_profile_dir_with_legacy_payloads(tmp_path, monkeypatch):
+    """A pre-#62 archive (absolute paths in its raw payloads) whose profile dir
+    was moved elsewhere still reprojects, and the output holds only keys (#62)."""
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    src_db = asyncio.run(run_full_collect(old_root))
+    with sqlite3.connect(src_db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', "
+            "? || '/default/media/' || substr(json_extract(payload_json, '$.sha256'), 1, 2) "
+            "|| '/' || json_extract(payload_json, '$.sha256') || '.txt') "
+            "WHERE lower(kind) IN ('mediadownload', 'avatardownload')",
+            (str(old_root),),
+        )
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+    shutil.copytree(old_root / "default", new_root / "default")
+    shutil.rmtree(old_root / "default")  # the recorded absolute paths now dangle
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(new_root))
+    out_db = new_root / "out.sqlite"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out_db)])
+    assert result.exit_code == 0, result.output
+
+    with sqlite3.connect(out_db) as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
+        for table in ("media", "custody_log"):
+            paths = [r[0] for r in conn.execute(f"SELECT path FROM {table}")]
+            assert paths
+            for path in paths:
+                assert is_media_key(path)
+                assert resolve_key_under(new_root / "default", path).exists()
