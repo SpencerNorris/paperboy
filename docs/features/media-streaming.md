@@ -152,7 +152,7 @@ $ ls -la <scratch>/default/media/.incoming -> total 0 (empty)
 ```
 
 Peak RSS 77.4 MB for a 1,005,068,556-byte file (7.7% of the file size) on the
-final code. Feature totals: 3 files, about 2.2 GB downloaded; 3 of 5 live
+final code. Feature totals: 3 files, about 2.0 GB downloaded; 3 of 5 live
 invocations used.
 
 ### Replay smoke (spec 4.1): reproject reads the media, and writes nothing
