@@ -84,7 +84,8 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
-[--phases channel,history] [--unsafe]`, `status [TARGET]`, `export TARGET
+[--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S]`
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out
