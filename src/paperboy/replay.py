@@ -576,11 +576,11 @@ _CHUNK = 1 << 20
 
 class RawReplayGateway:
     """`Gateway` served from a raw log, scoped to ONE historical `ReplayRun`
-    (ADR-0005) — every query below is additionally bounded to
-    `id BETWEEN run.lo AND run.hi`, so within one run each call site has at
-    most one matching record, same as a live RPC has one now. Never touches
-    the network — there is no client, no session, no `Budget` anywhere in
-    this class."""
+    (ADR-0005). Every lookup is answered from the run's in-memory `RunIndex`
+    (#75), so within one run each call site has at most one matching record —
+    the latest, same as a live RPC has one now — and a lookup never scans the
+    run. Never touches the network — there is no client, no session, no
+    `Budget` anywhere in this class."""
 
     # Tells collectors this is a replay: they must not write to the source
     # profile (e.g. the media collector uses file-less hashing sinks).
@@ -594,53 +594,50 @@ class RawReplayGateway:
         # loop); a per-channel cursor over the stored pages models that.
         self._diff_cursor: dict[int, int] = {}
 
-    def _latest(
-        self, kinds: tuple[str, ...], where: str, params: tuple
-    ) -> sqlite3.Row | None:
-        kind_sql, kind_params = _kind_clause(kinds)
-        return self._src.conn.execute(
-            f"SELECT observed_at, payload_json FROM raw_records "
-            f"WHERE {kind_sql} AND {where} AND id BETWEEN ? AND ? ORDER BY id DESC LIMIT 1",
-            (*kind_params, *params, self._run.lo, self._run.hi),
-        ).fetchone()
+    @property
+    def _index(self) -> RunIndex:
+        # Cache hit after the first call of the run (`ReplaySource.index`).
+        return self._src.index(self._run)
 
-    def _serve(self, row: sqlite3.Row) -> dict:
+    def _latest(
+        self,
+        kinds: tuple[str, ...],
+        fields: tuple[str, ...],
+        values: tuple[object, ...],
+    ) -> RawEntry | None:
+        hits = self._index.lookup(kinds, fields, values)
+        return hits[-1] if hits else None
+
+    def _row(self, entry: RawEntry) -> sqlite3.Row:
+        return self._src.payloads([entry.id])[entry.id]
+
+    def _serve(self, entry: RawEntry) -> dict:
+        row = self._row(entry)
         payload = json.loads(row["payload_json"])
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
         return payload
 
     async def resolve(self, target_value: str) -> dict:
-        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
-        rows = self._src.conn.execute(
-            "SELECT observed_at, payload_json, "
-            "json_extract(context_json, '$.target') AS target "
-            f"FROM raw_records WHERE {kind_sql} AND id BETWEEN ? AND ? ORDER BY id DESC",
-            (*kind_params, self._run.lo, self._run.hi),
-        ).fetchall()
-        for row in rows:
-            raw_target = row["target"]
+        for entry in reversed(self._index.entries(("resolvedpeer",))):
+            raw_target = entry.ctx.get("target")
             if raw_target and parse_target(raw_target).value == target_value:
-                return self._serve(row)
+                return self._serve(entry)
         raise SkipAndRecord(f"replay: no ResolvedPeer recorded for {target_value!r}")
 
     async def get_full_channel(self, input_channel: dict) -> dict:
-        row = self._latest(
-            ("chatfull",),
-            "json_extract(context_json, '$.channel_id') = ?",
-            (input_channel["channel_id"],),
-        )
-        if row is None:
+        entry = self._latest(("chatfull",), ("channel_id",), (input_channel["channel_id"],))
+        if entry is None:
             raise SkipAndRecord(
                 f"replay: no ChatFull recorded for channel {input_channel['channel_id']}"
             )
-        return self._serve(row)
+        return self._serve(entry)
 
     async def get_self(self) -> dict:
-        row = self._latest(("user",), "tier = 'self'", ())
-        if row is None:
+        entry = self._latest(("user",), ("@tier",), ("self",))
+        if entry is None:
             raise SkipAndRecord("replay: no self User recorded")
-        return self._serve(row)
+        return self._serve(entry)
 
     async def iter_history(
         self, input_channel: dict, *, offset_id: int, limit: int
@@ -649,44 +646,43 @@ class RawReplayGateway:
         # cursor. Secondary order id ASC (capture order) so an edited
         # message's revisions replay oldest-first. MessageEmpty is excluded —
         # getHistory never yielded one; they came from the probe.
-        kind_sql, kind_params = _kind_clause(("message", "messageservice"))
-        rows = self._src.conn.execute(
-            "SELECT id, observed_at, payload_json, "
-            "CAST(json_extract(payload_json, '$.id') AS INTEGER) AS msg_id "
-            "FROM raw_records "
-            f"WHERE {kind_sql} "
-            "AND json_extract(context_json, '$.channel_id') = ? "
-            "AND (? = 0 OR CAST(json_extract(payload_json, '$.id') AS INTEGER) < ?) "
-            "AND id BETWEEN ? AND ? "
-            "ORDER BY msg_id DESC, id ASC",
-            (
-                *kind_params, input_channel["channel_id"], offset_id, offset_id,
-                self._run.lo, self._run.hi,
-            ),
-        ).fetchall()
+        hits = self._index.lookup(
+            ("message", "messageservice"), ("channel_id",), (input_channel["channel_id"],)
+        )
+        # SQL semantics preserved: a cursor excludes records with no numeric
+        # id (`NULL < x` is not true); no cursor keeps them, sorted last.
+        if offset_id != 0:
+            hits = [e for e in hits if e.payload_id is not None and e.payload_id < offset_id]
+        ordered = sorted(
+            hits,
+            key=lambda e: (1, 0, e.id) if e.payload_id is None else (0, -e.payload_id, e.id),
+        )
         # Never split one msg_id's records across pages: the collector's next
         # cursor is `min(page ids)` and the next page takes strictly-below,
         # so a split id's tail records would be unreachable forever.
-        page = list(rows[:limit])
-        while len(rows) > len(page) and rows[len(page)]["msg_id"] == page[-1]["msg_id"]:
-            page.append(rows[len(page)])
+        page = ordered[:limit]
+        while len(ordered) > len(page) and ordered[len(page)].payload_id == page[-1].payload_id:
+            page.append(ordered[len(page)])
+        rows = self._src.payloads(e.id for e in page)
         self._clock.begin_batch()
-        for row in page:
+        for entry in page:
+            row = rows[entry.id]
             self._clock.serve_json(row["observed_at"], row["payload_json"])
             yield json.loads(row["payload_json"])
 
     async def get_messages(self, input_channel: dict, ids: list[int]) -> list[dict]:
         channel_id = input_channel["channel_id"]
         self._clock.begin_batch()
+        found = {
+            i: e
+            for i in ids
+            if (e := self._latest(_MESSAGE_KINDS, ("channel_id", "@payload_id"), (channel_id, i)))
+        }
+        rows = self._src.payloads(e.id for e in found.values())
         out: list[dict] = []
         for i in ids:
-            row = self._latest(
-                ("message", "messageservice", "messageempty"),
-                "json_extract(context_json, '$.channel_id') = ? "
-                "AND CAST(json_extract(payload_json, '$.id') AS INTEGER) = ?",
-                (channel_id, i),
-            )
-            if row is None:
+            entry = found.get(i)
+            if entry is None:
                 # D4.1: a placeholder, NOT a synthetic messageEmpty — that
                 # would fabricate deletion evidence (mark_deleted evidence=
                 # 'empty') for ids the original run never observed as
@@ -696,9 +692,28 @@ class RawReplayGateway:
                 # the original source's state.
                 out.append({"_": "ReplayUnknownMessage", "id": i})
                 continue
+            row = rows[entry.id]
             self._clock.serve_json(row["observed_at"], row["payload_json"])
             out.append(json.loads(row["payload_json"]))
         return out
+
+    def _nested_match(self, channel_id: object, message: dict) -> sqlite3.Row | None:
+        """The latest stored message record of `channel_id` whose payload text
+        is exactly `dumps(message)` (how the original run stored it)."""
+        index = self._index
+        mid = message.get("id")
+        if isinstance(mid, int) and not isinstance(mid, bool):
+            hits = index.lookup(_MESSAGE_KINDS, ("channel_id", "@payload_id"), (channel_id, mid))
+        else:  # no plain integer id to key on: compare the channel's whole set
+            hits = index.lookup(_MESSAGE_KINDS, ("channel_id",), (channel_id,))
+        if not hits:
+            return None
+        text = dumps(message)
+        rows = self._src.payloads(e.id for e in hits)
+        for entry in reversed(hits):
+            if rows[entry.id]["payload_json"] == text:
+                return rows[entry.id]
+        return None
 
     async def get_channel_difference(self, input_channel: dict, pts: int, limit: int) -> dict:
         del limit
@@ -706,34 +721,28 @@ class RawReplayGateway:
         idx = self._diff_cursor.get(channel_id, 0)
         # Substring, not prefix/suffix: the stored kind is one of
         # `updates.channelDifference`/`...Empty`/`...TooLong` — namespaced
-        # AND suffixed, so `_kind_clause`'s suffix tolerance doesn't cover
-        # it; a plain "contains" match does.
-        row = self._src.conn.execute(
-            "SELECT observed_at, payload_json FROM raw_records "
-            "WHERE lower(kind) LIKE '%channeldifference%' "
-            "AND json_extract(context_json, '$.channel_id') = ? "
-            "AND id BETWEEN ? AND ? "
-            "ORDER BY id ASC LIMIT 1 OFFSET ?",
-            (channel_id, self._run.lo, self._run.hi, idx),
-        ).fetchone()
+        # AND suffixed, so the suffix rule doesn't cover it; "contains" does.
+        pages = self._index.lookup(
+            ("channeldifference",), ("channel_id",), (channel_id,), mode="contains"
+        )
+        entry = pages[idx] if idx < len(pages) else None
         self._diff_cursor[channel_id] = idx + 1
 
-        if row is None:
+        if entry is None:
             # D4.4: exhausted the stored pages — a synthetic final EMPTY
             # diff, not SkipAndRecord. A mid-catch_up SkipAndRecord would
             # mark the whole history phase skipped and discard the backfill
             # counts already applied this run.
-            stamp = self._src.conn.execute(
-                "SELECT MAX(observed_at) AS t FROM raw_records "
-                "WHERE json_extract(context_json, '$.channel_id') = ? "
-                "AND id BETWEEN ? AND ?",
-                (channel_id, self._run.lo, self._run.hi),
-            ).fetchone()
+            in_channel = self._index.ctx_groups("channel_id").get(channel_id, [])
+            stamp = max((e.observed_at for e in in_channel), default=None)
             synthetic = {"_": "updates.channelDifferenceEmpty", "final": True, "pts": pts}
             self._clock.begin_batch()
-            self._clock.serve(stamp["t"], synthetic)
+            # `stamp` is None when the channel has no records in the run —
+            # behaviour unchanged from the SQL MAX() this replaced.
+            self._clock.serve(stamp, synthetic)  # type: ignore[arg-type]
             return synthetic
 
+        row = self._row(entry)
         payload = json.loads(row["payload_json"])
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
@@ -748,11 +757,7 @@ class RawReplayGateway:
               if isinstance(u.get("message"), dict)),
         ]
         for m in nested:
-            m_row = self._latest(
-                ("message", "messageservice", "messageempty"),
-                "json_extract(context_json, '$.channel_id') = ? AND payload_json = ?",
-                (channel_id, dumps(m)),
-            )
+            m_row = self._nested_match(channel_id, m)
             if m_row is not None:
                 self._clock.serve_json(m_row["observed_at"], m_row["payload_json"])
         return payload
@@ -767,15 +772,12 @@ class RawReplayGateway:
         # `profiles`/`participants` record the account's own posture once per
         # run (spec §4.3, `posture.py`) — that IS a recorded observation
         # (unlike `doctor`'s own reads, which are never recorded).
-        row = self._latest(
-            ("account.privacyrules", "privacyrules"),
-            "json_extract(context_json, '$.key') = ?", (key,),
-        )
-        if row is None:
+        entry = self._latest(("account.privacyrules", "privacyrules"), ("key",), (key,))
+        if entry is None:
             raise SkipAndRecord(
                 "replay: privacy posture not recorded for this run; reproject never runs doctor"
             )
-        return self._serve(row)
+        return self._serve(entry)
 
     def _resolve_payload_file(self, stored: str, sha: str) -> Path:
         """Resolve a `MediaDownload`/`AvatarDownload` payload's location under the
@@ -791,14 +793,13 @@ class RawReplayGateway:
     async def download_media(
         self, input_channel: dict, message: dict, sink: MediaSink
     ) -> bool:
-        row = self._latest(
-            ("mediadownload",),
-            "json_extract(context_json, '$.channel_id') = ? "
-            "AND json_extract(context_json, '$.msg_id') = ?",
+        entry = self._latest(
+            ("mediadownload",), ("channel_id", "msg_id"),
             (input_channel["channel_id"], message["id"]),
         )
-        if row is None:
+        if entry is None:
             return False
+        row = self._row(entry)
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
         path = self._resolve_payload_file(payload["path"], sha)
@@ -813,27 +814,23 @@ class RawReplayGateway:
         return True
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
-        row = self._latest(
-            ("chats", "chatsslice"),
-            "json_extract(context_json, '$.channel_id') = ?",
-            (input_channel["channel_id"],),
+        entry = self._latest(
+            ("chats", "chatsslice"), ("channel_id",), (input_channel["channel_id"],)
         )
-        if row is None:
+        if entry is None:
             raise SkipAndRecord(
                 "replay: no channel recommendations recorded for channel "
                 f"{input_channel['channel_id']}"
             )
-        return self._serve(row)
+        return self._serve(entry)
 
     async def check_chat_invite(self, hash_: str) -> dict:
-        row = self._latest(
-            ("chatinvite", "chatinvitealready", "chatinvitepeek"),
-            "json_extract(context_json, '$.hash') = ?",
-            (hash_,),
+        entry = self._latest(
+            ("chatinvite", "chatinvitealready", "chatinvitepeek"), ("hash",), (hash_,)
         )
-        if row is None:
+        if entry is None:
             raise SkipAndRecord(f"replay: no ChatInvite recorded for hash {hash_!r}")
-        return self._serve(row)
+        return self._serve(entry)
 
     async def join_channel(self, input_channel: dict) -> dict:
         # D4.3: reproject always runs with allow_join=True so a source whose
@@ -844,22 +841,19 @@ class RawReplayGateway:
         return {"_": "Updates", "updates": []}
 
     async def get_sponsored_messages(self, input_channel: dict) -> dict:
-        kind_sql, kind_params = _kind_clause(("sponsoredmessage",))
-        rows = self._src.conn.execute(
-            "SELECT observed_at, payload_json FROM raw_records "
-            f"WHERE {kind_sql} "
-            "AND json_extract(context_json, '$.channel_id') = ? "
-            "AND id BETWEEN ? AND ? ORDER BY id ASC",
-            (*kind_params, input_channel["channel_id"], self._run.lo, self._run.hi),
-        ).fetchall()
+        hits = self._index.lookup(
+            ("sponsoredmessage",), ("channel_id",), (input_channel["channel_id"],)
+        )
         self._clock.begin_batch()
-        if not rows:
+        if not hits:
             # D4.2: the original collector never stores the envelope, only
             # each SponsoredMessage individually — empty-and-skipped
             # originals are indistinguishable, so both project nothing.
             return {"_": "sponsoredMessagesEmpty"}
+        rows = self._src.payloads(e.id for e in hits)
         messages = []
-        for row in rows:
+        for entry in hits:
+            row = rows[entry.id]
             self._clock.serve_json(row["observed_at"], row["payload_json"])
             messages.append(json.loads(row["payload_json"]))
         return {"_": "SponsoredMessages", "messages": messages}
@@ -871,76 +865,78 @@ class RawReplayGateway:
         self, input_channel: dict, filter: dict, offset: int, limit: int, hash_: int = 0
     ) -> dict:
         del limit, hash_
-        row = self._latest(
+        entry = self._latest(
             ("channels.channelparticipants", "channels.channelparticipantsnotmodified"),
-            "json_extract(context_json, '$.channel_id') = ? "
-            "AND json_extract(context_json, '$.filter') = ? "
-            "AND json_extract(context_json, '$.offset') = ?",
+            ("channel_id", "filter", "offset"),
             (input_channel["channel_id"], filter.get("_"), offset),
         )
-        if row is None:
+        if entry is None:
             raise SkipAndRecord(
                 f"replay: no {filter.get('_')} page at offset {offset} recorded for "
                 f"channel {input_channel['channel_id']}"
             )
-        return self._serve(row)
+        return self._serve(entry)
 
     async def get_participant(self, input_channel: dict, participant: dict) -> dict | None:
-        row = self._latest(
+        entry = self._latest(
             ("channels.channelparticipant", "usernotparticipant"),
-            "json_extract(context_json, '$.channel_id') = ? "
-            "AND json_extract(context_json, '$.user_id') = ?",
+            ("channel_id", "user_id"),
             (input_channel["channel_id"], participant["user_id"]),
         )
-        if row is None:
+        if entry is None:
             raise SkipAndRecord(
                 f"replay: no getParticipant answer recorded for user {participant['user_id']}"
             )
-        payload = self._serve(row)
+        payload = self._serve(entry)
         # The definitive negative was stored as a synthetic record (plan D4);
         # served so the clock has its stamp, then returned as the None it was.
         return None if (payload.get("_") or "").lower() == "usernotparticipant" else payload
 
     async def get_users(self, refs: list[dict]) -> list[dict]:
         self._clock.begin_batch()
+        found = {
+            ref["user_id"]: e
+            for ref in refs
+            if (e := self._latest(
+                ("user", "userempty"), ("method", "user_id"),
+                ("users.getUsers", ref["user_id"]),
+            ))
+        }
+        rows = self._src.payloads(e.id for e in found.values())
         out: list[dict] = []
         for ref in refs:
-            row = self._latest(
-                ("user", "userempty"),
-                "json_extract(context_json, '$.method') = 'users.getUsers' "
-                "AND json_extract(context_json, '$.user_id') = ?",
-                (ref["user_id"],),
-            )
-            if row is None:
+            entry = found.get(ref["user_id"])
+            if entry is None:
                 # D4.1's analogue: a placeholder the collector ignores — never
                 # a synthetic UserEmpty, which would fabricate a "deleted
                 # account" observation the original run never made.
                 out.append({"_": REPLAY_UNKNOWN_USER_KIND, "id": ref["user_id"]})
                 continue
+            row = rows[entry.id]
             self._clock.serve_json(row["observed_at"], row["payload_json"])
             out.append(json.loads(row["payload_json"]))
         return out
 
     async def get_full_user(self, ref: dict) -> dict:
-        row = self._latest(("users.userfull",),
-                           "json_extract(context_json, '$.user_id') = ?", (ref["user_id"],))
-        if row is None:
+        entry = self._latest(("users.userfull",), ("user_id",), (ref["user_id"],))
+        if entry is None:
             raise SkipAndRecord(f"replay: no UserFull recorded for user {ref['user_id']}")
-        return self._serve(row)
+        return self._serve(entry)
 
     async def get_user_photos(self, ref: dict, *, offset: int, max_id: int, limit: int) -> dict:
         del offset, max_id, limit
-        row = self._latest(("photos.photos", "photos.photosslice"),
-                           "json_extract(context_json, '$.user_id') = ?", (ref["user_id"],))
-        if row is None:
+        entry = self._latest(
+            ("photos.photos", "photos.photosslice"), ("user_id",), (ref["user_id"],)
+        )
+        if entry is None:
             raise SkipAndRecord(f"replay: no photo history recorded for user {ref['user_id']}")
-        return self._serve(row)
+        return self._serve(entry)
 
     async def download_user_photo(self, photo: dict) -> bytes | None:
-        row = self._latest(("avatardownload",),
-                           "json_extract(context_json, '$.photo_id') = ?", (photo["id"],))
-        if row is None:
+        entry = self._latest(("avatardownload",), ("photo_id",), (photo["id"],))
+        if entry is None:
             return None
+        row = self._row(entry)
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
         path = self._resolve_payload_file(payload["path"], sha)
@@ -955,18 +951,16 @@ class RawReplayGateway:
         self, input_channel: dict, msg_id: int, *, offset: str | None, limit: int
     ) -> dict:
         del limit
-        row = self._latest(
+        entry = self._latest(
             ("messages.messagereactionslist",),
-            "json_extract(context_json, '$.channel_id') = ? "
-            "AND json_extract(context_json, '$.msg_id') = ? "
-            "AND json_extract(context_json, '$.offset') = ?",
+            ("channel_id", "msg_id", "offset"),
             (input_channel["channel_id"], msg_id, offset or ""),
         )
-        if row is None:
+        if entry is None:
             raise SkipAndRecord(
                 f"replay: no reaction list recorded for message {msg_id} at offset {offset!r}"
             )
-        return self._serve(row)
+        return self._serve(entry)
 
 
 class RawReplayWebClient:
@@ -989,16 +983,15 @@ class RawReplayWebClient:
         self._served: dict[str, int] = {}  # url -> raw id already served
 
     def get(self, url: str) -> httpx.Response:
-        row = self._src.conn.execute(
-            "SELECT id, observed_at, payload_json FROM raw_records "
-            "WHERE lower(kind) IN ('tme_page', 'wayback_cdx') "
-            "AND json_extract(payload_json, '$.url') = ? AND id > ? AND id <= ? "
-            "ORDER BY id ASC LIMIT 1",
-            (url, self._served.get(url, self._run.lo - 1), self._run.hi),
-        ).fetchone()
-        if row is None:
+        captures = self._src.index(self._run).lookup(
+            _WEB_KINDS, ("@url",), (url,), mode="exact"
+        )
+        after = self._served.get(url, self._run.lo - 1)
+        entry = next((e for e in captures if e.id > after), None)
+        if entry is None:
             return httpx.Response(404, text="")
-        self._served[url] = row["id"]
+        self._served[url] = entry.id
+        row = self._src.payloads([entry.id])[entry.id]
         payload = json.loads(row["payload_json"])
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])

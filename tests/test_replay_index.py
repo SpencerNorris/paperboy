@@ -4,13 +4,15 @@ one walk of the run's rowid window."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 
 import pytest
 
 from paperboy import replay
-from paperboy.replay import ReplaySource, kind_matches
+from paperboy.clock import ReplayClock
+from paperboy.replay import RawReplayGateway, ReplaySource, kind_matches
 from paperboy.store.db import Store
 
 SPELLINGS = [
@@ -144,3 +146,39 @@ def test_payloads_missing_id_raises(tmp_path):
         assert set(got) == set(ids)
         with pytest.raises(replay.ReprojectSourceError):
             src.payloads([ids[-1] + 1000])
+
+
+# --- Gateway lookups run no range query ---------------------------------------
+
+
+def _media_run(st):
+    st.add_raw("User", {"_": "user", "id": 1}, "self", None, observed_at="t1")
+    for mid in range(1, 4):
+        st.add_raw("MediaDownload", {"sha256": "ab" * 32, "path": "media/ab/x"}, "stranger",
+                   {"channel_id": 5, "msg_id": mid}, observed_at=f"t{mid}")
+
+
+def test_gateway_lookups_issue_no_sql_beyond_a_point_fetch(tmp_path):
+    with _source(tmp_path, _media_run) as src:
+        run = src.runs()[0]
+        gw = RawReplayGateway(src, ReplayClock(), run)
+        src.index(run)  # the one walk happens before we start counting
+        stmts: list[str] = []
+        src.conn.set_trace_callback(stmts.append)
+        try:
+            for mid in range(100, 150):  # misses never touch the sink
+                assert not asyncio.run(gw.download_media({"channel_id": 5}, {"id": mid}, None))  # type: ignore[arg-type]
+            asyncio.run(gw.get_messages({"channel_id": 5}, [1]))  # miss -> placeholder
+            assert [s for s in stmts if "raw_records" in s] == []
+            asyncio.run(gw.get_self())  # a hit: exactly one point fetch
+            fetches = [s for s in stmts if "raw_records" in s]
+            assert len(fetches) == 1
+        finally:
+            src.conn.set_trace_callback(None)
+        plan = " ".join(
+            r[3] for r in src.conn.execute(
+                "EXPLAIN QUERY PLAN SELECT id, observed_at, payload_json FROM raw_records "
+                "WHERE id IN (?)", (1,)
+            )
+        )
+        assert "USING INTEGER PRIMARY KEY (rowid=?)" in plan
