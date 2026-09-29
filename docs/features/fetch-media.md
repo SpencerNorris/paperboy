@@ -149,4 +149,74 @@ Each segment is a normal run, with two additions so `reproject` reproduces it
 
 ## Definition of done
 
-See the Smoke test transcript section below (appended when the gates ran).
+Redaction: channels are `@<channel>`, ids `<id>`; unredacted transcripts stay in
+`<scratch>/68/`. The operator's list, its rows and channels appear nowhere here.
+
+### Gates (pasted output)
+
+```
+$ uv run pytest -q
+929 passed in 84.02s (0:01:24)
+$ uv run ruff check
+All checks passed!
+$ uv run pyright
+0 errors, 0 warnings, 0 informations
+```
+
+### Smoke test transcript
+
+**Offline, synthetic list** (`tests/fixtures/media_list/synthetic.csv` against a
+synthetic two-channel store; no gateway, no keychain, no network; the CLI tests
+assert both constructors are never called). Command:
+`PAPERBOY_DATA_DIR=<scratch>/68/synthetic paperboy fetch-media tests/fixtures/media_list/synthetic.csv --dry-run`
+
+```
+  fetch-media: offline classification  
+┏━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
+┃ outcome        ┃ rows ┃ declared GB ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
+│ duplicate_row  │    1 │        0.00 │
+│ not_in_store   │    1 │        0.00 │
+│ deleted        │    0 │        0.00 │
+│ no_media       │    0 │        0.00 │
+│ unresolvable   │    0 │        0.00 │
+│ already_stored │    0 │        0.00 │
+│ pending        │    5 │        0.00 │
+│ total          │    7 │        0.00 │
+└────────────────┴──────┴─────────────┘
+         fetch-media: segment plan (list order)         
+┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
+┃ segment ┃ priority ┃ channel id ┃ rows ┃ declared GB ┃
+┡━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
+│       1 │ P1       │         10 │    1 │        0.00 │
+│       2 │ P1       │         20 │    1 │        0.00 │
+│       3 │ P2       │         10 │    2 │        0.00 │
+│       4 │ P2       │         20 │    1 │        0.00 │
+└─────────┴──────────┴────────────┴──────┴─────────────┘
+```
+
+No `pacing:` line appears (no gateway was built).
+
+**Offline, the operator's full list on the `.backup` copy: PENDING.** The
+permission classifier refused the command that runs `--dry-run` over the
+operator's private list (reason given: "Sensitive-Source Provenance"), so this
+agent did not read that list in any form and did not try another route. Nothing
+is claimed about its counts. To close it, the operator runs:
+`PAPERBOY_DATA_DIR=<scratch>/68 paperboy fetch-media <list> --dry-run --profile default`
+on a `sqlite3 .backup` copy and checks that the outcome table has `unresolvable`
+for the split-out investigation's linked group, and no `pacing:` log line.
+
+**Live, 3-row slice and its re-run: PENDING** for the same reason (the smoke slice
+is chosen from that list, and the run rules forbid choosing rows any other way).
+No live call was made: the live-call counter is 0 of 5, no `STOP-LIVE` flag was
+set, and the VPN check was not reached. Not a code failure; the driver, resume
+(`already_stored` with no gateway) and report paths are covered offline by
+`tests/test_fetch_media.py` and `tests/test_cli_fetch_media.py`.
+
+### Docs updated
+
+`docs/features/fetch-media.md` (new), `README.md` (command row, data layout,
+documentation list), `CLAUDE.md` (commands, status line), `docs/how-it-works.md`
+§6, `docs/features/pacing.md`, `docs/features/reproject.md`,
+`docs/adr/0005-run-structure.md`, `docs/data-model.md` (two raw kinds; no
+schema change), `docs/superpowers/plans/2026-09-29-media-list-fetch.md`.
