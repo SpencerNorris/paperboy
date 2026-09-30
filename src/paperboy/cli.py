@@ -405,19 +405,19 @@ async def _run_fetch(settings, profile, store, classified, log, report_path):
     try:
         secrets = composition.build_secrets(profile)
         gateway = await composition.build_gateway(settings, secrets, profile, store)
+        checks = [] if settings.unsafe else await run_doctor(gateway, settings)
     except BaseException:
-        # The report is written in every case, including auth/keychain failures.
+        # The report is written in every case, including auth/keychain and
+        # doctor-preflight failures.
         write_report(report_path, store, initial_results(classified))
         raise
-    if not settings.unsafe:
-        checks = await run_doctor(gateway, settings)
-        if doctor_blocks(checks):
-            write_report(report_path, store, initial_results(classified))
-            console.print(
-                "[red]doctor preflight failed[/] — refusing to fetch. "
-                "Run `paperboy doctor` for details, or pass --unsafe to override."
-            )
-            raise typer.Exit(code=1)
+    if not settings.unsafe and doctor_blocks(checks):
+        write_report(report_path, store, initial_results(classified))
+        console.print(
+            "[red]doctor preflight failed[/] — refusing to fetch. "
+            "Run `paperboy doctor` for details, or pass --unsafe to override."
+        )
+        raise typer.Exit(code=1)
     return await fetch_media(
         gateway, store, settings, classified, log, profile=profile, report_path=report_path
     )

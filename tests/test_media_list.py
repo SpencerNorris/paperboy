@@ -201,3 +201,16 @@ def test_segments_group_by_priority_then_channel_in_first_appearance_order(tmp_p
             ("P2", 10, "chan_a", [3]),
             ("P2", 20, "chan_b", [2]),
         ]
+
+
+def test_quoted_csv_header_is_detected(tmp_path):
+    path = _write(tmp_path, "l.csv", '"uri","priority"\ntg:msg:1/1,P1\n')
+    rows = parse_media_list(path)
+    assert [(r.uri, r.priority) for r in rows] == [("tg:msg:1/1", "P1")]
+
+
+def test_private_link_without_message_id_is_malformed(tmp_path):
+    path = _write(tmp_path, "l.txt", "tg:msg:1/1\nhttps://t.me/c/12345\n")
+    with pytest.raises(MediaListError) as exc:
+        parse_media_list(path)
+    assert exc.value.line_nos == [2]

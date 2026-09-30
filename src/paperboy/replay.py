@@ -691,7 +691,9 @@ class ReplaySource:
         """The `access_hash` the `ResolvedPeer` of run `run_id` recorded for
         `channel_id`. Raises `ReprojectSourceError` if that run is not in the
         log or never resolved the channel - a marker pointing nowhere is a
-        corrupt source, never guessed around."""
+        corrupt source, never guessed around. A resolved chat that carries no int
+        `access_hash` yields 0, a deliberate placeholder: `RawReplayGateway`
+        keys its lookups on `channel_id` alone and never reads the hash."""
         run = next((r for r in self.runs() if r.run_id == run_id), None)
         if run is None:
             raise ReprojectSourceError(

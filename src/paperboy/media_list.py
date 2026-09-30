@@ -77,6 +77,8 @@ def _parse_uri(text: str) -> tuple[int | None, str | None, int] | None:
     if m := _LINK_C_RE.match(text):
         return int(m.group(1)), None, int(m.group(2))
     if m := _LINK_USER_RE.match(text):
+        if m.group(1).lower() == "c":
+            return None  # `t.me/c/<id>` is a private-channel link missing its message id
         return None, m.group(1).lower(), int(m.group(2))
     return None
 
@@ -110,7 +112,9 @@ def parse_media_list(path: Path) -> list[ListRow]:
     first = next(
         (ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")), None
     )
-    is_csv = first is not None and "uri" in [f.strip().lower() for f in first.split(",")]
+    is_csv = first is not None and "uri" in [
+        f.strip().lower() for f in next(csv.reader([first]), [])
+    ]
 
     rows: list[ListRow] = []
     bad: list[int] = []

@@ -232,6 +232,34 @@ async def test_report_written_on_unexpected_error(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unexpected_error_mid_segment_keeps_earlier_rows_downloaded(tmp_path):
+    """The crash hits the second row of the P2/chan_a segment (msgs 2, 3): row 2
+    was already downloaded and recorded, so the report must say so."""
+
+    class Boom(Exception):
+        pass
+
+    gw = _gateway({**BYTES, 3: Boom("bug")})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        with pytest.raises(Boom):
+            await fetch_media(
+                gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+                profile="p", report_path=report,
+            )
+        stored = st.conn.execute(
+            "SELECT sha256, path FROM media WHERE message_uri = 'tg:msg:10/2'"
+        ).fetchone()
+    assert stored is not None
+    by_uri = {r["uri"]: r for r in _report(report)}
+    assert by_uri["tg:msg:10/2"]["outcome"] == "downloaded"
+    assert by_uri["tg:msg:10/2"]["sha256"] == stored["sha256"]
+    assert by_uri["tg:msg:10/2"]["key"] == stored["path"]
+    assert by_uri["tg:msg:10/3"]["outcome"] == "not_attempted"
+
+
+@pytest.mark.asyncio
 async def test_channel_phase_stop_ends_the_command(tmp_path):
     """A channel-phase PhaseStop (e.g. resolve FLOOD_WAIT over the ceiling) must
     not go on to channel B: its RPC would sleep the persisted cooldown."""

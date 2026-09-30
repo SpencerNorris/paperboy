@@ -149,15 +149,20 @@ async def _run_segments(
             }
         )
         cached = contexts.get(seg.channel_id)
-        phase_results, established = await collect_channel_with_context(
-            gateway, store, seg_settings, parse_target(f"@{seg.username}"),
-            ["channel", "media"], log,
-            collectors=[_ExpectChannel(seg.channel_id), MediaCollector(outcomes=outcomes)],
-            profile=profile, channel_context=cached,
-        )
-        for uri, outcome in outcomes.items():
-            if uri in by_uri:
-                by_uri[uri].outcome = outcome
+        try:
+            phase_results, established = await collect_channel_with_context(
+                gateway, store, seg_settings, parse_target(f"@{seg.username}"),
+                ["channel", "media"], log,
+                collectors=[_ExpectChannel(seg.channel_id), MediaCollector(outcomes=outcomes)],
+                profile=profile, channel_context=cached,
+            )
+        finally:
+            # Merge even when an unexpected error escapes mid-segment: rows the
+            # media phase already downloaded and recorded must be reported as
+            # such, not left `not_attempted`.
+            for uri, outcome in outcomes.items():
+                if uri in by_uri:
+                    by_uri[uri].outcome = outcome
         log.info(
             "%s end: %s", label, dict(Counter(outcomes.values())) or "no files considered"
         )
