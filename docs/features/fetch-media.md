@@ -159,7 +159,7 @@ Redaction: channels are `@<channel>`, ids `<id>`; unredacted transcripts stay in
 
 ```
 $ uv run pytest -q
-929 passed in 79.51s (0:01:19)
+933 passed in 77.40s (0:01:17)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
