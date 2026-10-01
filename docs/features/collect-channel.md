@@ -421,20 +421,56 @@ by id are pinned by tests in `tests/test_collector_channel.py` and
 `tests/test_profile_split.py`.
 
 Offline smoke on a scratch `.backup` of the store (redacted; the real data
-dir is read-only):
+dir is read-only). Output is verbatim apart from `<id>` substitutions; the
+rejection is a clean one-line message with exit 1 and no traceback (an earlier
+revision of this doc showed only the tail of a Rich traceback; fixed in
+`_parse_target_or_exit`, pinned by `test_negative_non_channel_id_is_rejected_without_a_traceback`):
 
 ```
 $ paperboy status --profile default -- <id>          # bare id
   messages 8400 / revisions 8400 / tombstones 304
 $ paperboy status --profile default -- -100<id>      # marked form, same channel
 $ paperboy status --profile default -- -123
-UnsupportedTarget: '-123' is a basic group or user id (channel ids look like
--100<id>); collecting non-channel peers is out of scope
+'-123' is a basic group or user id (channel ids look like -100<id>); collecting 
+non-channel peers is out of scope
+exit=1
+$ paperboy collect --profile default --phases channel -- -123
+'-123' is a basic group or user id (channel ids look like -100<id>); collecting 
+non-channel peers is out of scope
+exit=1
 $ paperboy status --profile default -- 999
-No local data for '999' yet - run `collect` first.
-$ paperboy reproject --profile default --exclude-target -100<id> --phases channel
-  8 x "reproject: run=<run> target=@<channel> channel_id=<id> decision=excluded"
-  ChannelAccess rows: source 36 -> output 28 (36 minus the 8 excluded runs)
+No local data for '999' yet — run `collect` first.
+exit=1
+```
+
+Reproject of the post-live scratch store (offline, a fresh `.backup` copy,
+`--phases channel`). Source `ChannelAccess` rows by `via`: `from_message` 1,
+`handle` 1, `saved_key` 2 (the four live runs; nothing earlier carries a
+receipt). `--exclude-target -100<minid>` (the min channel):
+
+```
+$ paperboy reproject --profile default --phases channel --exclude-target -100<minid>
+reproject: run=<run1> target=<fullid> channel_id=<fullid> decision=included       # live 1, saved_key
+reproject: run=<run2> target=<minid> channel_id=<minid> decision=excluded         # live 2, from_message
+reproject: run=<run3> target=<minid> channel_id=<minid> decision=excluded         # live 3, saved_key
+reproject: run=<run4> target=@<fullhandle> channel_id=<fullid> decision=included  # live 4, handle
+(whole store: 62 runs included, 2 excluded)
+output ChannelAccess rows by via: handle 60, saved_key 1
+```
+
+The two id-started runs of the min channel are excluded by its id; the id run
+of the full-key channel and the handle run are kept. (The 60 `handle` rows are
+the replay synthesising an access receipt for each pre-feature handle run.)
+`--include-target <minid>` instead keeps exactly those two runs and
+reproduces the `from_message` receipt:
+
+```
+$ paperboy reproject --profile default --phases channel --include-target <minid>
+reproject: run=<run2> target=<minid> channel_id=<minid> decision=included
+reproject: run=<run3> target=<minid> channel_id=<minid> decision=included
+channel access: id=<minid> via=from_message granted=True
+channel access: id=<minid> via=saved_key granted=True
+output ChannelAccess rows: from_message 1 (input_channel carries from_msg with msg_id)
 ```
 
 Live smoke (`--phases channel`, scratch `.backup` data dir, VPN egress,
