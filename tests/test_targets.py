@@ -73,3 +73,16 @@ def test_private_link_captures_msg_id():
 def test_negative_id_without_100_prefix_is_rejected():
     with pytest.raises(UnsupportedTarget, match="basic group or user id"):
         parse_target("-123")
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["99999999999999999999", "-10099999999999999999999", "t.me/c/99999999999999999999/5"],
+)
+def test_id_beyond_sqlite_signed_64_bit_is_rejected_at_parse_time(text):
+    with pytest.raises(UnsupportedTarget, match="64-bit"):
+        parse_target(text)
+
+
+def test_largest_sqlite_integer_is_still_an_id():
+    assert parse_target("9223372036854775807").value == "9223372036854775807"

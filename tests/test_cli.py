@@ -545,3 +545,16 @@ def test_negative_non_channel_id_is_rejected_without_a_traceback(tmp_path, cmd):
     assert result.exit_code == 1
     assert "basic group or user id" in result.stdout
     assert "Traceback" not in result.stdout
+
+
+@pytest.mark.parametrize("cmd", ["status", "collect", "export"])
+@pytest.mark.parametrize("target", ["99999999999999999999", "-10099999999999999999999"])
+def test_out_of_range_id_is_rejected_without_a_traceback(tmp_path, cmd, target):
+    result = runner.invoke(
+        app,
+        [cmd, "--profile", "clitest_bigid", "--", target],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 1
+    assert "64-bit" in result.stdout
+    assert "Traceback" not in result.stdout
