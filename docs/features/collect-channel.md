@@ -437,13 +437,49 @@ $ paperboy reproject --profile default --exclude-target -100<id> --phases channe
   ChannelAccess rows: source 36 -> output 28 (36 minus the 8 excluded runs)
 ```
 
-Live smoke (`--phases channel`, scratch data dir, VPN egress): **STOPPED, not
-run** (live-call counter 0 of 5). The VPN route check failed immediately
-before the first live command (both Telegram DC routes resolved to the
-physical interface), so no live call was made and the global stop flag was
-set per the protocol. To close it, run the four invocations from the plan
-against a scratch `.backup` of the store once egress is via the VPN: a
-full-key id (expect `via=saved_key`, no `ResolvedPeer`), a `min` id with
-provenance (expect `via=from_message`, then `is_min=0` afterwards), the same
-id again (expect `saved_key`), and `@<channel>` (expect one `ResolvedPeer`
-then `ChannelAccess via=handle`). Transcripts must use `<id>`/`@<channel>`.
+Live smoke (`--phases channel`, scratch `.backup` data dir, VPN egress,
+`--max-rpc 20 --max-flood-sleep 60`, no `--media`/`--join`/`--unsafe`/
+`--profiles`): **4 of 5 live calls used, all exit 0, no FLOOD_WAIT, no stop
+condition.** Before every call: no stop flag, live-call counter below 5, and
+the VPN route check
+
+```
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+```
+
+Redacted log lines (`<id>`/`@<channel>`; unredacted transcripts are kept in
+the scratch dir as `live-1.txt` .. `live-4.txt`):
+
+```
+1. paperboy collect <id>          (full key, previously collected)
+   INFO channel access: id=<id> via=saved_key granted=True
+   channel | {'channels': 1, 'peers': 1}
+2. paperboy collect <id>          (min peer, seen via a message in a full-key chat)
+   INFO channel access: id=<id> via=from_message granted=True
+   channel | {'channels': 1, 'peers': 1}
+3. paperboy collect <id>          (same id again)
+   INFO channel access: id=<id> via=saved_key granted=True
+   channel | {'channels': 1, 'peers': 1}
+4. paperboy collect @<channel>    (handle of the call-1 channel)
+   INFO channel access: id=<id> via=handle granted=True
+   channel | {'channels': 1, 'peers': 1}
+```
+
+SQL on the scratch store afterwards (run ids elided, ids redacted):
+
+```
+ChannelAccess rows, newest first:  handle | saved_key | from_message | saved_key
+call 1: ChannelAccess(saved_key) then ChatFull; no ResolvedPeer in that run
+call 2: ChannelAccess(from_message) then ChatFull; no ResolvedPeer in that run
+        receipt input_channel = {"channel_id": <id>, "from_msg": {"access_hash": <n>, "channel_id": <n>, "msg_id": <id>}}
+        peers row for the min channel afterwards:  is_min=0 | access_hash present
+call 3: ChannelAccess(saved_key) then ChatFull; no ResolvedPeer
+call 4: ResolvedPeer, then ChannelAccess(handle), then ChatFull
+```
+
+So every route behaved as specified: route 1 and route 2 make no `resolve`
+call, the `getFullChannel` answer upgrades the `min` row to a full key (so
+the repeat is route 1), and the handle path is unchanged apart from the
+added receipt. No `CHANNEL_PRIVATE` refusal occurred, so the spare fifth call
+was not used.
