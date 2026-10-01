@@ -420,10 +420,29 @@ content change); id-target routes 1-4, replay of the receipt (output-store
 by id are pinned by tests in `tests/test_collector_channel.py` and
 `tests/test_profile_split.py`.
 
-Live smoke (`--phases channel`, scratch data dir, VPN egress): **PENDING**.
-The live command was not permitted to run in the implementing session, so no
-live call was made (live-call counter 0 of 5). To close it, run the four
-invocations from the plan against a scratch `.backup` of the store: a
+Offline smoke on a scratch `.backup` of the store (redacted; the real data
+dir is read-only):
+
+```
+$ paperboy status --profile default -- <id>          # bare id
+  messages 8400 / revisions 8400 / tombstones 304
+$ paperboy status --profile default -- -100<id>      # marked form, same channel
+$ paperboy status --profile default -- -123
+UnsupportedTarget: '-123' is a basic group or user id (channel ids look like
+-100<id>); collecting non-channel peers is out of scope
+$ paperboy status --profile default -- 999
+No local data for '999' yet - run `collect` first.
+$ paperboy reproject --profile default --exclude-target -100<id> --phases channel
+  8 x "reproject: run=<run> target=@<channel> channel_id=<id> decision=excluded"
+  ChannelAccess rows: source 36 -> output 28 (36 minus the 8 excluded runs)
+```
+
+Live smoke (`--phases channel`, scratch data dir, VPN egress): **STOPPED, not
+run** (live-call counter 0 of 5). The VPN route check failed immediately
+before the first live command (both Telegram DC routes resolved to the
+physical interface), so no live call was made and the global stop flag was
+set per the protocol. To close it, run the four invocations from the plan
+against a scratch `.backup` of the store once egress is via the VPN: a
 full-key id (expect `via=saved_key`, no `ResolvedPeer`), a `min` id with
 provenance (expect `via=from_message`, then `is_min=0` afterwards), the same
 id again (expect `saved_key`), and `@<channel>` (expect one `ResolvedPeer`
