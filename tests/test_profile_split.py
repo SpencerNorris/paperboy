@@ -577,10 +577,20 @@ def test_linked_group_id_is_not_a_target(tmp_path):
         resolve_target_filter(src, [], [str(BETA_GROUP_ID)])
 
 
-def test_bot_api_style_and_non_channel_targets_are_rejected(tmp_path):
+def test_marked_channel_id_is_accepted_as_a_target(tmp_path):
+    # #84 / #83 item 4: the Bot-API "marked" form -100<id> names the same
+    # channel as the bare id.
     db = seed_two_target_source(tmp_path)
     with ReplaySource.open(db, tmp_path / "default") as src:
-        for bad in ("-1006", "+15551234567", "t.me/+abcdef", "@stray"):
+        flt = resolve_target_filter(src, [], ["-1006"])
+        assert flt is not None
+        assert flt.ids == resolve_target_filter(src, [], ["6"]).ids
+
+
+def test_non_channel_targets_are_rejected(tmp_path):
+    db = seed_two_target_source(tmp_path)
+    with ReplaySource.open(db, tmp_path / "default") as src:
+        for bad in ("-6", "+15551234567", "t.me/+abcdef", "@stray"):
             with pytest.raises(ReprojectError):
                 resolve_target_filter(src, [bad], [])
 

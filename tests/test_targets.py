@@ -11,7 +11,7 @@ from paperboy.targets import TargetKind, UnsupportedTarget, parse_target
         ("t.me/+AbCdEf", TargetKind.INVITE, "AbCdEf"),
         ("t.me/joinchat/AbCdEf", TargetKind.INVITE, "AbCdEf"),
         ("https://t.me/durov/1234", TargetKind.MSG_LINK, "durov"),
-        ("-1001234567890", TargetKind.PEER_ID, "-1001234567890"),
+        ("-1001234567890", TargetKind.PEER_ID, "1234567890"),
         ("+15551234567", TargetKind.PHONE, "+15551234567"),
         ("#osint", TargetKind.HASHTAG, "osint"),
     ],
@@ -54,3 +54,22 @@ def test_target_is_frozen():
     t = parse_target("@durov")
     with pytest.raises(Exception):  # noqa: B017, PT011 - frozen dataclass raises FrozenInstanceError
         setattr(t, "value", "x")  # noqa: B010 - setattr avoids a static assignment to a frozen field
+
+
+@pytest.mark.parametrize("text", ["123", "-100123", "t.me/c/123", "https://t.me/c/123/456"])
+def test_channel_id_forms_normalise_to_one_id_target(text):
+    t = parse_target(text)
+    assert t.kind == TargetKind.PEER_ID
+    assert t.value == "123"
+    assert t.raw == text
+    assert t.is_channel_like
+
+
+def test_private_link_captures_msg_id():
+    assert parse_target("t.me/c/123/456").msg_id == 456
+    assert parse_target("t.me/c/123").msg_id is None
+
+
+def test_negative_id_without_100_prefix_is_rejected():
+    with pytest.raises(UnsupportedTarget, match="basic group or user id"):
+        parse_target("-123")
