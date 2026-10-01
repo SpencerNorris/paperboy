@@ -9,9 +9,9 @@ from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.ids import channel_uri, user_uri
 from paperboy.store.channels import upsert_channel
 from paperboy.store.edges import add_edge
-from paperboy.store.peers import upsert_peer
+from paperboy.store.peers import input_channel_ref, stored_channel_username, upsert_peer
 from paperboy.store.sync import set_state
-from paperboy.targets import Target
+from paperboy.targets import Target, TargetKind
 
 # Telegram returns the *full* `User` object for the collecting account, and it
 # is the only peer object that ever carries `phone`. CLAUDE.md forbids
@@ -75,11 +75,111 @@ def _resolved_channel_id(resolved: dict) -> int:
     return channel_id
 
 
+def _refusal_message(receipt: dict) -> str:
+    return (
+        f"the stored handle for channel {receipt['channel_id']} now belongs to channel "
+        f"{receipt['resolved_channel_id']}, not {receipt['channel_id']}; refusing to "
+        "collect under the wrong id"
+    )
+
+
 class ChannelCollector:
+    """Step A (get access: an `input_channel` plus a `ChannelAccess` receipt of
+    how) then Step B (everything from `getFullChannel` on, keyed by id).
+
+    Step A routes for an id target, first that works (#84, spec §2.2): 1 saved
+    full key, 2 from-message reference, 3 stored handle verified to resolve to
+    the same id, 4 nothing worked -> `SkipAndRecord`. A handle target is route 3
+    without the verification. The receipt is appended BEFORE `getFullChannel`
+    so replay can serve Step A from raw instead of re-deriving it from the
+    output store's `peers`."""
+
     name = "channel"
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
+
+    async def _resolve_and_record(
+        self, ctx: CollectContext, handle: str
+    ) -> tuple[dict, int, str]:
+        """`contacts.resolveUsername` + its `ResolvedPeer` raw record."""
+        resolved = await ctx.gateway.resolve(handle)
+        t_resolved = ctx.clock.for_payload(resolved)
+        context = {"target": ctx.target.raw}
+        if ctx.target.kind is TargetKind.PEER_ID:
+            # An id target resolved through its stored handle (route 3): record
+            # the handle so replay can match this record by it (the target alone
+            # is just the id).
+            context["handle"] = handle
+        raw_id = ctx.store.add_raw(
+            resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, context,
+            observed_at=t_resolved,
+        )
+        return resolved, raw_id, t_resolved
+
+    async def _step_a(
+        self, ctx: CollectContext
+    ) -> tuple[dict, str | None, tuple[dict, int, str] | None, dict | None]:
+        """Returns `(receipt, receipt stamp | None, resolve (payload, raw id,
+        stamp) | None, chan | None)`.
+
+        `chan` is the resolve-side channel object (handle route only). The
+        receipt stamp is set only for a replay-served receipt: it must be read
+        before a following served `resolve` re-batches the clock. Does not write
+        the receipt; raises `SkipAndRecord` for route 4 (no receipt)."""
+        raw = ctx.target.raw
+        served = await ctx.gateway.channel_access_receipt(raw)
+        if served is not None:
+            # Replay: take the route and input_channel from the recorded receipt.
+            # A handle route also re-records its ResolvedPeer, served from raw.
+            t_receipt = ctx.clock.for_payload(served)
+            if served.get("via") != "handle":
+                return served, t_receipt, None, None
+            resolve = await self._resolve_and_record(ctx, served["handle"])
+            chan = pick_channel(
+                resolve[0].get("chats", []), _resolved_channel_id(resolve[0])
+            ) if served["granted"] else None
+            return served, t_receipt, resolve, chan
+
+        channel_id: int | None = None
+        if ctx.target.kind is TargetKind.PEER_ID:
+            channel_id = int(ctx.target.value)
+            ref = input_channel_ref(ctx.store, channel_id)
+            if ref is not None:
+                receipt = {
+                    "channel_id": channel_id, "requested": raw, "via": ref.via,
+                    "granted": True, "input_channel": ref.input_channel,
+                    "key_source_raw_id": ref.key_source_raw_id,
+                }
+                return receipt, None, None, None
+            handle = stored_channel_username(ctx.store, channel_id)
+            if handle is None:
+                raise SkipAndRecord(
+                    f"cannot get access to channel {channel_id}: no saved full key, "
+                    "no message in this store referencing it through a known chat, "
+                    "and no known handle. Collect a channel that forwards it first, "
+                    "or supply its handle or invite link"
+                )
+        else:
+            handle = ctx.target.value
+
+        resolve = await self._resolve_and_record(ctx, handle)
+        resolved, resolve_raw_id, _ = resolve
+        resolved_id = _resolved_channel_id(resolved)
+        chan = pick_channel(resolved.get("chats", []), resolved_id)
+        receipt = {
+            "channel_id": channel_id if channel_id is not None else resolved_id,
+            "requested": raw, "via": "handle", "handle": handle,
+            "key_source_raw_id": resolve_raw_id,
+        }
+        if channel_id is not None and resolved_id != channel_id:
+            receipt |= {"granted": False, "resolved_channel_id": resolved_id, "input_channel": None}
+        else:
+            receipt |= {
+                "granted": True,
+                "input_channel": {"channel_id": chan["id"], "access_hash": chan["access_hash"]},
+            }
+        return receipt, None, resolve, chan
 
     async def collect(self, ctx: CollectContext) -> CollectResult:
         peer_uris: set[str] = set()
@@ -98,36 +198,49 @@ class ChannelCollector:
         self_uri = user_uri(self_user["id"])
         set_state(ctx.store, "account", "self", {"uri": self_uri, "id": self_user.get("id")})
 
-        resolved = await ctx.gateway.resolve(ctx.target.value)
-        t_resolved = ctx.clock.for_payload(resolved)
-        resolve_raw_id = ctx.store.add_raw(
-            resolved.get("_", "ResolvedPeer"), resolved, ctx.tier, {"target": ctx.target.raw},
-            observed_at=t_resolved,
+        receipt, t_receipt, resolve, chan = await self._step_a(ctx)
+        requested_id = receipt["channel_id"]
+        ctx.store.add_raw(
+            "ChannelAccess", receipt, ctx.tier,
+            {"target": ctx.target.raw, "channel_id": requested_id},
+            observed_at=t_receipt or ctx.clock.for_payload(receipt),
         )
-        chan = pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
-        input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
+        # Channels are named by id only in logs (never the handle).
+        ctx.log.info(
+            "channel access: id=%s via=%s granted=%s",
+            requested_id, receipt["via"], receipt["granted"],
+        )
+        if not receipt["granted"]:
+            raise SkipAndRecord(_refusal_message(receipt))
 
-        full = await ctx.gateway.get_full_channel(input_channel)
+        full = await ctx.gateway.get_full_channel(receipt["input_channel"])
         t_full = ctx.clock.for_payload(full)
         full_raw_id = ctx.store.add_raw(
-            full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": chan["id"]},
+            full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": requested_id},
             observed_at=t_full,
         )
         full_chat = full["full_chat"]
         # getFullChannel(input_channel) must answer for the channel we asked
-        # about: input_channel (the access_hash history uses) is resolve-side,
-        # while channel_id / pts below key off full_chat.id. If those ever
-        # disagreed, one run would address one channel and store under another
-        # — fail loudly rather than split identity across the collect.
-        if full_chat["id"] != chan["id"]:
+        # about, whichever route got us access: if it answered for another,
+        # one run would address one channel and store under another — fail
+        # loudly rather than split identity across the collect. This is also
+        # the verification point for routes 1 and 2 (spec §2.4).
+        if full_chat["id"] != requested_id:
             raise ValueError(
-                f"getFullChannel for {chan['id']} answered with full_chat for "
+                f"getFullChannel for {requested_id} answered with full_chat for "
                 f"{full_chat['id']} — refusing to split channel identity"
             )
         # Prefer the richer `chat` object returned alongside getFullChannel
         # (may carry admin_rights/creator not present on the resolve() one).
         full_chats = full.get("chats", [])
-        chan_for_channel = pick_channel(full_chats, full_chat["id"]) if full_chats else chan
+        if full_chats:
+            chan_for_channel = pick_channel(full_chats, full_chat["id"])
+        elif chan is not None:
+            chan_for_channel = chan
+        else:
+            raise SkipAndRecord(
+                f"getFullChannel for {requested_id} returned no channel object to project"
+            )
 
         channel_id = chan_for_channel["id"]
         channel_uri_ = upsert_channel(
@@ -144,9 +257,11 @@ class ChannelCollector:
                 {"field": "linked_chat_id"},
             )
 
-        for source_raw_id, payload, t in (
-            (resolve_raw_id, resolved, t_resolved), (full_raw_id, full, t_full),
-        ):
+        sources = [(full_raw_id, full, t_full)]
+        if resolve is not None:
+            resolved, resolve_raw_id, t_resolved = resolve
+            sources.insert(0, (resolve_raw_id, resolved, t_resolved))
+        for source_raw_id, payload, t in sources:
             for obj in (*payload.get("chats", []), *payload.get("users", [])):
                 uri = upsert_peer(
                     ctx.store, obj, source_raw_id, t,
@@ -160,7 +275,11 @@ class ChannelCollector:
         elif chan_for_channel.get("admin_rights"):
             ctx.tier = "admin"
 
-        ctx.input_channel = input_channel
+        # From here on the run addresses the channel by its FULL key, whichever
+        # route got us in (a from-message start is a saved key next time).
+        ctx.input_channel = {
+            "channel_id": channel_id, "access_hash": chan_for_channel["access_hash"],
+        }
         ctx.channel_id = channel_id
 
         return CollectResult(name=self.name, counts={"channels": 1, "peers": len(peer_uris)})

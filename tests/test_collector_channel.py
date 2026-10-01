@@ -9,7 +9,9 @@ from paperboy.collectors.base import CollectContext
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.config import load_settings
 from paperboy.recipes import collect_channel
+from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
+from paperboy.store.peers import upsert_peer
 from paperboy.store.sync import get_state
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
@@ -219,3 +221,167 @@ async def test_channel_collector_rejects_a_resolution_without_peer(tmp_path):
         )
         with pytest.raises(SkipAndRecord):
             await ChannelCollector().collect(ctx)
+
+
+# --- #84: the id-first channel phase (Step A routes + the ChannelAccess receipt) ---
+
+T0 = "2026-01-01T00:00:00+00:00"
+
+
+def _seed_peer(st, cid, *, min_=False, hash_=99, seen=(None, None)):
+    obj = {"_": "channel", "id": cid, "title": f"t{cid}"}
+    if hash_ is not None:
+        obj["access_hash"] = hash_
+    if min_:
+        obj["min"] = True
+    raw = st.add_raw("Channel", obj, "stranger", None)
+    upsert_peer(st, obj, raw, T0, seen_in_chat=seen[0], seen_in_msg=seen[1])
+    return raw
+
+
+def _ctx(gw, st, target):
+    return CollectContext(
+        gw, st, load_settings("default", {}), parse_target(target),
+        None, None, "stranger", logging.getLogger("t"),
+    )
+
+
+def _raw_rows(st, kind):
+    return [
+        (r["id"], json.loads(r["payload_json"]), json.loads(r["context_json"] or "null"))
+        for r in st.conn.execute(
+            "select id, payload_json, context_json from raw_records where kind=? order by id",
+            (kind,),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_id_target_saved_key_takes_route_1(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_peer(st, 5)
+        await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert "resolve" not in gw.calls
+        assert gw.full_channel_inputs[0] == {"channel_id": 5, "access_hash": 99}
+        ((access_id, receipt, context),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "saved_key" and receipt["granted"] is True
+        assert receipt["channel_id"] == 5 and receipt["requested"] == "5"
+        assert context == {"target": "5", "channel_id": 5}
+        chat_full = st.conn.execute(
+            "select id from raw_records where kind='messages.chatFull'"
+        ).fetchone()["id"]
+        assert access_id < chat_full
+
+
+@pytest.mark.asyncio
+async def test_id_target_from_message_takes_route_2_then_route_1(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_peer(st, 7, hash_=11)
+        _seed_peer(st, 5, min_=True, hash_=555, seen=(7, 3))
+        ctx = _ctx(gw, st, "5")
+        await ChannelCollector().collect(ctx)
+        ((_, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "from_message"
+        assert receipt["input_channel"]["from_msg"] == {
+            "channel_id": 7, "access_hash": 11, "msg_id": 3,
+        }
+        assert gw.full_channel_inputs[0]["from_msg"]["msg_id"] == 3
+        assert "resolve" not in gw.calls
+        assert ctx.input_channel == {"channel_id": 5, "access_hash": 99}
+        row = st.conn.execute(
+            "select is_min, access_hash from peers where uri='tg:channel:5'"
+        ).fetchone()
+        assert (row["is_min"], row["access_hash"]) == (0, 99)
+        # A second collect now takes the saved key.
+        await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert _raw_rows(st, "ChannelAccess")[-1][1]["via"] == "saved_key"
+        assert gw.full_channel_inputs[1] == {"channel_id": 5, "access_hash": 99}
+
+
+@pytest.mark.asyncio
+async def test_id_target_min_hash_is_never_a_key(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_peer(st, 5, min_=True, hash_=555)
+        with pytest.raises(SkipAndRecord) as exc:
+            await ChannelCollector().collect(_ctx(gw, st, "5"))
+        msg = str(exc.value)
+        assert "saved full key" in msg and "message" in msg and "handle" in msg
+        assert _raw_rows(st, "ChannelAccess") == []
+        assert "get_full_channel" not in gw.calls
+
+
+@pytest.mark.asyncio
+async def test_id_target_stored_handle_verified(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        raw = st.add_raw("ChatFull", {}, "stranger", None)
+        upsert_channel(
+            st, {"id": 5, "pts": 1}, {"id": 5, "title": "t", "username": "durov"}, raw, T0
+        )
+        await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert gw.calls == ["get_self", "resolve", "get_full_channel"]
+        ((resolve_id, _, resolve_ctx),) = _raw_rows(st, "contacts.resolvedPeer")
+        assert resolve_ctx == {"target": "5", "handle": "durov"}
+        ((access_id, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "handle" and receipt["handle"] == "durov"
+        assert receipt["granted"] is True
+        assert receipt["key_source_raw_id"] == resolve_id
+        assert resolve_id < access_id
+
+
+@pytest.mark.asyncio
+async def test_id_target_stored_handle_now_another_channel(tmp_path):
+    fx = _fixtures()
+    fx["resolve"] = {
+        "_": "contacts.resolvedPeer",
+        "peer": {"_": "PeerChannel", "channel_id": 6},
+        "chats": [{"_": "channel", "id": 6, "access_hash": 77, "title": "other"}],
+        "users": [],
+    }
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        raw = st.add_raw("ChatFull", {}, "stranger", None)
+        upsert_channel(
+            st, {"id": 5, "pts": 1}, {"id": 5, "title": "t", "username": "durov"}, raw, T0
+        )
+        with pytest.raises(SkipAndRecord) as exc:
+            await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert "6" in str(exc.value) and "5" in str(exc.value)
+        ((_, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["granted"] is False and receipt["resolved_channel_id"] == 6
+        assert receipt["input_channel"] is None and receipt["channel_id"] == 5
+        assert "get_full_channel" not in gw.calls
+
+
+@pytest.mark.asyncio
+async def test_handle_target_unchanged_plus_receipt(tmp_path):
+    gw = FakeGateway(_fixtures())
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await ChannelCollector().collect(_ctx(gw, st, "@durov"))
+        assert gw.calls == ["get_self", "resolve", "get_full_channel"]
+        ((resolve_id, _, resolve_ctx),) = _raw_rows(st, "contacts.resolvedPeer")
+        assert resolve_ctx == {"target": "@durov"}
+        ((access_id, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "handle" and receipt["granted"] is True
+        assert receipt["input_channel"] == {"channel_id": 5, "access_hash": 99}
+        assert access_id > resolve_id
+
+
+@pytest.mark.asyncio
+async def test_replay_receipt_beats_the_store(tmp_path):
+    receipt = {
+        "_": "ChannelAccess", "channel_id": 5, "requested": "5", "via": "saved_key",
+        "granted": True, "input_channel": {"channel_id": 5, "access_hash": 99},
+        "key_source_raw_id": 1,
+    }
+    fx = _fixtures()
+    fx["channel_access"] = receipt
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:  # the store has NO row for 5
+        await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert "resolve" not in gw.calls
+        ((_, recorded, _),) = _raw_rows(st, "ChannelAccess")
+        assert recorded == receipt
