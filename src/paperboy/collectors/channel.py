@@ -132,9 +132,10 @@ class ChannelCollector:
     access error (`SkipAndRecord`: CHANNEL_INVALID / CHANNEL_PRIVATE /
     MSG_ID_INVALID, ...) is recorded as a `granted: false` receipt naming the
     error and the next route is tried. Floods and hard/phase stops are not
-    access errors and propagate; so does the rejection of a handle target's one
-    route. Each attempt's receipt is appended before the `ChatFull` it gated
-    (after the call, so the outcome is in it), so replay serves Step A from the
+    access errors and propagate; the rejection of a handle target's one
+    route is recorded, then propagates. Each attempt's receipt is appended
+    before the `ChatFull` it gated (after the call, so the outcome is in it);
+    in replay the recorded receipts alone decide any fallback. So replay serves Step A from the
     recorded receipts, in order, instead of re-deriving it from the output
     store's `peers`.
 
@@ -278,9 +279,10 @@ class ChannelCollector:
         route Telegram rejects as an access error (`SkipAndRecord`) is recorded as
         a refused receipt and the next route is tried; floods, hard stops and
         phase stops are not access errors and propagate. A handle target has the
-        one route, so its rejection propagates as it always did."""
+        one route, so its rejection is recorded and then propagates."""
         refused: list[dict] = []
         by_id = ctx.target.kind is TargetKind.PEER_ID
+        replay = getattr(ctx.gateway, "replay", False) is True
         async for access in self._accesses(ctx):
             receipt = access.receipt
             if receipt is not None and not receipt["granted"]:
@@ -295,7 +297,11 @@ class ChannelCollector:
             try:
                 full = await ctx.gateway.get_full_channel(access.input_channel)
             except SkipAndRecord as exc:
-                if receipt is None or not by_id:
+                if receipt is None or replay:
+                    # Replay: the recorded receipts alone decide the fallback (a
+                    # refusal was recorded as such). A failure here is the replay
+                    # gateway's "no ChatFull recorded" for a run that was cut
+                    # short; it must not mint a refusal that never happened.
                     self._record_receipt(ctx, access)
                     raise
                 receipt = receipt | {
@@ -304,6 +310,8 @@ class ChannelCollector:
                     "reason": str(exc),
                 }
                 self._record_receipt(ctx, replace(access, receipt=receipt))
+                if not by_id:
+                    raise  # a handle target has no next route; the outcome is recorded
                 refused.append(receipt)
                 continue
             except BaseException:

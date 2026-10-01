@@ -484,3 +484,39 @@ async def test_a_flood_on_route_1_does_not_fall_back(tmp_path):
         assert len(gw.full_channel_inputs) == 1 and "resolve" not in gw.calls
         ((_, receipt, _),) = _raw_rows(st, "ChannelAccess")
         assert receipt["via"] == "saved_key" and receipt["granted"] is True
+
+
+@pytest.mark.asyncio
+async def test_replay_never_treats_a_get_full_channel_failure_as_a_refusal(tmp_path):
+    # A live run whose granted receipt was followed by a flood/crash has a receipt
+    # and no ChatFull. Replay's SkipAndRecord("no ChatFull recorded") must not mint
+    # a refused receipt or fall back: the recorded receipts alone decide.
+    receipt = {
+        "_": "ChannelAccess", "channel_id": 5, "requested": "5", "via": "saved_key",
+        "granted": True, "input_channel": {"channel_id": 5, "access_hash": 99},
+        "key_source_raw_id": 1,
+    }
+    fx = _fixtures()
+    fx["channel_access"] = [receipt]
+    fx["full_channel"] = SkipAndRecord("replay: no ChatFull recorded for channel 5")
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        with pytest.raises(SkipAndRecord, match="no ChatFull recorded"):
+            await ChannelCollector().collect(_ctx(gw, st, "5"))
+        ((_, recorded, _),) = _raw_rows(st, "ChannelAccess")
+        assert recorded == receipt
+
+
+@pytest.mark.asyncio
+async def test_handle_target_rejection_records_the_outcome_then_propagates(tmp_path):
+    from telethon.errors import ChannelPrivateError
+
+    fx = _fixtures()
+    fx["full_channel"] = _rejected(ChannelPrivateError)
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        with pytest.raises(SkipAndRecord, match="ChannelPrivateError"):
+            await ChannelCollector().collect(_ctx(gw, st, "@durov"))
+        ((_, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "handle" and receipt["granted"] is False
+        assert receipt["error"] == "ChannelPrivateError"

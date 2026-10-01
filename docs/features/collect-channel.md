@@ -81,7 +81,7 @@ recorded as a `ChannelAccess` receipt with `granted: false` and the `error`
 name, and the next route is tried (1, then 2, then 3, then the route-4 failure,
 which lists every route tried and its error). Floods, hard stops and phase
 stops are not access errors: they propagate and never trigger a fallback. A
-handle target has the one route, so its rejection propagates as it always did.
+handle target has the one route, so its rejection is recorded (`granted: false` plus the error) and then propagates.
 
 Step A always appends a `ChannelAccess` raw record (`via`, `input_channel`,
 `granted`, ...; see `docs/data-model.md`) before `getFullChannel`, so replay
