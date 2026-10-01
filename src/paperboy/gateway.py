@@ -241,6 +241,7 @@ class FakeGateway:
         # Every `input_channel` `get_full_channel` was called with, so a test
         # can tell the saved-key form from the from-message form (#84).
         self.full_channel_inputs: list[dict] = []
+        self._receipts_served = 0
 
     async def resolve(self, target_value: str) -> dict:
         self.calls.append("resolve")
@@ -250,11 +251,24 @@ class FakeGateway:
             raise value
         return value
 
+    @property
+    def replay(self) -> bool:
+        """A `channel_access` fixture (even `None`: a run with no receipt) makes
+        this fake a replay, as `RawReplayGateway` is."""
+        return "channel_access" in self._fx
+
     async def channel_access_receipt(self, target_raw: str) -> dict | None:
-        # Not an RPC (so not in `calls`): the fixture lets a test prove a
-        # recorded receipt beats the store, as replay does.
+        # Not an RPC (so not in `calls`): the fixture (a receipt, or a list of
+        # them served in order) lets a test prove a recorded receipt beats the
+        # store, as replay does.
         del target_raw
-        return self._fx.get("channel_access")
+        fx = self._fx.get("channel_access")
+        if fx is None:
+            return None
+        receipts = fx if isinstance(fx, list) else [fx]
+        index = self._receipts_served
+        self._receipts_served += 1
+        return receipts[index] if index < len(receipts) else None
 
     async def get_full_channel(self, input_channel: dict) -> dict:
         self.calls.append("get_full_channel")
@@ -263,6 +277,12 @@ class FakeGateway:
         # (participants preflight) differently from the target's.
         by_id: dict[int, object] = self._fx.get("full_channel_by_id", {})
         value = by_id.get(input_channel["channel_id"], self._fx.get("full_channel"))
+        # `full_channel_sequence` answers the Nth call (0-based) of a run
+        # differently — e.g. a rejected first route then an accepted second
+        # (#84 route fallback); calls past its end use the fixtures above.
+        sequence: list[object] = self._fx.get("full_channel_sequence", [])
+        if len(self.full_channel_inputs) <= len(sequence):
+            value = sequence[len(self.full_channel_inputs) - 1]
         if isinstance(value, BaseException):
             raise value
         if value is None:
@@ -642,17 +662,27 @@ class TelethonGateway:
         return None
 
     async def get_full_channel(self, input_channel: dict) -> dict:
+        from telethon.errors import ChannelInvalidError
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.types.messages import ChatFull
 
+        from paperboy.budget import SkipAndRecord
+
         channel = _input_channel(input_channel)
-        result = cast(
-            ChatFull,
-            await self.budget.call(
-                "channels.getFullChannel",
-                lambda: self.client(GetFullChannelRequest(channel=channel)),
-            ),
-        )
+        try:
+            result = cast(
+                ChatFull,
+                await self.budget.call(
+                    "channels.getFullChannel",
+                    lambda: self.client(GetFullChannelRequest(channel=channel)),
+                ),
+            )
+        except ChannelInvalidError as exc:
+            # A stale saved key or from-message reference (message deleted, hash
+            # rotated) answers CHANNEL_INVALID: an access refusal the channel
+            # collector answers by trying its next route (#84, spec §2.2) — scoped
+            # here, not in `classify`, for the reason errors.py gives.
+            raise SkipAndRecord(str(exc)) from exc
         return result.to_dict()
 
     async def iter_history(

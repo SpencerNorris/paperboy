@@ -261,15 +261,18 @@ class ChannelRef:
     key_source_raw_id: int | None
 
 
-def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
-    """Routes 1 and 2 of the id-first channel phase, from the `peers` projection.
+def input_channel_refs(store: Store, channel_id: int) -> list[ChannelRef]:
+    """Routes 1 and 2 of the id-first channel phase, from the `peers` projection,
+    in the order they are tried (spec §2.2: stop at the first that works, so the
+    caller needs every applicable route to fall through to the next).
 
     1. A non-`min` row with a real `access_hash` -> `saved_key`.
-    2. Else a `min` row with `(seen_in_chat, seen_in_msg)` provenance into a
-       channel whose own hash is a full key -> `from_message`
-       (`inputChannelFromMessage`; research §8.7).
-    3. Else `None`. A `min` hash is never offered as a key, and a hash is
-       never guessed.
+    2. A row with `(seen_in_chat, seen_in_msg)` provenance into a channel whose
+       own hash is a full key -> `from_message` (`inputChannelFromMessage`;
+       research §8.7).
+
+    A `min` hash is never offered as a key, and a hash is never guessed. Empty
+    when neither route is available.
     """
     peer = store.conn.execute(
         "SELECT is_min, access_hash, seen_in_chat, seen_in_msg, source_raw_id "
@@ -277,12 +280,15 @@ def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
         (channel_uri(channel_id),),
     ).fetchone()
     if peer is None:
-        return None
+        return []
+    refs: list[ChannelRef] = []
     if not peer["is_min"] and peer["access_hash"]:
-        return ChannelRef(
-            "saved_key",
-            {"channel_id": channel_id, "access_hash": peer["access_hash"]},
-            peer["source_raw_id"],
+        refs.append(
+            ChannelRef(
+                "saved_key",
+                {"channel_id": channel_id, "access_hash": peer["access_hash"]},
+                peer["source_raw_id"],
+            )
         )
     if peer["seen_in_chat"] and peer["seen_in_msg"]:
         chat = store.conn.execute(
@@ -290,19 +296,27 @@ def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
             (channel_uri(peer["seen_in_chat"]),),
         ).fetchone()
         if chat is not None and not chat["is_min"] and chat["access_hash"]:
-            return ChannelRef(
-                "from_message",
-                {
-                    "channel_id": channel_id,
-                    "from_msg": {
-                        "channel_id": peer["seen_in_chat"],
-                        "access_hash": chat["access_hash"],
-                        "msg_id": peer["seen_in_msg"],
+            refs.append(
+                ChannelRef(
+                    "from_message",
+                    {
+                        "channel_id": channel_id,
+                        "from_msg": {
+                            "channel_id": peer["seen_in_chat"],
+                            "access_hash": chat["access_hash"],
+                            "msg_id": peer["seen_in_msg"],
+                        },
                     },
-                },
-                peer["source_raw_id"],
+                    peer["source_raw_id"],
+                )
             )
-    return None
+    return refs
+
+
+def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
+    """The first applicable route of `input_channel_refs`, or None."""
+    refs = input_channel_refs(store, channel_id)
+    return refs[0] if refs else None
 
 
 def stored_channel_username(store: Store, channel_id: int) -> str | None:

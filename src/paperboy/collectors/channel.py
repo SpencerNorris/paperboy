@@ -5,12 +5,15 @@ later Phase 2 collectors).
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
+
 from paperboy.budget import SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.ids import channel_uri, user_uri
 from paperboy.store.channels import upsert_channel
 from paperboy.store.edges import add_edge
-from paperboy.store.peers import input_channel_ref, stored_channel_username, upsert_peer
+from paperboy.store.peers import input_channel_refs, stored_channel_username, upsert_peer
 from paperboy.store.sync import set_state
 from paperboy.targets import Target, TargetKind
 
@@ -84,6 +87,38 @@ def _refusal_message(receipt: dict) -> str:
     )
 
 
+def _exhausted_message(target_value: str, refused: list[dict]) -> str:
+    """Route 4 (spec §2.2): no route gave access. Names every route tried and
+    what would make another work."""
+    if not refused:
+        return (
+            f"cannot get access to channel {target_value}: no saved full key, "
+            "no message in this store referencing it through a known chat, "
+            "and no known handle. Collect a channel that forwards it first, "
+            "or supply its handle or invite link"
+        )
+    tried = ", ".join(f"{r['via']} ({r.get('error', 'refused')})" for r in refused)
+    return (
+        f"cannot get access to channel {target_value}: Telegram rejected every route "
+        f"tried: {tried}. Collect a channel that forwards it first, or supply its "
+        "current handle or invite link"
+    )
+
+
+@dataclass(frozen=True)
+class _Access:
+    """One Step A route's outcome: its receipt (None only for a legacy replay),
+    the id it addresses, the `input_channel` to try, and the handle route's
+    resolve record / resolve-side channel object."""
+
+    receipt: dict | None
+    requested_id: int
+    input_channel: dict | None
+    t_receipt: str | None = None
+    resolve: tuple[dict, int, str] | None = None
+    chan: dict | None = None
+
+
 class ChannelCollector:
     """Step A (get access: an `input_channel` plus a `ChannelAccess` receipt of
     how) then Step B (everything from `getFullChannel` on, keyed by id).
@@ -91,9 +126,21 @@ class ChannelCollector:
     Step A routes for an id target, first that works (#84, spec §2.2): 1 saved
     full key, 2 from-message reference, 3 stored handle verified to resolve to
     the same id, 4 nothing worked -> `SkipAndRecord`. A handle target is route 3
-    without the verification. The receipt is appended BEFORE `getFullChannel`
-    so replay can serve Step A from raw instead of re-deriving it from the
-    output store's `peers`."""
+    without the verification.
+
+    "Works" means `getFullChannel` accepts it: a route Telegram rejects as an
+    access error (`SkipAndRecord`: CHANNEL_INVALID / CHANNEL_PRIVATE /
+    MSG_ID_INVALID, ...) is recorded as a `granted: false` receipt naming the
+    error and the next route is tried. Floods and hard/phase stops are not
+    access errors and propagate; so does the rejection of a handle target's one
+    route. Each attempt's receipt is appended before the `ChatFull` it gated
+    (after the call, so the outcome is in it), so replay serves Step A from the
+    recorded receipts, in order, instead of re-deriving it from the output
+    store's `peers`.
+
+    A replayed run with NO receipt predates #84: it takes the handle path it
+    took then and records no receipt. Live vs replay is read from the gateway's
+    `replay` flag, never inferred from the store."""
 
     name = "channel"
 
@@ -118,50 +165,27 @@ class ChannelCollector:
         )
         return resolved, raw_id, t_resolved
 
-    async def _step_a(
-        self, ctx: CollectContext
-    ) -> tuple[dict, str | None, tuple[dict, int, str] | None, dict | None]:
-        """Returns `(receipt, receipt stamp | None, resolve (payload, raw id,
-        stamp) | None, chan | None)`.
-
-        `chan` is the resolve-side channel object (handle route only). The
-        receipt stamp is set only for a replay-served receipt: it must be read
-        before a following served `resolve` re-batches the clock. Does not write
-        the receipt; raises `SkipAndRecord` for route 4 (no receipt)."""
+    async def _live_accesses(self, ctx: CollectContext) -> AsyncIterator[_Access]:
+        """Step A computed live: yield each route, in order, only as far as the
+        consumer asks (a route that `getFullChannel` rejects is followed by the
+        next; the resolve RPC of route 3 is not spent unless it is reached)."""
         raw = ctx.target.raw
-        served = await ctx.gateway.channel_access_receipt(raw)
-        if served is not None:
-            # Replay: take the route and input_channel from the recorded receipt.
-            # A handle route also re-records its ResolvedPeer, served from raw.
-            t_receipt = ctx.clock.for_payload(served)
-            if served.get("via") != "handle":
-                return served, t_receipt, None, None
-            resolve = await self._resolve_and_record(ctx, served["handle"])
-            chan = pick_channel(
-                resolve[0].get("chats", []), _resolved_channel_id(resolve[0])
-            ) if served["granted"] else None
-            return served, t_receipt, resolve, chan
-
-        channel_id: int | None = None
         if ctx.target.kind is TargetKind.PEER_ID:
             channel_id = int(ctx.target.value)
-            ref = input_channel_ref(ctx.store, channel_id)
-            if ref is not None:
-                receipt = {
-                    "channel_id": channel_id, "requested": raw, "via": ref.via,
-                    "granted": True, "input_channel": ref.input_channel,
-                    "key_source_raw_id": ref.key_source_raw_id,
-                }
-                return receipt, None, None, None
+            for ref in input_channel_refs(ctx.store, channel_id):
+                yield _Access(
+                    {
+                        "channel_id": channel_id, "requested": raw, "via": ref.via,
+                        "granted": True, "input_channel": ref.input_channel,
+                        "key_source_raw_id": ref.key_source_raw_id,
+                    },
+                    channel_id, ref.input_channel,
+                )
             handle = stored_channel_username(ctx.store, channel_id)
             if handle is None:
-                raise SkipAndRecord(
-                    f"cannot get access to channel {channel_id}: no saved full key, "
-                    "no message in this store referencing it through a known chat, "
-                    "and no known handle. Collect a channel that forwards it first, "
-                    "or supply its handle or invite link"
-                )
+                return
         else:
+            channel_id = None
             handle = ctx.target.value
 
         resolve = await self._resolve_and_record(ctx, handle)
@@ -175,12 +199,121 @@ class ChannelCollector:
         }
         if channel_id is not None and resolved_id != channel_id:
             receipt |= {"granted": False, "resolved_channel_id": resolved_id, "input_channel": None}
+            input_channel = None
         else:
-            receipt |= {
-                "granted": True,
-                "input_channel": {"channel_id": chan["id"], "access_hash": chan["access_hash"]},
-            }
-        return receipt, None, resolve, chan
+            input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
+            receipt |= {"granted": True, "input_channel": input_channel}
+        yield _Access(receipt, receipt["channel_id"], input_channel, resolve=resolve, chan=chan)
+
+    async def _replayed_accesses(
+        self, ctx: CollectContext, first: dict
+    ) -> AsyncIterator[_Access]:
+        """Step A served from the run's recorded receipts, in recorded order: the
+        refused attempts, then the final one. A handle receipt also re-records
+        its `ResolvedPeer`, served from raw."""
+        served: dict | None = first
+        while served is not None:
+            # Read the stamp now: a following served `resolve` re-batches the clock.
+            t_receipt = ctx.clock.for_payload(served)
+            resolve = chan = None
+            if served.get("via") == "handle":
+                resolve = await self._resolve_and_record(ctx, served["handle"])
+                if served["granted"]:
+                    chan = pick_channel(
+                        resolve[0].get("chats", []), _resolved_channel_id(resolve[0])
+                    )
+            yield _Access(
+                served, served["channel_id"], served.get("input_channel"),
+                t_receipt=t_receipt, resolve=resolve, chan=chan,
+            )
+            served = await ctx.gateway.channel_access_receipt(ctx.target.raw)
+
+    async def _legacy_access(self, ctx: CollectContext) -> AsyncIterator[_Access]:
+        """A replayed run that has no receipt at all (recorded before #84): take
+        exactly the path it took then — resolve the handle, address the channel by
+        the resolve-side key — and mint NO receipt, since none was observed."""
+        resolve = await self._resolve_and_record(ctx, ctx.target.value)
+        resolved = resolve[0]
+        chan = pick_channel(resolved.get("chats", []), _resolved_channel_id(resolved))
+        input_channel = {"channel_id": chan["id"], "access_hash": chan["access_hash"]}
+        yield _Access(None, chan["id"], input_channel, resolve=resolve, chan=chan)
+
+    async def _accesses(self, ctx: CollectContext) -> AsyncIterator[_Access]:
+        # Live vs replay is the gateway's own declaration, never inferred from
+        # the store: a replay with no receipt is a legacy run, a live run
+        # computes (and records) Step A.
+        source: AsyncIterator[_Access]
+        if getattr(ctx.gateway, "replay", False) is not True:
+            source = self._live_accesses(ctx)
+        else:
+            first = await ctx.gateway.channel_access_receipt(ctx.target.raw)
+            source = (
+                self._legacy_access(ctx) if first is None
+                else self._replayed_accesses(ctx, first)
+            )
+        async for access in source:
+            yield access
+
+    def _record_receipt(self, ctx: CollectContext, access: _Access) -> None:
+        receipt = access.receipt
+        if receipt is None:  # legacy replay: nothing was observed, nothing to record
+            return
+        t_receipt = access.t_receipt or ctx.clock.for_payload(receipt)
+        ctx.store.add_raw(
+            "ChannelAccess", receipt, ctx.tier,
+            {"target": ctx.target.raw, "channel_id": access.requested_id},
+            observed_at=t_receipt,
+        )
+        # Channels are named by id only in logs (never the handle).
+        ctx.log.info(
+            "channel access: id=%s via=%s granted=%s error=%s",
+            access.requested_id, receipt["via"], receipt["granted"], receipt.get("error"),
+        )
+
+    async def _get_access(
+        self, ctx: CollectContext
+    ) -> tuple[_Access, dict]:
+        """Step A (routes, in order) fused with the first `getFullChannel` that
+        accepts one: spec §2.2, stop at the first that works. For an id target, a
+        route Telegram rejects as an access error (`SkipAndRecord`) is recorded as
+        a refused receipt and the next route is tried; floods, hard stops and
+        phase stops are not access errors and propagate. A handle target has the
+        one route, so its rejection propagates as it always did."""
+        refused: list[dict] = []
+        by_id = ctx.target.kind is TargetKind.PEER_ID
+        async for access in self._accesses(ctx):
+            receipt = access.receipt
+            if receipt is not None and not receipt["granted"]:
+                self._record_receipt(ctx, access)
+                if "error" not in receipt:
+                    # Route 3's verification: the stored handle now belongs to
+                    # another channel. Terminal; never proceed under the wrong id.
+                    raise SkipAndRecord(_refusal_message(receipt))
+                refused.append(receipt)  # a replayed refusal: next receipt follows
+                continue
+            assert access.input_channel is not None
+            try:
+                full = await ctx.gateway.get_full_channel(access.input_channel)
+            except SkipAndRecord as exc:
+                if receipt is None or not by_id:
+                    self._record_receipt(ctx, access)
+                    raise
+                receipt = receipt | {
+                    "granted": False,
+                    "error": type(exc.__cause__ or exc).__name__,
+                    "reason": str(exc),
+                }
+                self._record_receipt(ctx, replace(access, receipt=receipt))
+                refused.append(receipt)
+                continue
+            except BaseException:
+                # Not an access error (flood, hard stop, phase stop, bug): no
+                # fallback. The attempt was made, so it is still on record.
+                self._record_receipt(ctx, access)
+                raise
+            self._record_receipt(ctx, access)
+            return access, full
+        raise SkipAndRecord(_exhausted_message(ctx.target.value, refused))
 
     async def collect(self, ctx: CollectContext) -> CollectResult:
         peer_uris: set[str] = set()
@@ -199,22 +332,8 @@ class ChannelCollector:
         self_uri = user_uri(self_user["id"])
         set_state(ctx.store, "account", "self", {"uri": self_uri, "id": self_user.get("id")})
 
-        receipt, t_receipt, resolve, chan = await self._step_a(ctx)
-        requested_id = receipt["channel_id"]
-        ctx.store.add_raw(
-            "ChannelAccess", receipt, ctx.tier,
-            {"target": ctx.target.raw, "channel_id": requested_id},
-            observed_at=t_receipt or ctx.clock.for_payload(receipt),
-        )
-        # Channels are named by id only in logs (never the handle).
-        ctx.log.info(
-            "channel access: id=%s via=%s granted=%s",
-            requested_id, receipt["via"], receipt["granted"],
-        )
-        if not receipt["granted"]:
-            raise SkipAndRecord(_refusal_message(receipt))
-
-        full = await ctx.gateway.get_full_channel(receipt["input_channel"])
+        access, full = await self._get_access(ctx)
+        requested_id, resolve, chan = access.requested_id, access.resolve, access.chan
         t_full = ctx.clock.for_payload(full)
         full_raw_id = ctx.store.add_raw(
             full.get("_", "ChatFull"), full, ctx.tier, {"channel_id": requested_id},

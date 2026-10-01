@@ -385,3 +385,102 @@ async def test_replay_receipt_beats_the_store(tmp_path):
         assert "resolve" not in gw.calls
         ((_, recorded, _),) = _raw_rows(st, "ChannelAccess")
         assert recorded == receipt
+
+
+# --- #84 spec §2.2: "stop at the first that works" (route fallback) ---
+
+def _rejected(error_cls):
+    """What `Budget.call` raises for an access-type RPC error: a SkipAndRecord
+    whose `__cause__` is the Telethon error."""
+    exc = SkipAndRecord(f"{error_cls.__name__} (caused by GetFullChannelRequest)")
+    exc.__cause__ = error_cls(None)
+    return exc
+
+
+def _seed_route2_and_handle(st):
+    """Channel 5: a `min` peer reachable from message 3 of full-key chat 7 (route 2),
+    and a stored handle (route 3)."""
+    _seed_peer(st, 7, hash_=11)
+    _seed_peer(st, 5, min_=True, hash_=555, seen=(7, 3))
+    raw = st.add_raw("ChatFull", {}, "stranger", None)
+    upsert_channel(st, {"id": 5, "pts": 1}, {"id": 5, "title": "t", "username": "durov"}, raw, T0)
+
+
+@pytest.mark.asyncio
+async def test_rejected_route_2_falls_through_to_route_3(tmp_path):
+    from telethon.errors import MsgIdInvalidError
+
+    fx = _fixtures()
+    fx["full_channel_sequence"] = [_rejected(MsgIdInvalidError)]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_route2_and_handle(st)
+        ctx = _ctx(gw, st, "5")
+        await ChannelCollector().collect(ctx)
+        assert [i.get("from_msg", {}).get("msg_id") for i in gw.full_channel_inputs] == [3, None]
+        assert gw.full_channel_inputs[1] == {"channel_id": 5, "access_hash": 99}
+        assert gw.calls == ["get_self", "get_full_channel", "resolve", "get_full_channel"]
+        rows = _raw_rows(st, "ChannelAccess")
+        assert [(r["via"], r["granted"]) for _, r, _ in rows] == [
+            ("from_message", False), ("handle", True),
+        ]
+        refused = rows[0][1]
+        assert refused["error"] == "MsgIdInvalidError"
+        assert refused["channel_id"] == 5 and refused["requested"] == "5"
+        resolve_id = _raw_rows(st, "contacts.resolvedPeer")[0][0]
+        assert rows[0][0] < resolve_id < rows[1][0]
+        assert ctx.channel_id == 5
+
+
+@pytest.mark.asyncio
+async def test_rejected_saved_key_falls_through_to_route_2(tmp_path):
+    from telethon.errors import ChannelPrivateError
+
+    fx = _fixtures()
+    fx["full_channel_sequence"] = [_rejected(ChannelPrivateError)]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_peer(st, 7, hash_=11)
+        _seed_peer(st, 5, hash_=555, seen=(7, 3))  # a full key AND provenance
+        await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert "resolve" not in gw.calls
+        rows = _raw_rows(st, "ChannelAccess")
+        assert [(r["via"], r["granted"]) for _, r, _ in rows] == [
+            ("saved_key", False), ("from_message", True),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_every_route_rejected_ends_in_the_route_4_failure(tmp_path):
+    from telethon.errors import ChannelPrivateError, MsgIdInvalidError
+
+    fx = _fixtures()
+    fx["full_channel_sequence"] = [
+        _rejected(MsgIdInvalidError), _rejected(ChannelPrivateError),
+    ]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_route2_and_handle(st)
+        with pytest.raises(SkipAndRecord) as exc:
+            await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert "from_message" in str(exc.value) and "handle" in str(exc.value)
+        assert [(r["via"], r["granted"]) for _, r, _ in _raw_rows(st, "ChannelAccess")] == [
+            ("from_message", False), ("handle", False),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_a_flood_on_route_1_does_not_fall_back(tmp_path):
+    from paperboy.budget import PhaseStop
+
+    fx = _fixtures()
+    fx["full_channel_sequence"] = [PhaseStop("flood wait 900s")]
+    gw = FakeGateway(fx)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_peer(st, 7, hash_=11)
+        _seed_peer(st, 5, hash_=555, seen=(7, 3))
+        with pytest.raises(PhaseStop):
+            await ChannelCollector().collect(_ctx(gw, st, "5"))
+        assert len(gw.full_channel_inputs) == 1 and "resolve" not in gw.calls
+        ((_, receipt, _),) = _raw_rows(st, "ChannelAccess")
+        assert receipt["via"] == "saved_key" and receipt["granted"] is True

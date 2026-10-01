@@ -605,12 +605,15 @@ class ReplaySource:
             key = (run.run_id, str(target))
             if row["kind"].lower() == "channelaccess":
                 # The receipt is written after the pair's ResolvedPeer (higher
-                # id), so it wins the pair. A refused receipt (granted false: the
-                # stored handle now belongs to another channel) is a stray:
+                # id), so it wins the pair, and the pair's last receipt is the
+                # final route tried. One refused because the stored handle now
+                # belongs to another channel (`resolved_channel_id`) is a stray:
                 # channel_id None, so the #70 filter never files the run under
-                # the wrong channel.
+                # the wrong channel. One Telegram rejected as an access error is
+                # still unmistakably the requested channel.
                 prior = pairs.get(key)
-                channel_id = payload.get("channel_id") if payload.get("granted") else None
+                misdirected = not payload.get("granted") and "resolved_channel_id" in payload
+                channel_id = None if misdirected else payload.get("channel_id")
                 username = (prior.username if prior else None) or payload.get("handle")
             else:
                 channel_id, username = _resolved_channel(payload)
@@ -689,6 +692,8 @@ class RawReplayGateway:
         # get_channel_difference is inherently sequential (a pts catch-up
         # loop); a per-channel cursor over the stored pages models that.
         self._diff_cursor: dict[int, int] = {}
+        # Receipts served so far per raw target (`channel_access_receipt`).
+        self._access_served: dict[str, int] = {}
 
     @property
     def _index(self) -> RunIndex:
@@ -730,12 +735,19 @@ class RawReplayGateway:
         raise SkipAndRecord(f"replay: no ResolvedPeer recorded for {target_value!r}")
 
     async def channel_access_receipt(self, target_raw: str) -> dict | None:
-        """The run's recorded `ChannelAccess` for `target_raw` (#84): replay takes
-        Step A's route and `input_channel` from this receipt, never from the
-        output store's `peers`. None when the run recorded none (a legacy or
-        pre-feature run), in which case the collector computes Step A as live."""
-        entry = self._latest(("channelaccess",), ("target",), (target_raw,))
-        return self._serve(entry) if entry is not None else None
+        """The run's next recorded `ChannelAccess` for `target_raw` (#84): replay
+        takes Step A's route and `input_channel` from the receipts, never from the
+        output store's `peers`. A run holds one receipt per route attempted — the
+        refused ones and the final one — and successive calls serve them in
+        recorded order; None once exhausted. None on the FIRST call means the run
+        recorded none (a pre-#84 run): the collector replays it as the legacy
+        handle path and writes no receipt."""
+        hits = self._index.lookup(("channelaccess",), ("target",), (target_raw,))
+        served = self._access_served.get(target_raw, 0)
+        if served >= len(hits):
+            return None
+        self._access_served[target_raw] = served + 1
+        return self._serve(hits[served])
 
     async def get_full_channel(self, input_channel: dict) -> dict:
         entry = self._latest(("chatfull",), ("channel_id",), (input_channel["channel_id"],))
