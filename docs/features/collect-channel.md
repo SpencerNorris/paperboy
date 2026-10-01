@@ -73,13 +73,29 @@ obtains one, never guessing, by the first route that works (spec
 4. Nothing worked: the phase is skipped with an error naming what would
    make each route work.
 
+"Works" means `getFullChannel` accepts the key. If it rejects a saved key, a
+from-message reference or a verified handle with an access error
+(`CHANNEL_INVALID`, `CHANNEL_PRIVATE`, `MSG_ID_INVALID`, i.e. what
+`Budget.call` turns into `SkipAndRecord` for that call), that attempt is
+recorded as a `ChannelAccess` receipt with `granted: false` and the `error`
+name, and the next route is tried (1, then 2, then 3, then the route-4 failure,
+which lists every route tried and its error). Floods, hard stops and phase
+stops are not access errors: they propagate and never trigger a fallback. A
+handle target has the one route, so its rejection propagates as it always did.
+
 Step A always appends a `ChannelAccess` raw record (`via`, `input_channel`,
 `granted`, ...; see `docs/data-model.md`) before `getFullChannel`, so replay
 serves Step A from the receipt instead of recomputing it from the output
 store. `getFullChannel`'s identity check is the verification for every route;
 afterwards the run uses the full key it returns, so a from-message start is a
 saved key next time. `status` and `export` also accept the id forms,
-offline, via `channels.id`.
+offline, via `channels.id`. An id beyond SQLite's signed 64-bit range is
+rejected at parse time with a one-line message (exit 1, no traceback).
+
+On reproject, the refused attempts and the final one are replayed from the
+recorded receipts in order. A run recorded before #84 has no receipt: it
+replays exactly as it did then (handle path) and writes no `ChannelAccess` row
+(see `docs/features/reproject.md`).
 
 ## Edge cases handled
 
@@ -412,7 +428,7 @@ interactive keychain access — see the DoD report for the exact command.
 
 ## Collect-by-id smoke (#84)
 
-Offline evidence (all green on this branch): `pytest` 928 passed, `ruff check`
+Offline evidence (all green on this branch): `pytest` 949 passed, `ruff check`
 clean, `pyright` 0 errors; the parity golden diff is only the added
 `ChannelAccess` raw row and the raw-id shifts it causes (no projected-table
 content change); id-target routes 1-4, replay of the receipt (output-store
@@ -430,6 +446,15 @@ revision of this doc showed only the tail of a Rich traceback; fixed in
 $ paperboy status --profile default -- <id>          # bare id
   messages 8400 / revisions 8400 / tombstones 304
 $ paperboy status --profile default -- -100<id>      # marked form, same channel
+  paperboy status —
+    -100<id>
+┏━━━━━━━━━━━━┳━━━━━━━┓
+┃ metric     ┃ count ┃
+┡━━━━━━━━━━━━╇━━━━━━━┩
+│ messages   │ 8400  │
+│ revisions  │ 8400  │
+│ tombstones │ 304   │
+└────────────┴───────┘
 $ paperboy status --profile default -- -123
 '-123' is a basic group or user id (channel ids look like -100<id>); collecting 
 non-channel peers is out of scope
@@ -455,12 +480,15 @@ reproject: run=<run2> target=<minid> channel_id=<minid> decision=excluded       
 reproject: run=<run3> target=<minid> channel_id=<minid> decision=excluded         # live 3, saved_key
 reproject: run=<run4> target=@<fullhandle> channel_id=<fullid> decision=included  # live 4, handle
 (whole store: 62 runs included, 2 excluded)
-output ChannelAccess rows by via: handle 60, saved_key 1
+output ChannelAccess rows by via: handle 1, saved_key 1
 ```
 
 The two id-started runs of the min channel are excluded by its id; the id run
-of the full-key channel and the handle run are kept. (The 60 `handle` rows are
-the replay synthesising an access receipt for each pre-feature handle run.)
+of the full-key channel and the handle run are kept. (Re-run after the legacy
+fix: the 60 pre-feature handle runs in the store have no receipt, so they replay
+as before and write none; the two output rows are the live `saved_key` run and
+the live `handle` run. An earlier revision of this doc showed `handle 60` because
+replay minted a receipt for every legacy run, which spec 2.6 forbids.)
 `--include-target <minid>` instead keeps exactly those two runs and
 reproduces the `from_message` receipt:
 

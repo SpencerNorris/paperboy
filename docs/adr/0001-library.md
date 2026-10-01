@@ -43,8 +43,11 @@ channel request needs the id plus a per-account `access_hash`. So:
 - `Gateway.channel_access_receipt(target_raw) -> dict | None` is a replay-only
   hook. Live gateways return `None` (Step A is computed from the store by the
   `channel` collector and recorded as a `ChannelAccess` raw record);
-  `RawReplayGateway` serves the run's recorded receipt, so replay never
-  re-derives access from the output store's `peers`.
+  `RawReplayGateway` serves the run's recorded receipts in order (one per
+  route attempted), so replay never re-derives access from the output store's
+  `peers`. A replay gateway sets `replay = True`; a replayed run whose first
+  call returns `None` is a pre-#84 run and takes the legacy handle path with no
+  receipt written.
 - Every channel-taking gateway method accepts the `from_msg` form of an
   `input_channel` dict (`{"channel_id", "from_msg": {"channel_id",
   "access_hash", "msg_id"}}`), built by `_input_channel` /

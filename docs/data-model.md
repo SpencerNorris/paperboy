@@ -55,7 +55,9 @@ replay can serve them): `MediaDownload`, `RosterWalled`, and `ChannelAccess`
 appended before `getFullChannel`. Payload: `channel_id`, `requested` (the
 target as typed), `via` (`saved_key` | `from_message` | `handle`), `granted`
 (false when a stored handle now resolves to a different channel, with
-`resolved_channel_id` and `input_channel: null`), `input_channel`
+`resolved_channel_id` and `input_channel: null`, or when Telegram rejected the
+route's key at `getFullChannel`, with the `error` class name and `reason`: one
+receipt per route attempted, the refused ones then the final one), `input_channel`
 (`{channel_id, access_hash}` or `{channel_id, from_msg: {channel_id,
 access_hash, msg_id}}`), `key_source_raw_id` (a live-store raw id,
 informational, not a cross-store foreign key) and, for `handle`, `handle`.
