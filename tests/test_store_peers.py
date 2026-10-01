@@ -3,8 +3,9 @@ import json
 
 import pytest
 
+from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store, dumps
-from paperboy.store.peers import upsert_peer
+from paperboy.store.peers import ChannelRef, input_channel_ref, stored_channel_username, upsert_peer
 
 
 def test_min_does_not_clobber_full(tmp_path):
@@ -308,3 +309,84 @@ def test_upsert_peer_lattice_is_order_independent_for_a_replay_sequence(tmp_path
         "first_seen": t1, "last_seen": t3,
         "source_payload": dumps(observations["full3"][0]),
     }
+
+
+# --- input_channel_ref (#84): the store side of Step A routes 1 and 2 ----------
+
+_T = "2026-01-01T00:00:00+00:00"
+
+
+def _put_channel(st, cid, *, min_=False, hash_: int | None = 99, username=None, seen=(None, None)):
+    obj = {"_": "Channel", "id": cid, "title": f"t{cid}"}
+    if hash_ is not None:
+        obj["access_hash"] = hash_
+    if min_:
+        obj["min"] = True
+    if username:
+        obj["username"] = username
+    raw = st.add_raw("Channel", obj, "stranger", None)
+    upsert_peer(st, obj, raw, _T, seen_in_chat=seen[0], seen_in_msg=seen[1])
+    return raw
+
+
+def test_channel_ref_saved_key_for_a_full_row(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        raw = _put_channel(st, 5)
+        assert input_channel_ref(st, 5) == ChannelRef(
+            via="saved_key", input_channel={"channel_id": 5, "access_hash": 99},
+            key_source_raw_id=raw,
+        )
+
+
+def test_channel_ref_from_message_for_a_min_row_with_provenance(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _put_channel(st, 7, hash_=11)
+        raw = _put_channel(st, 5, min_=True, hash_=555, seen=(7, 3))
+        ref = input_channel_ref(st, 5)
+        assert ref == ChannelRef(
+            via="from_message",
+            input_channel={
+                "channel_id": 5,
+                "from_msg": {"channel_id": 7, "access_hash": 11, "msg_id": 3},
+            },
+            key_source_raw_id=raw,
+        )
+
+
+def test_channel_ref_never_uses_a_min_hash_as_a_key(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        # provenance chat is itself min -> its hash is not a usable key
+        _put_channel(st, 7, min_=True, hash_=11)
+        _put_channel(st, 5, min_=True, hash_=555, seen=(7, 3))
+        assert input_channel_ref(st, 5) is None
+
+
+def test_channel_ref_min_row_without_provenance_is_none(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _put_channel(st, 5, min_=True, hash_=555)
+        assert input_channel_ref(st, 5) is None
+
+
+def test_channel_ref_unknown_channel_is_none(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        assert input_channel_ref(st, 5) is None
+
+
+def test_channel_ref_full_row_with_null_hash_is_none(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _put_channel(st, 5, hash_=None)
+        assert input_channel_ref(st, 5) is None
+
+
+def test_stored_channel_username_prefers_channels_then_peers(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        assert stored_channel_username(st, 5) is None
+        _put_channel(st, 5, username="from_peers")
+        assert stored_channel_username(st, 5) == "from_peers"
+        raw = st.add_raw("ChatFull", {}, "stranger", None)
+        upsert_channel(
+            st, {"id": 5, "pts": 1}, {"id": 5, "title": "t", "username": "from_channels"},
+            raw, _T,
+        )
+        assert stored_channel_username(st, 5) == "from_channels"
+        assert stored_channel_username(st, 6) is None
