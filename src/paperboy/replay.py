@@ -707,6 +707,14 @@ class RawReplayGateway:
                 return self._serve(entry)
         raise SkipAndRecord(f"replay: no ResolvedPeer recorded for {target_value!r}")
 
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        """The run's recorded `ChannelAccess` for `target_raw` (#84): replay takes
+        Step A's route and `input_channel` from this receipt, never from the
+        output store's `peers`. None when the run recorded none (a legacy or
+        pre-feature run), in which case the collector computes Step A as live."""
+        entry = self._latest(("channelaccess",), ("target",), (target_raw,))
+        return self._serve(entry) if entry is not None else None
+
     async def get_full_channel(self, input_channel: dict) -> dict:
         entry = self._latest(("chatfull",), ("channel_id",), (input_channel["channel_id"],))
         if entry is None:
