@@ -390,3 +390,13 @@ def test_stored_channel_username_prefers_channels_then_peers(tmp_path):
         )
         assert stored_channel_username(st, 5) == "from_channels"
         assert stored_channel_username(st, 6) is None
+
+
+def test_stored_channel_username_ignores_a_user_peer_with_the_same_id(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        obj = {"_": "user", "id": 5, "access_hash": 1, "username": "a_user"}
+        upsert_peer(
+            st, obj, st.add_raw("user", obj, "member", None), _T,
+            seen_in_chat=None, seen_in_msg=None,
+        )
+        assert stored_channel_username(st, 5) is None

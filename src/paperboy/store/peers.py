@@ -308,10 +308,12 @@ def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
 def stored_channel_username(store: Store, channel_id: int) -> str | None:
     """The last-known handle for a channel id: `channels.username` first, else
     `peers.username`. Input to Step A route 3 (a verified handle lookup)."""
-    for table in ("channels", "peers"):
-        row = store.conn.execute(
-            f"SELECT username FROM {table} WHERE id=?", (channel_id,)  # noqa: S608 - fixed names
-        ).fetchone()
+    for sql in (
+        "SELECT username FROM channels WHERE id=?",
+        # `kind='channel'`: a user / basic-group peer can share the numeric id.
+        "SELECT username FROM peers WHERE id=? AND kind='channel'",
+    ):
+        row = store.conn.execute(sql, (channel_id,)).fetchone()
         if row is not None and row["username"]:
             return row["username"]
     return None

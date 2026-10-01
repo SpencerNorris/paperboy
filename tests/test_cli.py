@@ -533,3 +533,15 @@ def test_status_and_export_accept_channel_id_forms(tmp_path, monkeypatch):
     unknown = runner.invoke(app, ["status", "6", "--profile", "cliid"], env=env)
     assert unknown.exit_code == 1
     assert "No local data" in unknown.stdout
+
+
+@pytest.mark.parametrize("cmd", ["status", "collect", "export"])
+def test_negative_non_channel_id_is_rejected_without_a_traceback(tmp_path, cmd):
+    result = runner.invoke(
+        app,
+        [cmd, "--profile", "clitest_badid", "--", "-123"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 1
+    assert "basic group or user id" in result.stdout
+    assert "Traceback" not in result.stdout
