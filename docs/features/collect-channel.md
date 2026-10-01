@@ -409,3 +409,22 @@ directly, not the full `collect_channel` recipe. A live confirmation of
 finding #1 (`paperboy collect <a private/no-admin channel> --unsafe` no
 longer crashing) is recommended as a follow-up by whoever next has
 interactive keychain access — see the DoD report for the exact command.
+
+## Collect-by-id smoke (#84)
+
+Offline evidence (all green on this branch): `pytest` 928 passed, `ruff check`
+clean, `pyright` 0 errors; the parity golden diff is only the added
+`ChannelAccess` raw row and the raw-id shifts it causes (no projected-table
+content change); id-target routes 1-4, replay of the receipt (output-store
+`peers` deliberately wrong, receipt still served) and `--exclude-target`
+by id are pinned by tests in `tests/test_collector_channel.py` and
+`tests/test_profile_split.py`.
+
+Live smoke (`--phases channel`, scratch data dir, VPN egress): **PENDING**.
+The live command was not permitted to run in the implementing session, so no
+live call was made (live-call counter 0 of 5). To close it, run the four
+invocations from the plan against a scratch `.backup` of the store: a
+full-key id (expect `via=saved_key`, no `ResolvedPeer`), a `min` id with
+provenance (expect `via=from_message`, then `is_min=0` afterwards), the same
+id again (expect `saved_key`), and `@<channel>` (expect one `ResolvedPeer`
+then `ChannelAccess via=handle`). Transcripts must use `<id>`/`@<channel>`.
