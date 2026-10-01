@@ -57,7 +57,8 @@ class ReplayRun:
 
 @dataclass(frozen=True)
 class ResolveRecord:
-    """One `(run, raw target)` pair as `ResolvedPeer` recorded it (#70).
+    """One `(run, raw target)` pair as `ResolvedPeer` and/or `ChannelAccess`
+    recorded it (#70, #84).
 
     `channel_id` is the channel the target resolved to, or None when it
     resolved to a non-channel peer (a user, a basic group). `username` is that
@@ -557,11 +558,14 @@ class ReplaySource:
         return out
 
     def resolve_targets(self, run: ReplayRun) -> list[str]:
-        """Every distinct `target` a `resolve()` was recorded against WITHIN
-        `run`, in first-seen (capture) order — `reproject` re-runs a full
-        collect per target per historical run (ADR-0005)."""
+        """Every distinct `target` a `resolve()` or a `ChannelAccess` receipt
+        was recorded against WITHIN `run`, in first-seen (capture) order —
+        `reproject` re-runs a full collect per target per historical run
+        (ADR-0005). An id-started run (#84) has a receipt and, unless it took
+        the handle route, no `ResolvedPeer`; a handle run has both, which the
+        dict dedups."""
         seen: dict[str, None] = {}
-        for e in self.index(run).entries(("resolvedpeer",)):
+        for e in self.index(run).entries(("resolvedpeer", "channelaccess")):
             target = _as_sqlite_json_value(e.ctx.get("target"))
             if target is not None:
                 seen.setdefault(target)
@@ -569,7 +573,7 @@ class ReplaySource:
 
     def resolve_catalogue(self) -> list[ResolveRecord]:
         """Every `(run, raw target)` pair with the channel id it resolved to,
-        from ONE pass over the `ResolvedPeer` rows (no per-run index builds, so
+        from ONE pass over the `ResolvedPeer` and `ChannelAccess` rows (no per-run index builds, so
         validating a `--include/--exclude-target` costs a query, not a
         replay). Pairs are keyed and ordered exactly as `resolve_targets` does
         (first-seen order, `_as_sqlite_json_value` on the context target); a
@@ -577,10 +581,10 @@ class ReplaySource:
         `RawReplayGateway.resolve` serves it."""
         runs = self.runs()
         los = [r.lo for r in runs]
-        kind_sql, kind_params = _kind_clause(("resolvedpeer",))
+        kind_sql, kind_params = _kind_clause(("resolvedpeer", "channelaccess"))
         pairs: dict[tuple[str, str], ResolveRecord] = {}
         for row in self.conn.execute(
-            "SELECT id, context_json, payload_json FROM raw_records "
+            "SELECT id, kind, context_json, payload_json FROM raw_records "
             f"WHERE {kind_sql} ORDER BY id",
             kind_params,
         ):
@@ -597,10 +601,20 @@ class ReplaySource:
             target = _as_sqlite_json_value(ctx.get("target") if isinstance(ctx, dict) else None)
             if target is None:
                 continue
-            channel_id, username = _resolved_channel(json.loads(row["payload_json"]))
-            pairs[(run.run_id, str(target))] = ResolveRecord(
-                run.run_id, str(target), channel_id, username
-            )
+            payload = json.loads(row["payload_json"])
+            key = (run.run_id, str(target))
+            if row["kind"].lower() == "channelaccess":
+                # The receipt is written after the pair's ResolvedPeer (higher
+                # id), so it wins the pair. A refused receipt (granted false: the
+                # stored handle now belongs to another channel) is a stray:
+                # channel_id None, so the #70 filter never files the run under
+                # the wrong channel.
+                prior = pairs.get(key)
+                channel_id = payload.get("channel_id") if payload.get("granted") else None
+                username = (prior.username if prior else None) or payload.get("handle")
+            else:
+                channel_id, username = _resolved_channel(payload)
+            pairs[key] = ResolveRecord(run.run_id, str(target), channel_id, username)
         return list(pairs.values())
 
     def linked_group_map(self) -> dict[int, int]:
@@ -701,7 +715,15 @@ class RawReplayGateway:
         return payload
 
     async def resolve(self, target_value: str) -> dict:
-        for entry in reversed(self._index.entries(("resolvedpeer",))):
+        entries = list(reversed(self._index.entries(("resolvedpeer",))))
+        # An id target resolved through its stored handle (#84 route 3) records
+        # that handle in its context; match it first. Then the original rule: a
+        # handle target is recorded under its own spelling (legacy records
+        # have no `handle` key).
+        for entry in entries:
+            if entry.ctx.get("handle") == target_value:
+                return self._serve(entry)
+        for entry in entries:
             raw_target = entry.ctx.get("target")
             if raw_target and parse_target(raw_target).value == target_value:
                 return self._serve(entry)

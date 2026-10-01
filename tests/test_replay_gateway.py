@@ -562,3 +562,22 @@ def test_resolve_catalogue_private_channel_has_no_username(tmp_path):
                    observed_at="2026-01-01T00:00:01+00:00")
     [rec] = ReplaySource.open(db, tmp_path).resolve_catalogue()
     assert (rec.channel_id, rec.username) == (8, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_matches_the_handle_an_id_target_was_resolved_through(tmp_path):
+    db, profile_root = _seed(tmp_path)
+    with Store.open(db) as st:
+        st.add_raw(
+            "ResolvedPeer",
+            {"_": "contacts.ResolvedPeer",
+             "peer": {"_": "PeerChannel", "channel_id": 5},
+             "chats": [{"_": "Channel", "id": 5, "access_hash": 9}]},
+            "stranger", {"target": "5", "handle": "viahandle"},
+            observed_at="2026-01-01T00:00:09+00:00",
+        )
+    src = ReplaySource.open(db, profile_root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    assert (await gw.resolve("viahandle"))["peer"]["channel_id"] == 5
+    # The legacy spelling still matches its own record.
+    assert (await gw.resolve("durov"))["peer"]["channel_id"] == CID
