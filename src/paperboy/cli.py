@@ -14,6 +14,7 @@ from typing import Annotated, Any, cast
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from paperboy import app as composition
@@ -33,13 +34,23 @@ from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
 from paperboy.reproject import reproject as reproject_run
-from paperboy.targets import parse_target
+from paperboy.targets import Target, TargetKind, UnsupportedTarget, parse_target
 
 app = typer.Typer(
     add_completion=False,
     help="Local, read-only Telegram channel OSINT collector. See docs/opsec.md first.",
 )
 console = Console()
+
+
+def _parse_target_or_exit(raw: str) -> Target:
+    """`parse_target`, but an unparsable TARGET is a clean one-line CLI error
+    (exit 1) rather than an uncaught exception with a Rich traceback."""
+    try:
+        return parse_target(raw)
+    except UnsupportedTarget as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
 
 _PACING_HELP = (
     "Multiply every request interval we assume by this (default 2.0, min 1.0). "
@@ -70,10 +81,17 @@ def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
         raise typer.Exit(code=1) from None
 
 
-def _find_channel_id(store, username: str) -> int | None:
-    row = store.conn.execute(
-        "SELECT id FROM channels WHERE username = ?", (username.lstrip("@"),)
-    ).fetchone()
+def _find_channel_id(store, target: Target) -> int | None:
+    """The locally stored channel a `status`/`export` target names, offline:
+    by id for the id forms (#84), else by username."""
+    if target.kind is TargetKind.PEER_ID:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE id = ?", (int(target.value),)
+        ).fetchone()
+    else:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE username = ?", (target.value.lstrip("@"),)
+        ).fetchone()
     return row["id"] if row else None
 
 
@@ -259,7 +277,7 @@ def collect(
 
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
-    parsed_target = parse_target(target)
+    parsed_target = _parse_target_or_exit(target)
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
@@ -362,8 +380,8 @@ def status(
 
         channel_id = None
         if target:
-            parsed = parse_target(target)
-            channel_id = _find_channel_id(store, parsed.value)
+            parsed = _parse_target_or_exit(target)
+            channel_id = _find_channel_id(store, parsed)
             if channel_id is None:
                 console.print(f"[yellow]No local data for {target!r} yet — run `collect` first.[/]")
                 raise typer.Exit(code=1)
@@ -411,9 +429,9 @@ def export_cmd(
         raise typer.Exit(code=1)
 
     settings = _settings_with_overrides(profile)
-    parsed = parse_target(target)
+    parsed = _parse_target_or_exit(target)
     with composition.build_store(settings, profile) as store:
-        channel_id = _find_channel_id(store, parsed.value)
+        channel_id = _find_channel_id(store, parsed)
         if channel_id is None:
             console.print(f"[red]No local data for {target!r}. Run `collect` first.[/]")
             raise typer.Exit(code=1)

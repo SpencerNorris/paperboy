@@ -1,7 +1,10 @@
 """Parse a user-supplied string into a typed :class:`Target`.
 
 Accepted shapes: ``@name``, bare ``name``, ``t.me/name``, ``t.me/+hash``,
-``t.me/joinchat/hash``, ``t.me/name/123`` (a message link), numeric peer ids,
+``t.me/joinchat/hash``, ``t.me/name/123`` (a message link), channel ids (bare ``123``, marked
+``-100123``, or the private-link forms ``t.me/c/123`` and ``t.me/c/123/456``;
+all normalise to the bare id with ``kind=PEER_ID``; a negative id without
+the ``-100`` prefix is a basic-group or user id and is rejected),
 ``+phone`` numbers, and ``#hashtag``. v1 recipes only act on channel-like
 targets (``is_channel_like``); the others parse cleanly so future recipes
 (phone lookup, hashtag search) can consume them, but attempting to collect
@@ -52,14 +55,35 @@ _SCHEME_RE = re.compile(r"^(https?://)?(www\.)?t\.me/", re.IGNORECASE)
 # so a bare phone number falls through to `_PHONE_RE` instead.
 _INVITE_PLUS_RE = re.compile(r"^\+(?!\d+$)([A-Za-z0-9_-]+)$")
 _INVITE_JOINCHAT_RE = re.compile(r"^joinchat/([A-Za-z0-9_-]+)$")
+# `t.me/c/<id>[/<msg>]` is the private-link form people share channel ids in.
+# It must be tried BEFORE `_MSG_LINK_RE`, else `c/123` parses as a message link
+# for a user named `c`.
+_PRIVATE_LINK_RE = re.compile(r"^c/(\d+)(?:/(\d+))?$")
+# Telegram's "marked" channel id: -100 followed by the bare channel id.
+_MARKED_ID_RE = re.compile(r"^-100(\d+)$")
 _MSG_LINK_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_]{0,31})/(\d+)$")
 # Telegram enforces its own (longer) minimum public-username length; this
 # module only recognizes the *shape* of a username-like token — an invalid
 # or nonexistent one still fails, later, at resolve() time.
 _USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{0,31})$")
 _PHONE_RE = re.compile(r"^\+\d{7,15}$")
-_PEER_ID_RE = re.compile(r"^-?\d+$")
+_PEER_ID_RE = re.compile(r"^\d+$")
+_NEGATIVE_ID_RE = re.compile(r"^-\d+$")
 _HASHTAG_RE = re.compile(r"^#(\w+)$")
+
+
+# SQLite stores integers as signed 64-bit; an id beyond it can never be a real
+# channel id (Telegram's are far smaller) and would crash the store with an
+# OverflowError at the first query, so it is rejected here, once, with a message.
+_SQLITE_MAX_INT = 2**63 - 1
+
+
+def _peer_id_target(raw: str, digits: str, *, msg_id: int | None = None) -> Target:
+    if int(digits) > _SQLITE_MAX_INT:
+        raise UnsupportedTarget(
+            f"{raw!r} is not a valid channel id: it exceeds the signed 64-bit range"
+        )
+    return Target(TargetKind.PEER_ID, raw, digits, msg_id=msg_id)
 
 
 def parse_target(text: str) -> Target:
@@ -76,6 +100,9 @@ def parse_target(text: str) -> Target:
         return Target(TargetKind.INVITE, raw, m.group(1))
     if m := _INVITE_JOINCHAT_RE.match(body):
         return Target(TargetKind.INVITE, raw, m.group(1))
+    if m := _PRIVATE_LINK_RE.match(body):
+        msg = int(m.group(2)) if m.group(2) else None
+        return _peer_id_target(raw, m.group(1), msg_id=msg)
     if m := _MSG_LINK_RE.match(body):
         return Target(TargetKind.MSG_LINK, raw, m.group(1), msg_id=int(m.group(2)))
     if m := _USERNAME_RE.match(body):
@@ -84,7 +111,14 @@ def parse_target(text: str) -> Target:
         return Target(TargetKind.PHONE, raw, body)
     if m := _HASHTAG_RE.match(body):
         return Target(TargetKind.HASHTAG, raw, m.group(1))
+    if m := _MARKED_ID_RE.match(body):
+        return _peer_id_target(raw, m.group(1))
     if _PEER_ID_RE.match(body):
-        return Target(TargetKind.PEER_ID, raw, body)
+        return _peer_id_target(raw, body)
+    if _NEGATIVE_ID_RE.match(body):
+        raise UnsupportedTarget(
+            f"{text!r} is a basic group or user id (channel ids look like "
+            "-100<id>); collecting non-channel peers is out of scope"
+        )
 
     raise UnsupportedTarget(f"unrecognized target: {text!r}")

@@ -102,6 +102,25 @@ async def test_resolve_unknown_target_skips(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_channel_access_receipt_serves_the_run_receipt_and_stamps_clock(tmp_path):
+    db, profile_root = _seed(tmp_path)
+    receipt = {
+        "_": "ChannelAccess", "channel_id": CID, "requested": "100", "via": "saved_key",
+        "granted": True, "input_channel": IC, "key_source_raw_id": 2,
+    }
+    with Store.open(db) as st:
+        st.add_raw("ChannelAccess", receipt, "stranger", {"target": "100", "channel_id": CID},
+                   observed_at="2026-01-01T00:00:01+00:00")
+    src = ReplaySource.open(db, profile_root)
+    clock = ReplayClock()
+    gw = RawReplayGateway(src, clock, src.runs()[0])
+    served = await gw.channel_access_receipt("100")
+    assert served is not None and served == receipt
+    assert clock.for_payload(served) == "2026-01-01T00:00:01+00:00"
+    assert await gw.channel_access_receipt("101") is None
+
+
+@pytest.mark.asyncio
 async def test_get_self_serves_self_tier_record(tmp_path):
     gw, _ = _gateway(tmp_path)
     assert (await gw.get_self())["id"] == 1
@@ -543,3 +562,22 @@ def test_resolve_catalogue_private_channel_has_no_username(tmp_path):
                    observed_at="2026-01-01T00:00:01+00:00")
     [rec] = ReplaySource.open(db, tmp_path).resolve_catalogue()
     assert (rec.channel_id, rec.username) == (8, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_matches_the_handle_an_id_target_was_resolved_through(tmp_path):
+    db, profile_root = _seed(tmp_path)
+    with Store.open(db) as st:
+        st.add_raw(
+            "ResolvedPeer",
+            {"_": "contacts.ResolvedPeer",
+             "peer": {"_": "PeerChannel", "channel_id": 5},
+             "chats": [{"_": "Channel", "id": 5, "access_hash": 9}]},
+            "stranger", {"target": "5", "handle": "viahandle"},
+            observed_at="2026-01-01T00:00:09+00:00",
+        )
+    src = ReplaySource.open(db, profile_root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    assert (await gw.resolve("viahandle"))["peer"]["channel_id"] == 5
+    # The legacy spelling still matches its own record.
+    assert (await gw.resolve("durov"))["peer"]["channel_id"] == CID

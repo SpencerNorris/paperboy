@@ -18,6 +18,8 @@ true min/max window regardless of arrival order.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from paperboy.ids import channel_uri, chat_uri, parse_uri, primary_username, user_uri
 from paperboy.store.db import Store, dumps
 from paperboy.store.sync import is_self
@@ -242,4 +244,90 @@ def input_user_ref(store: Store, uri: str) -> dict | None:
                     "msg_id": peer["seen_in_msg"],
                 },
             }
+    return None
+
+
+@dataclass(frozen=True)
+class ChannelRef:
+    """How the store can give this account access to a channel (#84 Step A).
+
+    `via` is `saved_key` (a full `access_hash`) or `from_message` (a message in
+    a chat whose own key is known); `input_channel` is the gateway-ready dict;
+    `key_source_raw_id` is the raw record the peer row was last projected from
+    (informational: a live-store id, not a cross-store foreign key)."""
+
+    via: str
+    input_channel: dict
+    key_source_raw_id: int | None
+
+
+def input_channel_refs(store: Store, channel_id: int) -> list[ChannelRef]:
+    """Routes 1 and 2 of the id-first channel phase, from the `peers` projection,
+    in the order they are tried (spec §2.2: stop at the first that works, so the
+    caller needs every applicable route to fall through to the next).
+
+    1. A non-`min` row with a real `access_hash` -> `saved_key`.
+    2. A row with `(seen_in_chat, seen_in_msg)` provenance into a channel whose
+       own hash is a full key -> `from_message` (`inputChannelFromMessage`;
+       research §8.7).
+
+    A `min` hash is never offered as a key, and a hash is never guessed. Empty
+    when neither route is available.
+    """
+    peer = store.conn.execute(
+        "SELECT is_min, access_hash, seen_in_chat, seen_in_msg, source_raw_id "
+        "FROM peers WHERE uri=?",
+        (channel_uri(channel_id),),
+    ).fetchone()
+    if peer is None:
+        return []
+    refs: list[ChannelRef] = []
+    if not peer["is_min"] and peer["access_hash"]:
+        refs.append(
+            ChannelRef(
+                "saved_key",
+                {"channel_id": channel_id, "access_hash": peer["access_hash"]},
+                peer["source_raw_id"],
+            )
+        )
+    if peer["seen_in_chat"] and peer["seen_in_msg"]:
+        chat = store.conn.execute(
+            "SELECT is_min, access_hash FROM peers WHERE uri=?",
+            (channel_uri(peer["seen_in_chat"]),),
+        ).fetchone()
+        if chat is not None and not chat["is_min"] and chat["access_hash"]:
+            refs.append(
+                ChannelRef(
+                    "from_message",
+                    {
+                        "channel_id": channel_id,
+                        "from_msg": {
+                            "channel_id": peer["seen_in_chat"],
+                            "access_hash": chat["access_hash"],
+                            "msg_id": peer["seen_in_msg"],
+                        },
+                    },
+                    peer["source_raw_id"],
+                )
+            )
+    return refs
+
+
+def input_channel_ref(store: Store, channel_id: int) -> ChannelRef | None:
+    """The first applicable route of `input_channel_refs`, or None."""
+    refs = input_channel_refs(store, channel_id)
+    return refs[0] if refs else None
+
+
+def stored_channel_username(store: Store, channel_id: int) -> str | None:
+    """The last-known handle for a channel id: `channels.username` first, else
+    `peers.username`. Input to Step A route 3 (a verified handle lookup)."""
+    for sql in (
+        "SELECT username FROM channels WHERE id=?",
+        # `kind='channel'`: a user / basic-group peer can share the numeric id.
+        "SELECT username FROM peers WHERE id=? AND kind='channel'",
+    ):
+        row = store.conn.execute(sql, (channel_id,)).fetchone()
+        if row is not None and row["username"]:
+            return row["username"]
     return None

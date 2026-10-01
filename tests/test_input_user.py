@@ -10,7 +10,10 @@ from telethon.tl.types import (
     ChannelParticipantsBots,
     ChannelParticipantsMentions,
     ChannelParticipantsRecent,
+    InputChannel,
+    InputChannelFromMessage,
     InputPeerChannel,
+    InputPeerChannelFromMessage,
     InputPeerUser,
     InputPeerUserFromMessage,
     InputUser,
@@ -22,6 +25,8 @@ from paperboy.gateway import (
     FILTER_BOTS,
     FILTER_RECENT,
     _file_reference,
+    _input_channel,
+    _input_peer_channel,
     _input_peer_user,
     _input_user,
     _largest_photo_size,
@@ -139,3 +144,24 @@ def test_photo_download_helpers():
     # a replayed/stored photo dict carries base64 text (store.db.dumps)
     encoded = base64.b64encode(b"\x01\x02").decode()
     assert _file_reference({"file_reference": encoded}) == b"\x01\x02"
+
+
+def test_input_channel_plain_form_builds_input_channel():
+    built = _input_channel({"channel_id": 5, "access_hash": 99})
+    assert isinstance(built, InputChannel) and (built.channel_id, built.access_hash) == (5, 99)
+    peer = _input_peer_channel({"channel_id": 5, "access_hash": 99})
+    assert isinstance(peer, InputPeerChannel) and peer.access_hash == 99
+
+
+def test_input_channel_from_msg_form_builds_from_message():
+    ref = {"channel_id": 5, "from_msg": {"channel_id": 7, "access_hash": 11, "msg_id": 3}}
+    built = _input_channel(ref)
+    assert isinstance(built, InputChannelFromMessage)
+    assert isinstance(built.peer, InputPeerChannel)
+    assert (built.peer.channel_id, built.peer.access_hash) == (7, 11)
+    assert (built.msg_id, built.channel_id) == (3, 5)
+    peer = _input_peer_channel(ref)
+    assert isinstance(peer, InputPeerChannelFromMessage)
+    assert isinstance(peer.peer, InputPeerChannel)
+    assert (peer.peer.channel_id, peer.peer.access_hash) == (7, 11)
+    assert (peer.msg_id, peer.channel_id) == (3, 5)

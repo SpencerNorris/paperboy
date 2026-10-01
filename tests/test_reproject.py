@@ -1024,3 +1024,116 @@ def test_missing_source_file_propagates_sqlite_error(tmp_path):
 
     with pytest.raises(sqlite3.OperationalError, match="unable to open"):
         ReplaySource.open(tmp_path / "nope.sqlite", tmp_path)
+
+
+# --- #84: runs started by id, per route; legacy (pre-receipt) runs -------------------
+
+
+def _route_source(data_dir: Path, *, fallback: bool) -> Path:
+    """Two runs, the second collecting channel 5 BY ID.
+
+    Default: run 1 collects `@alpha` (channel 7), whose history carries a post
+    authored by channel 5 -> a `min` peer for 5 with provenance (7, msg 2), so
+    run 2 takes route 2 (from_message).
+
+    `fallback`: run 1 collects `@five` itself (a saved full key AND a handle),
+    and Telegram rejects the saved key in run 2, so Step A falls through to
+    route 3 (the handle) and the run holds a refused receipt, then the final one."""
+    from telethon.errors import ChannelPrivateError
+
+    from paperboy.budget import SkipAndRecord
+    from paperboy.collectors.channel import ChannelCollector
+    from paperboy.collectors.history import HistoryCollector
+    from tests.test_profile_split import _channel_fixtures
+
+    settings = load_settings("default", {"data_dir": data_dir})
+    db = data_dir / "default" / "paperboy.sqlite"
+    run2 = _channel_fixtures(5, "five", linked=None, media={})
+    if fallback:
+        first = ("@five", _channel_fixtures(5, "five", linked=None, media={}))
+        rejected = SkipAndRecord("CHANNEL_PRIVATE")
+        rejected.__cause__ = ChannelPrivateError(None)
+        run2["full_channel_sequence"] = [rejected]
+    else:
+        alpha = _channel_fixtures(7, "alpha", linked=None, media={})
+        alpha["history"].append({
+            "_": "message", "id": 2, "message": "m2", "date": 1767322500,
+            "from_id": {"_": "PeerChannel", "channel_id": 5},
+        })
+        first = ("@alpha", alpha)
+
+    async def go() -> None:
+        with Store.open(db) as store:
+            for target, fixtures in (first, ("5", run2)):
+                await collect_channel(
+                    FakeGateway(fixtures), store, settings, parse_target(target),
+                    ["channel", "history"], logging.getLogger("t"),
+                    collectors=[ChannelCollector(), HistoryCollector()],
+                )
+
+    asyncio.run(go())
+    return db
+
+
+def _receipts(db: Path) -> list[tuple[str, dict]]:
+    conn = sqlite3.connect(db)
+    try:
+        return [
+            (r[0], json.loads(r[1]))
+            for r in conn.execute(
+                "SELECT context_json, payload_json FROM raw_records "
+                "WHERE kind='ChannelAccess' ORDER BY id"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _reproject_cli(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    return tmp_path / "default" / "paperboy.reprojected.sqlite"
+
+
+def test_route_2_started_run_round_trips(tmp_path, monkeypatch):
+    """Spec §4: a from-message (route 2) start reprojects to identical tables,
+    with Step A served from the receipt."""
+    db1 = _route_source(tmp_path, fallback=False)
+    assert [r["via"] for _, r in _receipts(db1)] == ["handle", "from_message"]
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert_round_trip(db1, out)
+    assert _receipts(out) == _receipts(db1)
+
+
+def test_rejected_route_round_trips_with_the_same_receipt_sequence(tmp_path, monkeypatch):
+    """Spec §2.2 fallback: route 1 refused, route 3 succeeds. Replay reproduces
+    the refused attempt and the final one, in order, and the same tables."""
+    db1 = _route_source(tmp_path, fallback=True)
+    seq = [(r["via"], r["granted"]) for _, r in _receipts(db1)]
+    assert seq == [("handle", True), ("saved_key", False), ("handle", True)]
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert_round_trip(db1, out)
+    assert _receipts(out) == _receipts(db1)
+
+
+def test_legacy_run_without_receipts_reprojects_as_before_and_writes_none(
+    tmp_path, monkeypatch
+):
+    """Spec §2.6: a pre-#84 source has no ChannelAccess. Replay must take the
+    handle path exactly as before and must NOT mint a receipt (a replay with no
+    receipt is not a live run)."""
+    db1 = _route_source(tmp_path, fallback=False)
+    conn = sqlite3.connect(db1)
+    conn.execute("DELETE FROM raw_records WHERE kind='ChannelAccess'")
+    conn.commit()
+    conn.close()
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert _receipts(out) == []
+    conn = sqlite3.connect(out)
+    try:
+        kinds = {r[0] for r in conn.execute("SELECT kind FROM raw_records")}
+        assert "contacts.resolvedPeer" in kinds or "ResolvedPeer" in kinds
+        assert conn.execute("SELECT count(*) FROM channels WHERE id=7").fetchone()[0] == 1
+    finally:
+        conn.close()

@@ -103,13 +103,20 @@ payload: {
   "via": "saved_key" | "from_message" | "handle",
   "input_channel": { "channel_id": 123, "access_hash": … }
                  | { "channel_id": 123, "from_msg": {"channel_id", "access_hash", "msg_id"} },
-  "key_source_raw_id": <raw id the key or provenance came from, when known>
+  "key_source_raw_id": <raw id the key or provenance came from, when known>,
+  "granted": true | false,
+  "handle": "<handle>"            (via "handle" only),
+  "resolved_channel_id": M        (granted false only)
 }
 context: { "target": "<target.raw>", "channel_id": 123 }
 ```
 
 For `via: "handle"` the `ResolvedPeer` receipt is still written, as today, and
-`ChannelAccess` follows it. `access_hash` values already appear in raw
+`ChannelAccess` follows it. A failed route-3 verification (the stored handle now
+belongs to channel M) is itself recorded as a receipt with `granted: false`,
+`resolved_channel_id: M` and `input_channel: null` before the phase is skipped, so
+replay reproduces the refusal from raw and the #70 filter never files the run
+under M (orchestrator decision, 2026-09-30). `access_hash` values already appear in raw
 `ResolvedPeer`/`ChatFull` payloads, so recording one here changes no exposure.
 Exports keep scrubbing as today.
 

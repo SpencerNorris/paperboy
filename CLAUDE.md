@@ -38,8 +38,11 @@ untouched. #75 replay lookup performance is on
 `docs/features/reproject.md`). #70 profile split is on `feat/profile-split`
 (PR pending; `reproject --include-target/--exclude-target/--out-profile`,
 `scripts/unreferenced_media.py`, replay now verifies each media sha; no
-migration — `docs/features/reproject.md` "Splitting a mixed profile"). Next:
-#68 `fetch-media --list`. Order and protocol:
+migration — `docs/features/reproject.md` "Splitting a mixed profile"). #84 collect
+by id is on `feat/collect-by-id` (PR pending; `collect`/`status`/`export` accept
+channel ids, Step A gets access by saved key, from-message or verified handle and
+records a `ChannelAccess` receipt, replay serves it; no migration —
+`docs/features/collect-channel.md`). Next: #68 `fetch-media --list`. Order and protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
@@ -113,7 +116,10 @@ PATH | --out-profile NAME] [--include-target T | --exclude-target T] [--phases a
 needs none of that — it never touches the network or the keychain, only a
 source `paperboy.sqlite`'s `raw_records` (the target flags split a mixed
 profile, #70; `scripts/unreferenced_media.py --profile P` lists orphaned media). `watch`/
-`lookup` exit 1 with a "Phase 2" message — not implemented yet.
+`lookup` exit 1 with a "Phase 2" message — not implemented yet. `TARGET` for
+`collect`/`status`/`export` is a handle or a channel id (`123`, `-100123` after
+`--`, `t.me/c/123`; #84) — by id the account must already have been shown the
+channel.
 
 ## Workflow
 

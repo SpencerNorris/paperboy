@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from paperboy.budget import SkipAndRecord
 from paperboy.cli import app as cli_app
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.discussion import DiscussionCollector
@@ -31,6 +32,7 @@ from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ResolveRecord
 from paperboy.reproject import ReprojectError, TargetFilter, reproject, resolve_target_filter
 from paperboy.store.db import Store
+from paperboy.store.peers import upsert_peer
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
 
@@ -577,10 +579,21 @@ def test_linked_group_id_is_not_a_target(tmp_path):
         resolve_target_filter(src, [], [str(BETA_GROUP_ID)])
 
 
-def test_bot_api_style_and_non_channel_targets_are_rejected(tmp_path):
+def test_marked_channel_id_is_accepted_as_a_target(tmp_path):
+    # #84 / #83 item 4: the Bot-API "marked" form -100<id> names the same
+    # channel as the bare id.
     db = seed_two_target_source(tmp_path)
     with ReplaySource.open(db, tmp_path / "default") as src:
-        for bad in ("-1006", "+15551234567", "t.me/+abcdef", "@stray"):
+        flt = resolve_target_filter(src, [], ["-1006"])
+        bare = resolve_target_filter(src, [], ["6"])
+        assert flt is not None and bare is not None
+        assert flt.ids == bare.ids
+
+
+def test_non_channel_targets_are_rejected(tmp_path):
+    db = seed_two_target_source(tmp_path)
+    with ReplaySource.open(db, tmp_path / "default") as src:
+        for bad in ("-6", "+15551234567", "t.me/+abcdef", "@stray"):
             with pytest.raises(ReprojectError):
                 resolve_target_filter(src, [bad], [])
 
@@ -619,3 +632,126 @@ def test_stray_pair_alone_in_a_run_is_kept_only_under_exclude():
     recs = [_rec("r1", "@stray", None)]
     assert TargetFilter("exclude", frozenset({6})).decide_run(recs) == {"@stray": True}
     assert TargetFilter("include", frozenset({6})).decide_run(recs) == {"@stray": False}
+
+
+# --- #84: runs started by channel id (ChannelAccess receipts) -------------------
+
+
+def seed_three_run_source(data_dir: Path) -> Path:
+    """The two-target source plus a third run collecting channel 5 BY ID.
+
+    Alpha's key was saved by run 1, so run 3's Step A takes route 1; the
+    `resolve` fixture raises, proving nothing resolved a handle."""
+    db = seed_two_target_source(data_dir)
+    settings = load_settings("default", {"data_dir": data_dir})
+    fixtures = _channel_fixtures(ALPHA_ID, "alpha", linked=None, media={})
+    fixtures["resolve"] = SkipAndRecord("route 1 must not call resolve")
+
+    async def go() -> None:
+        with Store.open(db) as store:
+            await collect_channel(
+                FakeGateway(fixtures), store, settings, parse_target(str(ALPHA_ID)),
+                ["channel"], logging.getLogger("seed"), collectors=[ChannelCollector()],
+            )
+
+    asyncio.run(go())
+    return db
+
+
+def _access_rows(db: Path) -> list[tuple[str, str]]:
+    with closing(sqlite3.connect(db)) as conn:
+        return sorted(
+            conn.execute(
+                "SELECT context_json, payload_json FROM raw_records WHERE kind='ChannelAccess'"
+            ).fetchall()
+        )
+
+
+def test_id_started_run_is_identified_from_its_receipt(tmp_path):
+    db = seed_three_run_source(tmp_path)
+    with ReplaySource.open(db, tmp_path / "default") as src:
+        run1, run2, run3 = src.runs()
+        assert src.resolve_targets(run3) == ["5"]
+        assert src.resolve_targets(run1) == ["@alpha"]  # handle runs unchanged
+        by_pair = {(r.run_id, r.raw_target): r for r in src.resolve_catalogue()}
+        assert by_pair[(run3.run_id, "5")].channel_id == ALPHA_ID
+        # A handle run has BOTH a ResolvedPeer and a receipt: one record, the
+        # username taken from the ResolvedPeer.
+        both = by_pair[(run1.run_id, "@alpha")]
+        assert (both.channel_id, both.username) == (ALPHA_ID, "alpha")
+        assert len([r for r in by_pair if r[0] == run1.run_id]) == 1
+
+
+def test_receipts_do_not_change_run_segmentation(tmp_path):
+    db = seed_three_run_source(tmp_path)
+    with ReplaySource.open(db, tmp_path / "default") as src:
+        with_receipts = [(r.run_id, r.lo, r.hi) for r in src.runs()]
+    assert len(with_receipts) == 3
+    stripped = tmp_path / "stripped.sqlite"
+    shutil.copy(db, stripped)
+    with closing(sqlite3.connect(stripped)) as conn:
+        conn.execute("DELETE FROM raw_records WHERE kind='ChannelAccess'")
+        conn.commit()
+    with ReplaySource.open(stripped, tmp_path / "default") as src:
+        assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == with_receipts
+
+
+def test_refused_receipt_leaves_the_run_a_stray(tmp_path):
+    db = seed_three_run_source(tmp_path)
+    settings = load_settings("default", {"data_dir": tmp_path})
+    fixtures = _channel_fixtures(ALPHA_ID, "alpha", linked=None, media={})  # resolves to 5
+    with Store.open(db) as store:
+        # Channel 9: known only as a min stub with a handle, so Step A takes
+        # route 3 and the handle now belongs to channel 5 -> refused.
+        stub = {"_": "channel", "id": 9, "min": True, "access_hash": 1, "username": "gone"}
+        upsert_peer(
+            store, stub, store.add_raw("Channel", stub, "stranger", None),
+            "2026-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None,
+        )
+        results = asyncio.run(
+            collect_channel(
+                FakeGateway(fixtures), store, settings, parse_target("9"), ["channel"],
+                logging.getLogger("seed"), collectors=[ChannelCollector()],
+            )
+        )
+    assert results[0].stopped == "skip"
+    with ReplaySource.open(db, tmp_path / "default") as src:
+        run4 = src.runs()[-1]
+        rec = next(r for r in src.resolve_catalogue() if r.run_id == run4.run_id)
+        assert (rec.raw_target, rec.channel_id) == ("9", None)
+
+
+def test_reproject_serves_step_a_from_the_receipt_not_the_output_store(tmp_path):
+    db = seed_three_run_source(tmp_path)
+    out = tmp_path / "out.sqlite"
+    with Store.open(out) as pre:
+        # The output store would give a DIFFERENT answer for channel 5: a newer
+        # observation, so newest-wins keeps this wrong key through the replay.
+        wrong = {"_": "channel", "id": ALPHA_ID, "access_hash": 1, "title": "x"}
+        upsert_peer(
+            pre, wrong, pre.add_raw("Channel", wrong, "stranger", None),
+            "2099-01-01T00:00:00+00:00", seen_in_chat=None, seen_in_msg=None,
+        )
+    run_filtered(tmp_path, out)
+    assert _access_rows(out) == _access_rows(db)
+    for table, col in (("channels", "id"), ("channel_snapshots", "channel_id")):
+        sql = f"SELECT count(*) FROM {table} WHERE {col}=?"
+        assert _count(out, sql, ALPHA_ID) == _count(db, sql, ALPHA_ID)
+
+
+def test_target_filter_classifies_id_started_runs(tmp_path, caplog):
+    seed_three_run_source(tmp_path)
+    for spec in ("5", "-1005"):
+        caplog.clear()
+        decisions = run_filtered(
+            tmp_path, tmp_path / f"ex{spec}.sqlite", exclude=[spec], caplog=caplog
+        )
+        by_target = {t: d for (_, t), d in decisions.items()}
+        assert by_target["5"] == "excluded"
+        assert by_target["@alpha"] == "excluded"
+        assert by_target["@beta"] == "included"
+    caplog.clear()
+    decisions = run_filtered(tmp_path, tmp_path / "inc.sqlite", include=["5"], caplog=caplog)
+    assert {t: d for (_, t), d in decisions.items()} == {
+        "@alpha": "included", "@beta": "excluded", "5": "included",
+    }

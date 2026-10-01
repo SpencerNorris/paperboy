@@ -25,13 +25,20 @@ Detail: [`data-model.md`](data-model.md) (every table and column).
 
 ## 2. Collect: talking to Telegram
 
-`paperboy collect @channel` runs a series of **phases** (`channel`, `history`,
+`paperboy collect @channel` (or `paperboy collect 123`, by channel id) runs a series of **phases** (`channel`, `history`,
 `media`, `discussion`, `graph`, `web`, `participants`, `profiles`). Each phase
 is a **collector** that asks Telegram for something through one **gateway**,
 and every request passes through the **budget**. The budget spaces requests
 out (`--pacing-factor`), waits out Telegram's "slow down" replies (FLOOD_WAIT)
 up to a ceiling (`--max-flood-sleep`), and stops the run on anything that
 risks the account.
+
+A target is a handle or a channel id. Telegram needs an id *plus* a secret
+"access hash" that it only gives an account when it shows it the channel, so
+by id the first step finds one already on file, or a message that referenced
+the channel, or a known handle that still points at the same id, and writes
+down which it used (a `ChannelAccess` receipt). The account must already have
+been shown the channel; paperboy never guesses a hash.
 
 Detail: [`features/collect-channel.md`](features/collect-channel.md),
 [`features/pacing.md`](features/pacing.md), [`opsec.md`](opsec.md).
