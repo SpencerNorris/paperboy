@@ -65,6 +65,14 @@ scoped to that run's own `raw_records` rowid range, and each run's raw
 via `collect_channel(run_id=...)` — so a reprojected DB carries the same
 pass structure as its source and is itself faithfully re-reprojectable.
 
+A run's targets are identified by its `ResolvedPeer` **or `ChannelAccess`**
+records (#84): a run started by channel id has a receipt and no `ResolvedPeer`
+(unless it took the handle route), and replay serves Step A from the receipt,
+never from the output store's `peers`. `--include-target/--exclude-target`
+accept the marked `-100…` form as well as the bare id. A refused receipt
+(`granted: false`) leaves the run a stray, as a non-channel resolution does.
+Legacy runs have no receipt and replay as before.
+
 `HistoryCollector`'s live-collection incremental-vs-full-sweep bookkeeping
 (`sync_state` scopes `history`/`history_sweep`) needs *some* per-run reset
 before replaying, because a run's own raw window naturally running dry is a

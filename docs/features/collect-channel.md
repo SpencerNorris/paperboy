@@ -14,9 +14,14 @@ that paces every RPC and classifies every error per spec §8.
 
 ## Inputs
 
-- `TARGET`: `@name`, `t.me/name`, `t.me/name/123`, or a bare handle
-  (`targets.py`). v1 acts on channel-like targets only (invite hashes and
-  numeric peer ids parse but aren't resolvable yet — see Known limitations).
+- `TARGET` (`targets.py`), either a **handle** (`@name`, `name`, `t.me/name`,
+  `t.me/name/123`) or a channel **id** (#84): bare `123`, marked `-100123`,
+  or `t.me/c/123[/456]` (the message part is ignored). All id forms normalise
+  to the bare id. A leading `-` needs `--` on the command line
+  (`paperboy collect -- -100123`). A negative id without `-100` is a basic
+  group or user id and is rejected. Collecting by id requires that this
+  account has already been shown the channel (see Step A below); invite
+  hashes still parse but aren't resolvable.
 - `--profile`: selects the session/database compartment (`config.profile_dir`).
 - `--phases channel,history`: restricts which collectors run (default: both).
 - `--unsafe`: skips the `doctor` preflight gate.
@@ -38,9 +43,10 @@ that paces every RPC and classifies every error per spec §8.
 
 ## How it works
 
-`cli.py` → `recipes.collect_channel` runs `ChannelCollector` (resolve →
-`getFullChannel` → upsert channel + snapshot + `linked_group` edge → seed
-`pts` → upsert peers → identify `self`), then `HistoryCollector`: pages
+`cli.py` → `recipes.collect_channel` runs `ChannelCollector` (identify
+`self` → **Step A, get access** → `getFullChannel` → upsert channel +
+snapshot + `linked_group` edge → seed `pts` → upsert peers), then
+`HistoryCollector`: pages
 `getHistory` newest→oldest into `sync_ranges`, probes every id in the swept
 span that `getHistory` didn't return via `getMessages` (chunks of ≤200),
 tombstones any `messageEmpty` result (`evidence="empty"`), then immediately
@@ -48,6 +54,32 @@ runs `catch_up()` (`updates.getChannelDifference` from the stored `pts`) so
 the channel's sync state is current as of *now*. Every Telegram RPC goes
 through `Budget.call` (per-method pacing, persisted flood cooldowns, a
 per-run cap) — no collector or gateway method calls Telethon directly.
+
+### Step A: getting access to the channel (#84)
+
+Every channel request needs the id plus a per-account `access_hash` that
+Telegram only hands to an account when it shows it the channel. Step A
+obtains one, never guessing, by the first route that works (spec
+`docs/superpowers/specs/2026-09-30-collect-by-id-design.md` §2):
+
+1. **saved key**: a full (non-`min`) `access_hash` in `peers`.
+2. **from message**: a `min` peer with `(seen_in_chat, seen_in_msg)`
+   provenance into a chat whose own key is full, used as
+   `inputChannelFromMessage`. A `min` hash is never used as a key.
+3. **handle**: the stored username, resolved with `contacts.resolveUsername`
+   and accepted only if it resolves to the requested id (else
+   `the stored handle for channel N now belongs to channel M`, and the phase
+   is skipped). A handle target is this route without the verification.
+4. Nothing worked: the phase is skipped with an error naming what would
+   make each route work.
+
+Step A always appends a `ChannelAccess` raw record (`via`, `input_channel`,
+`granted`, ...; see `docs/data-model.md`) before `getFullChannel`, so replay
+serves Step A from the receipt instead of recomputing it from the output
+store. `getFullChannel`'s identity check is the verification for every route;
+afterwards the run uses the full key it returns, so a from-message start is a
+saved key next time. `status` and `export` also accept the id forms,
+offline, via `channels.id`.
 
 ## Edge cases handled
 
@@ -73,9 +105,13 @@ per-run cap) — no collector or gateway method calls Telethon directly.
 
 ## Known limitations (v1 core scope)
 
-- `resolve()` only implements `contacts.resolveUsername` — invite-hash and
-  bare numeric-id targets parse (`Target.is_channel_like`) but aren't
-  resolvable yet; only `@name`/`t.me/name` targets work end to end.
+- Invite-hash targets parse (`Target.is_channel_like`) but aren't
+  resolvable yet. An id target is only reachable when this account has
+  already been shown the channel (a saved key, a referencing message, or a
+  known handle; Step A route 4 otherwise).
+- When Step A finds no route (route 4) no `ChannelAccess` receipt is written,
+  so that run has no target for `reproject`, which logs its existing "no
+  resolve records" warning and drops it.
 - A backfill resumed after an interruption only marks the *resumed* span
   `[1, cursor_at_interruption]` as a verified `sync_range` — the portion
   collected *before* the interruption isn't retroactively gap-probed by that

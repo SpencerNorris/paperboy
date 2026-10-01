@@ -1,5 +1,6 @@
-"""The `channel` collector: resolve a target, fetch full channel metadata,
-project it, and prime `ctx` for `history` (and later Phase 2 collectors).
+"""The `channel` collector: get access to a target channel (by id or handle),
+fetch full channel metadata, project it, and prime `ctx` for `history` (and
+later Phase 2 collectors).
 """
 
 from __future__ import annotations
