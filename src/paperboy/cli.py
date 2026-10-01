@@ -33,7 +33,7 @@ from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
 from paperboy.reproject import reproject as reproject_run
-from paperboy.targets import parse_target
+from paperboy.targets import Target, TargetKind, parse_target
 
 app = typer.Typer(
     add_completion=False,
@@ -70,10 +70,17 @@ def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
         raise typer.Exit(code=1) from None
 
 
-def _find_channel_id(store, username: str) -> int | None:
-    row = store.conn.execute(
-        "SELECT id FROM channels WHERE username = ?", (username.lstrip("@"),)
-    ).fetchone()
+def _find_channel_id(store, target: Target) -> int | None:
+    """The locally stored channel a `status`/`export` target names, offline:
+    by id for the id forms (#84), else by username."""
+    if target.kind is TargetKind.PEER_ID:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE id = ?", (int(target.value),)
+        ).fetchone()
+    else:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE username = ?", (target.value.lstrip("@"),)
+        ).fetchone()
     return row["id"] if row else None
 
 
@@ -363,7 +370,7 @@ def status(
         channel_id = None
         if target:
             parsed = parse_target(target)
-            channel_id = _find_channel_id(store, parsed.value)
+            channel_id = _find_channel_id(store, parsed)
             if channel_id is None:
                 console.print(f"[yellow]No local data for {target!r} yet — run `collect` first.[/]")
                 raise typer.Exit(code=1)
@@ -413,7 +420,7 @@ def export_cmd(
     settings = _settings_with_overrides(profile)
     parsed = parse_target(target)
     with composition.build_store(settings, profile) as store:
-        channel_id = _find_channel_id(store, parsed.value)
+        channel_id = _find_channel_id(store, parsed)
         if channel_id is None:
             console.print(f"[red]No local data for {target!r}. Run `collect` first.[/]")
             raise typer.Exit(code=1)
