@@ -115,7 +115,7 @@ async def test_channel_access_receipt_serves_the_run_receipt_and_stamps_clock(tm
     clock = ReplayClock()
     gw = RawReplayGateway(src, clock, src.runs()[0])
     served = await gw.channel_access_receipt("100")
-    assert served == receipt
+    assert served is not None and served == receipt
     assert clock.for_payload(served) == "2026-01-01T00:00:01+00:00"
     assert await gw.channel_access_receipt("101") is None
 
