@@ -583,8 +583,9 @@ def test_marked_channel_id_is_accepted_as_a_target(tmp_path):
     db = seed_two_target_source(tmp_path)
     with ReplaySource.open(db, tmp_path / "default") as src:
         flt = resolve_target_filter(src, [], ["-1006"])
-        assert flt is not None
-        assert flt.ids == resolve_target_filter(src, [], ["6"]).ids
+        bare = resolve_target_filter(src, [], ["6"])
+        assert flt is not None and bare is not None
+        assert flt.ids == bare.ids
 
 
 def test_non_channel_targets_are_rejected(tmp_path):
