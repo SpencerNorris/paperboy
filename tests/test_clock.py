@@ -99,3 +99,24 @@ def test_replay_clock_now_is_the_last_served_stamp():
         clock.now()
     clock.serve("2026-01-01T00:00:07+00:00", {"_": "a"})
     assert clock.now() == "2026-01-01T00:00:07+00:00"
+
+
+def test_pinned_stamp_survives_begin_batch():
+    # Paperboy-authored records (a MediaSelection written between gateway
+    # calls) are not gateway responses: the next served response re-batches the
+    # clock, which must not lose their stored stamp.
+    clock = ReplayClock()
+    sel = {"channel_id": 5, "msg_ids": [1]}
+    clock.pin_json("2026-01-01T00:00:07+00:00", dumps(sel))
+    clock.serve("2026-01-01T00:00:08+00:00", {"_": "other"})
+    clock.begin_batch()
+    assert clock.for_payload(sel) == "2026-01-01T00:00:07+00:00"
+    # Pinning does not move "now": it is not a served response.
+    assert clock.now() == "2026-01-01T00:00:08+00:00"
+
+
+def test_pinned_stamp_wins_over_a_served_equal_payload():
+    clock = ReplayClock()
+    clock.pin_json("2026-01-01T00:00:09+00:00", dumps({"a": 1}))
+    clock.serve("2026-01-01T00:00:10+00:00", {"a": 1})
+    assert clock.for_payload({"a": 1}) == "2026-01-01T00:00:09+00:00"

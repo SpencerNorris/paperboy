@@ -56,6 +56,18 @@ class ReplayRun:
 
 
 @dataclass(frozen=True)
+class RunMarker:
+    """One recipe-written bookkeeping record of a run (`ChannelContextReused`,
+    `MediaSelection`, #68): its stored stamp and JSON (so the replay clock can
+    hand the same stamp back) plus the parsed payload and tier."""
+
+    observed_at: str
+    payload_json: str
+    payload: dict
+    tier: str
+
+
+@dataclass(frozen=True)
 class ResolveRecord:
     """One `(run, raw target)` pair as `ResolvedPeer` and/or `ChannelAccess`
     recorded it (#70, #84).
@@ -650,8 +662,97 @@ class ReplaySource:
                 linked.add(group)
         return linked
 
+    def has_history_evidence(self, run: ReplayRun) -> bool:
+        """Whether `run` left any trace of a `history` phase: a message, or the
+        `getChannelDifference` page `catch_up` always records. A run without
+        one (`--phases channel`, a fetch-media segment) must not replay
+        `history`, which would append a synthetic difference raw the source
+        never had."""
+        index = self.index(run)
+        return bool(index.entries(_MESSAGE_KINDS)) or bool(
+            index.entries(("channeldifference",), "contains")
+        )
+
     def has_kind(self, run: ReplayRun, *kinds: str) -> bool:
         return bool(self.index(run).entries(kinds))
+
+    def _markers(self, run: ReplayRun, kind: str) -> list[RunMarker]:
+        entries = self.index(run).entries((kind,), "exact")
+        rows = self.payloads(e.id for e in entries)
+        markers: list[RunMarker] = []
+        for e in entries:
+            row = rows[e.id]
+            try:
+                payload = json.loads(row["payload_json"])
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                raise ReprojectSourceError(
+                    f"raw record id={e.id} in run {run.run_id} ({kind}) is not a JSON object"
+                )
+            markers.append(RunMarker(row["observed_at"], row["payload_json"], payload, e.tier))
+        return markers
+
+    def context_markers(self, run: ReplayRun) -> list[RunMarker]:
+        """The run's `ChannelContextReused` markers (a fetch-media segment that
+        reused an already-resolved channel; payload `{channel_id, source_run_id}`)."""
+        return self._markers(run, "channelcontextreused")
+
+    def media_selection(self, run: ReplayRun) -> RunMarker | None:
+        """The run's `MediaSelection` record, if its media phase was scoped to
+        specific messages. Payload `{channel_id, msg_ids}`; runs recorded before
+        #68's by-id amendment carry the legacy `{msg_ids}` only."""
+        found = self._markers(run, "mediaselection")
+        return found[-1] if found else None
+
+    def _chatfull_entries(self, run: ReplayRun, channel_id: int | None) -> list[RawEntry]:
+        """The run's `ChatFull` records for `channel_id` (any when `None`)."""
+        entries = self.index(run).entries(("chatfull",))
+        if channel_id is None:
+            return entries
+        return [e for e in entries if e.ctx.get("channel_id") == channel_id]
+
+    def channel_established(self, run: ReplayRun, channel_id: int | None) -> bool:
+        """Whether the live run's `channel` phase got access to `channel_id`
+        (any channel when `None`, the legacy selection shape): it recorded that
+        channel's `ChatFull`. A granted `ChannelAccess` always precedes it, and
+        a refused or route-less attempt leaves none, so this is "access
+        granted" for stamped and pre-#84 runs alike (#68 spec 9.3)."""
+        return bool(self._chatfull_entries(run, channel_id))
+
+    def established_channel_ids(self, run: ReplayRun) -> list[int]:
+        """Channel ids the run recorded a `ChatFull` for, in order."""
+        seen: dict[int, None] = {}
+        for e in self._chatfull_entries(run, None):
+            cid = e.ctx.get("channel_id")
+            if isinstance(cid, int):
+                seen.setdefault(cid)
+        return list(seen)
+
+    def resolved_access_hash(self, run_id: str, channel_id: int) -> int:
+        """The `access_hash` the `ChatFull` of run `run_id` recorded for
+        `channel_id` (it carries the channel object, whichever route got the
+        run in). Raises `ReprojectSourceError` if that run is not in the log or
+        never established the channel - a marker pointing nowhere is a corrupt
+        source, never guessed around. A channel object that carries no int
+        `access_hash` yields 0, a deliberate placeholder: `RawReplayGateway`
+        keys its lookups on `channel_id` alone and never reads the hash."""
+        run = next((r for r in self.runs() if r.run_id == run_id), None)
+        if run is None:
+            raise ReprojectSourceError(
+                f"a ChannelContextReused marker names source run {run_id!r}, "
+                "which is not in the raw log"
+            )
+        entries = self._chatfull_entries(run, channel_id)
+        for row in self.payloads(e.id for e in entries).values():
+            for chat in json.loads(row["payload_json"]).get("chats") or []:
+                if isinstance(chat, dict) and chat.get("id") == channel_id:
+                    access_hash = chat.get("access_hash")
+                    return access_hash if isinstance(access_hash, int) else 0
+        raise ReprojectSourceError(
+            f"source run {run_id!r} never established channel {channel_id}, but a "
+            "ChannelContextReused marker says its context was reused"
+        )
 
     def has_context_channel(self, run: ReplayRun, channel_ids: set[int]) -> bool:
         groups = self.index(run).ctx_groups("channel_id")

@@ -131,6 +131,20 @@ Option A, with structural-marker inference for legacy rows.
   ran but downloaded nothing new leaves no raw trace, so its
   duplicate-custody rows are not reproduced — phase detection is
   conservative by design (spec D4.5).
+- `fetch-media` (#68) adds two recipe-written raw kinds so runs that carry no
+  `channel` phase, or whose media phase is scoped, still replay exactly.
+  `ChannelContextReused` (`{channel_id, source_run_id}`, no access hash) marks a
+  media-only segment run that reused a channel established earlier in the same
+  process; replay reads the access hash from the source run's `ChatFull` and
+  runs only `media`. `MediaSelection` (`{channel_id, msg_ids}`) records the
+  channel and the ids a scoped media phase walked (written just before the
+  phase, so its presence plus the channel's `ChatFull` says the phase ran),
+  so replay walks the same rows
+  instead of re-deriving dedup custody rows for messages that run never
+  considered. Phase detection also no longer infers `history` for a run with
+  no history evidence (no message and no `getChannelDifference` raw), which
+  replayed a synthetic difference raw the source never had. Together these
+  close the #36 residual for media-only segment runs.
 - #35's double-replay of one channel under two target spellings disappears:
   each spelling replays only within its own run(s).
 

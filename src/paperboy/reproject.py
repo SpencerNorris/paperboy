@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from paperboy.clock import ReplayClock
-from paperboy.collectors.base import CollectResult
+from paperboy.collectors.base import ChannelContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
@@ -27,7 +27,9 @@ from paperboy.replay import (
     RawReplayWebClient,
     ReplayRun,
     ReplaySource,
+    ReprojectSourceError,
     ResolveRecord,
+    RunMarker,
 )
 from paperboy.store.db import Store, dumps
 from paperboy.targets import Target, TargetKind, UnsupportedTarget, parse_target
@@ -222,6 +224,23 @@ def _reset_incremental_backfill_state(out_store: Store) -> None:
         )
 
 
+def _pin_selection(
+    clock: ReplayClock, selection: RunMarker | None, channel_id: int | None
+) -> None:
+    """Give the replayed `MediaSelection` its recorded stamp. A legacy selection
+    (`{msg_ids}`, recorded before it named its channel) is replayed in the
+    current shape, so its stamp is also pinned under that shape's payload."""
+    if selection is None:
+        return
+    clock.pin_json(selection.observed_at, selection.payload_json)
+    if "channel_id" not in selection.payload and channel_id is not None:
+        current = {
+            "channel_id": channel_id,
+            "msg_ids": sorted(set(selection.payload.get("msg_ids") or [])),
+        }
+        clock.pin_json(selection.observed_at, dumps(current))
+
+
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     """The phase set ONE historical run executed, inferred from the raw kinds
     it left behind (spec §3: a run that never did graph reprojects without
@@ -230,7 +249,13 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     (spec §8) and conservative: a phase whose every RPC was skipped leaves no
     raw and is treated as never-run for that run; --phases overrides.
     """
-    phases = ["channel", "history"]
+    if source.context_markers(run):
+        # A fetch-media segment that reused a resolved channel (#68): no
+        # channel or history phase ran, only media.
+        return ["media"]
+    phases = ["channel"]
+    if source.has_history_evidence(run):
+        phases.append("history")
     linked = source.linked_group_ids(run)
     if linked and source.has_context_channel(run, linked):
         phases.append("discussion")
@@ -249,7 +274,11 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
         phases.append("graph")
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
-    if source.has_kind(run, "mediadownload"):
+    selection = source.media_selection(run)
+    if source.has_kind(run, "mediadownload") or (
+        selection is not None
+        and source.channel_established(run, selection.payload.get("channel_id"))
+    ):
         phases.append("media")
     return phases
 
@@ -297,8 +326,10 @@ async def reproject(
 
     decisions: dict[str, dict[str, bool]] = {}
     records_by_run: dict[str, list[ResolveRecord]] = {}
+    catalogue: list[ResolveRecord] | None = None
     if target_filter is not None:
-        for rec in source.resolve_catalogue():
+        catalogue = source.resolve_catalogue()
+        for rec in catalogue:
             records_by_run.setdefault(rec.run_id, []).append(rec)
         decisions = {rid: target_filter.decide_run(recs) for rid, recs in records_by_run.items()}
     pairs_replayed = pairs_skipped = runs_touched = 0
@@ -350,11 +381,77 @@ async def reproject(
             "profile_budget": 10**9, "participant_oracle_budget": 10**9,
             "participant_reactions_budget": 10**9,
         })
+        selection = source.media_selection(run)
+        if selection is not None:
+            # The live media phase walked only these messages (#55/#68); walk
+            # the same ones so dedup custody rows are not re-derived for
+            # messages that run never considered.
+            replay_settings = replay_settings.model_copy(
+                update={"media_msgs": list(selection.payload.get("msg_ids") or [])}
+            )
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:
             if p not in phases_seen:
                 phases_seen.append(p)
         run_targets = source.resolve_targets(run)
+        markers = source.context_markers(run)
+        if not run_targets and markers:
+            # A media-only fetch-media segment (#68): its channel was resolved
+            # by an earlier run, so it has no resolve records of its own.
+            if len(markers) > 1:
+                raise ReprojectSourceError(
+                    f"run {run.run_id} holds {len(markers)} ChannelContextReused markers; "
+                    "a fetch-media segment writes exactly one"
+                )
+            marker = markers[0]
+            channel_id = marker.payload.get("channel_id")
+            source_run_id = marker.payload.get("source_run_id")
+            if not isinstance(channel_id, int) or not isinstance(source_run_id, str):
+                raise ReprojectSourceError(
+                    f"run {run.run_id}: malformed ChannelContextReused marker"
+                )
+            if target_filter is not None:
+                keep = target_filter.replays(channel_id)
+                pairs_replayed += keep
+                pairs_skipped += not keep
+                log.info(
+                    "reproject: run=%s marker channel_id=%s decision=%s",
+                    run.run_id, channel_id, "included" if keep else "excluded",
+                )
+                if not keep:
+                    continue
+                runs_touched += 1
+            replayed_any = True
+            access_hash = source.resolved_access_hash(source_run_id, channel_id)
+            if catalogue is None:
+                catalogue = source.resolve_catalogue()
+            catalogued = next(
+                (
+                    rec for rec in catalogue
+                    if rec.run_id == source_run_id and rec.channel_id == channel_id
+                ),
+                None,
+            )
+            if catalogued is None:
+                raise ReprojectSourceError(
+                    f"run {run.run_id}: source run {source_run_id!r} has no resolve of "
+                    f"channel {channel_id}"
+                )
+            clock = ReplayClock()
+            clock.pin_json(marker.observed_at, marker.payload_json)
+            _pin_selection(clock, selection, channel_id)
+            context = ChannelContext(
+                {"channel_id": channel_id, "access_hash": access_hash}, channel_id,
+                marker.tier, source_run_id,
+            )
+            results.setdefault(catalogued.raw_target, []).extend(
+                await _replay_one(
+                    source, out_store, replay_settings, media_profile, run, list(run_phases),
+                    catalogued.raw_target, clock, log,
+                    out_profile=out_profile, channel_context=context,
+                )
+            )
+            continue
         if not run_targets:
             # A run with no ResolvedPeer at all — no target to replay a
             # collect against, so every raw row in its window is silently
@@ -373,41 +470,14 @@ async def reproject(
                 continue  # logged above; belongs to the other output
             replayed_any = True
             clock = ReplayClock()
-            gateway = RawReplayGateway(source, clock, run)
-            web_client = RawReplayWebClient(source, clock, run)
-            collectors = [
-                ChannelCollector(), HistoryCollector(), DiscussionCollector(),
-                ParticipantsCollector(), ProfilesCollector(),
-                GraphCollector(),
-                WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
-                MediaCollector(copy_on_replay=out_profile is not None),
-            ]
-            try:
-                run_results = await collect_channel(
-                    gateway, out_store, replay_settings, parse_target(raw_target),
-                    list(run_phases), log,
-                    collectors=collectors, profile=media_profile, clock=clock,
-                    run_id=run.run_id,
+            established = source.established_channel_ids(run)
+            _pin_selection(clock, selection, established[0] if established else None)
+            results.setdefault(raw_target, []).extend(
+                await _replay_one(
+                    source, out_store, replay_settings, media_profile, run, list(run_phases),
+                    raw_target, clock, log, out_profile=out_profile,
                 )
-            except Exception as exc:
-                # collect_channel was designed for exactly one target per run
-                # and has no notion of "this target, among several, turned
-                # out bad" — e.g. a historically-resolved target that later
-                # resolves to a non-channel peer crashes channel.collect
-                # even on a live run (found exercising this against a real
-                # archive — DoD smoke, docs/features/reproject.md). A
-                # multi-target, multi-run reproject must not let one such
-                # target/run discard every other target's or run's
-                # projections already committed to out_store. The failure is
-                # recorded, not swallowed.
-                log.error(
-                    "reproject: target %r (run %s) failed: %s",
-                    raw_target, run.run_id, exc,
-                )
-                run_results = [
-                    CollectResult(name="target", counts={}, stopped=f"error: {exc}")
-                ]
-            results.setdefault(raw_target, []).extend(run_results)
+            )
     if target_filter is not None:
         log.info(
             "reproject: targets replayed=%d skipped=%d runs_touched=%d filter=%s ids=%s",
@@ -432,6 +502,59 @@ async def reproject(
         for t in REPROJECT_TABLES
     }
     return ReprojectSummary(phases_seen, results, counts)
+
+
+async def _replay_one(
+    source: ReplaySource,
+    out_store: Store,
+    replay_settings: Settings,
+    media_profile: str,
+    run: ReplayRun,
+    run_phases: list[str],
+    raw_target: str,
+    clock: ReplayClock,
+    log: logging.Logger,
+    *,
+    out_profile: str | None,
+    channel_context: ChannelContext | None = None,
+) -> list[CollectResult]:
+    """Replay ONE `(run, raw target)` pair through the normal collectors.
+
+    `channel_context` is set for a media-only fetch-media segment (#68): the
+    recipe then skips `channel` and rewrites the run's marker.
+    """
+    gateway = RawReplayGateway(source, clock, run)
+    web_client = RawReplayWebClient(source, clock, run)
+    collectors = [
+        ChannelCollector(), HistoryCollector(), DiscussionCollector(),
+        ParticipantsCollector(), ProfilesCollector(),
+        GraphCollector(),
+        WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
+        MediaCollector(copy_on_replay=out_profile is not None),
+    ]
+    try:
+        return await collect_channel(
+            gateway, out_store, replay_settings, parse_target(raw_target),
+            list(run_phases), log,
+            collectors=collectors, profile=media_profile, clock=clock,
+            run_id=run.run_id, channel_context=channel_context,
+        )
+    except Exception as exc:
+        # collect_channel was designed for exactly one target per run
+        # and has no notion of "this target, among several, turned
+        # out bad" — e.g. a historically-resolved target that later
+        # resolves to a non-channel peer crashes channel.collect
+        # even on a live run (found exercising this against a real
+        # archive — DoD smoke, docs/features/reproject.md). A
+        # multi-target, multi-run reproject must not let one such
+        # target/run discard every other target's or run's
+        # projections already committed to out_store. The failure is
+        # recorded, not swallowed.
+        log.error(
+            "reproject: target %r (run %s) failed: %s",
+            raw_target, run.run_id, exc,
+        )
+        return [CollectResult(name="target", counts={}, stopped=f"error: {exc}")]
 
 
 def _table_count(conn: sqlite3.Connection, table: str) -> int:
