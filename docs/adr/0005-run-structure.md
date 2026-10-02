@@ -71,7 +71,8 @@ Option A, with structural-marker inference for legacy rows.
    by the `tier='self'` marker rule; segments are labeled `legacy-0001…` in
    capture order. The source DB is never mutated.
 5. `reproject` replays **once per run**: per-run targets (that run's
-   `ResolvedPeer` records), per-run phase detection, per-run-scoped gateway
+   `ResolvedPeer` **or `ChannelAccess`** records; `ChannelAccess` appears only
+   in stamped runs, so legacy segmentation is untouched, #84), per-run phase detection, per-run-scoped gateway
    queries (`id BETWEEN run.lo AND run.hi`). The target store carries
    `sync_state` across replayed runs exactly as the live store did across
    real runs. All `_backfill_older_*` shadow-projection code is deleted.

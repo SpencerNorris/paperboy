@@ -38,12 +38,13 @@ untouched. #75 replay lookup performance is on
 `docs/features/reproject.md`). #70 profile split is on `feat/profile-split`
 (PR pending; `reproject --include-target/--exclude-target/--out-profile`,
 `scripts/unreferenced_media.py`, replay now verifies each media sha; no
-migration — `docs/features/reproject.md` "Splitting a mixed profile"). #68
-`fetch-media LIST` is on `feat/fetch-media-list` (PR pending;
-`docs/features/fetch-media.md`): ordered cross-channel media pull, offline
-classification, resolve-once-per-channel with a `ChannelContextReused` replay
-marker, `MediaSelection` raw so reproject walks the same rows; no migration.
-Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+migration — `docs/features/reproject.md` "Splitting a mixed profile"). #84 collect
+by id is merged (PR #86; `docs/features/collect-channel.md`). #68
+`fetch-media LIST` is on `feat/fetch-media-by-id` (PR pending →
+`dev/media-storage`; `docs/features/fetch-media.md`): ordered cross-channel media
+pull, each channel reached by id through the standard `channel` phase,
+`--exclude-target`, `MediaSelection` names the channel so reproject walks the same
+rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
 
@@ -117,7 +118,10 @@ PATH | --out-profile NAME] [--include-target T | --exclude-target T] [--phases a
 needs none of that — it never touches the network or the keychain, only a
 source `paperboy.sqlite`'s `raw_records` (the target flags split a mixed
 profile, #70; `scripts/unreferenced_media.py --profile P` lists orphaned media). `watch`/
-`lookup` exit 1 with a "Phase 2" message — not implemented yet.
+`lookup` exit 1 with a "Phase 2" message — not implemented yet. `TARGET` for
+`collect`/`status`/`export` is a handle or a channel id (`123`, `-100123` after
+`--`, `t.me/c/123`; #84) — by id the account must already have been shown the
+channel.
 
 ## Workflow
 

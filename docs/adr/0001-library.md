@@ -34,3 +34,25 @@ testable against a `FakeGateway`.
   defaults, so behaviour is identical across a library swap.
 - The wheel's layer (227) can lag the docs (228); we validate against the
   installed schema, not the docs' headline layer.
+
+## Amendment 2026-09-30 (#84): the seam gains an access step
+Collecting a channel by id (not only by handle) means the account must first
+*obtain access* to it. Telegram gives no request that takes a bare id: every
+channel request needs the id plus a per-account `access_hash`. So:
+
+- `Gateway.channel_access_receipt(target_raw) -> dict | None` is a replay-only
+  hook. Live gateways return `None` (Step A is computed from the store by the
+  `channel` collector and recorded as a `ChannelAccess` raw record);
+  `RawReplayGateway` serves the run's recorded receipts in order (one per
+  route attempted), so replay never re-derives access from the output store's
+  `peers`. A replay gateway sets `replay = True`; a replayed run whose first
+  call returns `None` is a pre-#84 run and takes the legacy handle path with no
+  receipt written.
+- Every channel-taking gateway method accepts the `from_msg` form of an
+  `input_channel` dict (`{"channel_id", "from_msg": {"channel_id",
+  "access_hash", "msg_id"}}`), built by `_input_channel` /
+  `_input_peer_channel` as `InputChannelFromMessage` /
+  `InputPeerChannelFromMessage`, mirroring `_input_user`.
+- An `access_hash` is only ever obtained by three routes: a saved full key, a
+  from-message reference through a chat whose own key is known, or a verified
+  handle lookup. A `min` hash is never used as a key; hashes are never guessed.

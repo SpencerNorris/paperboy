@@ -163,3 +163,99 @@ gives its path; never copy it into the repo).
 
 GCS (#63), resolving linked-group rows through the parent, parallel
 downloads, writing back to the analyst's catalogue.
+
+## 9. Amendment (2026-10-01): fetch by id, after the first run escalated
+
+**Why.** The first implementation (branch `feat/fetch-media-list`, ac20097)
+escalated at K=3 review (see #68's root-cause comment). It reached each channel
+by resolving its stored `@username`, then guarded with a wrapper collector
+(`_ExpectChannel`) that skipped the segment if the handle now pointed at a
+different channel. The guard's input, "this segment wants channel N", lived only
+in memory, never in `raw_records`, and the wrapper existed only on the live
+path. So `reproject` could not reproduce the guard's decision, and each review
+round found another parity symptom. #84 (merged) makes channels addressable by
+id, which removes the reason for the guard altogether.
+
+This section supersedes §3.3's handle resolution and §4 where they conflict.
+
+### 9.1 Each segment targets the channel id
+
+- A segment runs `collect_channel` with the **id target** `<channel_id>` taken
+  from the list row (`tg:msg:<channel_id>/<msg_id>`), through #84's Step A
+  (saved key → from-message → verified stored handle). There is no
+  `@username` resolution in fetch-media and no wrapper collector:
+  **`_ExpectChannel` is deleted.** Live and replay run the identical, standard
+  collector list (`channel` + `media`), so they cannot drift.
+- Channel identity is guaranteed by #84: Step A addresses channel N by id, and
+  the channel phase's existing check (`full_chat.id == requested id`) refuses
+  anything else. A handle that has changed hands can no longer redirect a
+  segment.
+- Later segments of the same channel may reuse the channel context, as §3
+  decided, as long as the reuse is itself recorded in raw so replay reuses it
+  identically.
+
+### 9.2 The selection receipt names the channel
+
+`MediaSelection` becomes `{"channel_id": N, "msg_ids": [...]}`. `collect
+--media-msgs` (no list) writes the channel it resolved. Replay serves the
+selection from this receipt only, never from the operator's list, which is not
+in the database. Older `{"msg_ids"}`-only receipts replay as today (legacy).
+
+### 9.3 Replay what was executed, not what was intended
+
+`detect_phases` must not treat a `MediaSelection` alone as evidence that
+`media` ran: the receipt is written before any phase runs. The `media` phase is
+replayed for a run if and only if the live run executed it, i.e. the run's
+channel phase was granted access (a granted `ChannelAccess`, or for legacy runs
+a `ResolvedPeer` + `ChatFull`) for the selection's channel, or the run has
+`MediaDownload` rows. Write the rule down and test both directions:
+- access granted, zero files downloaded: media still replays (with zero rows);
+- access refused: media does not replay, and no custody rows appear.
+
+### 9.4 Classification (replaces §4)
+
+- `unresolvable` is removed. A channel no longer needs a stored username to be
+  fetched.
+- `not_in_store` still applies (no `messages` row). After the profile split
+  (#70), rows from the split-out investigation have no messages in the clean
+  `default`, so they classify `not_in_store` and are never fetched.
+- New `--exclude-target T` (repeatable, same parsing as `reproject`'s, by
+  resolved channel id; a linked discussion group follows its parent) marks
+  matching rows `excluded`, offline. It's a guard for running against a store
+  that still holds an investigation the operator doesn't want pulled.
+- `--dry-run` prints per-channel counts (by `<id>`) of each outcome, so the
+  operator sees exactly which channels a pull would touch before any network
+  call.
+- A Step A refusal at run time (no route works) marks that segment's rows
+  `no_access` with the reason from #84's route-4 message, and the command
+  continues with the next segment. It's a `SkipAndRecord`, not a stop.
+
+### 9.5 Tests (in addition to §6)
+
+- A segment of a channel whose stored handle now resolves elsewhere still
+  fetches the right channel by id (no handle lookup at all when a saved key
+  exists).
+- The live run and its reproject produce identical `media`/`custody_log` for:
+  a normal segment; a refused segment; a selection whose access was granted but
+  which downloaded zero files.
+- `MediaSelection` carries `channel_id`; a legacy `{"msg_ids"}` receipt replays
+  unchanged.
+- `--exclude-target` marks rows `excluded` offline; dry-run per-channel counts.
+- There is no `_ExpectChannel` (or any fetch-media-only collector) in the live
+  or replay collector lists.
+
+### 9.6 Definition of done (amends §7)
+
+The §7 live smoke is re-run at the final commit, since the earlier one ran on
+the superseded design. Same protocol: ≤ 5 invocations, ≤ 3 small files from ≥ 2
+channels already in the store, never the split-out investigation. Then
+reproject the scratch store and show source vs output `media` and
+`custody_log` equal for the fetched segments.
+
+### 9.7 Implementation note
+
+Resume on `feat/fetch-media-list` (merge `dev/media-storage` into it first; it
+predates #75, #70 and #84) rather than starting over. Remove the code this
+amendment supersedes (`_ExpectChannel`, handle resolution in segments, the
+`unresolvable` class, the intent-based phase detection) instead of leaving it
+dormant.

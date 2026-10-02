@@ -65,6 +65,29 @@ scoped to that run's own `raw_records` rowid range, and each run's raw
 via `collect_channel(run_id=...)` — so a reprojected DB carries the same
 pass structure as its source and is itself faithfully re-reprojectable.
 
+A run's targets are identified by its `ResolvedPeer` **or `ChannelAccess`**
+records (#84): a run started by channel id has a receipt and no `ResolvedPeer`
+(unless it took the handle route), and replay serves Step A from the receipt,
+never from the output store's `peers`. `--include-target/--exclude-target`
+accept the marked `-100…` form as well as the bare id. A refused receipt
+(`granted: false` with `resolved_channel_id`: the stored handle now belongs to
+another channel) leaves the run a stray, as a non-channel resolution does.
+
+A run holds one receipt per Step A route attempted. When Telegram rejected a
+route (a `granted: false` receipt carrying an `error` name) and the collect fell
+through to the next one, `RawReplayGateway.channel_access_receipt` serves the
+refused attempts and then the final one, in recorded order, and the replayed
+run reproduces the same receipts and tables. A refused-by-error receipt still
+names the requested channel, so the `--include/--exclude-target` filter files
+the run under it.
+
+**Legacy runs** (recorded before #84) have no `ChannelAccess` at all. A replay
+with no receipt is told apart from a live run by the gateway's explicit
+`replay` flag, not by inspecting the store; such a run takes the handle path it
+took then (`resolve` the target, address the channel by the resolve-side key)
+and writes **no** `ChannelAccess` row into the output. Receipts appear in a
+reprojected store only for runs that recorded them.
+
 `HistoryCollector`'s live-collection incremental-vs-full-sweep bookkeeping
 (`sync_state` scopes `history`/`history_sweep`) needs *some* per-run reset
 before replaying, because a run's own raw window naturally running dry is a

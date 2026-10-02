@@ -16,9 +16,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from telethon import TelegramClient
     from telethon.tl.types import (
-        InputChannel,
-        InputPeerChannel,
         TypeChannelParticipantsFilter,
+        TypeInputChannel,
         TypeInputPeer,
         TypeInputUser,
     )
@@ -32,8 +31,18 @@ class Gateway(Protocol):
         """`contacts.resolveUsername` — returns `{"chats": [...], "users": [...]}`."""
         ...
 
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        """Replay-only: live gateways return None; Step A is computed from the
+        store and recorded. `RawReplayGateway` serves the run's recorded
+        `ChannelAccess` receipt for `target_raw` (#84, ADR-0001 amendment)."""
+        ...
+
     async def get_full_channel(self, input_channel: dict) -> dict:
-        """`channels.getFullChannel` — `{"full_chat": {...}, "chats": [...], "users": [...]}`."""
+        """`channels.getFullChannel` — `{"full_chat": {...}, "chats": [...], "users": [...]}`.
+
+        `input_channel` is either `{"channel_id", "access_hash"}` or the
+        from-message form `{"channel_id", "from_msg": {"channel_id",
+        "access_hash", "msg_id"}}` (every channel-taking method accepts both)."""
         ...
 
     def iter_history(
@@ -182,9 +191,6 @@ class FakeGateway:
     to simulate `Budget.call`'s classification without going through it —
     `FakeGateway` never touches `Budget`.
 
-    `resolve_by_target` (a `{username: dict | BaseException}` lookup, like
-    `full_channel_by_id`; missing key falls back to `resolve`).
-
     Person-layer fixture keys (spec §4–§8): `full_channel_by_id` (a
     `{channel_id: dict | BaseException}` lookup — lets a test answer the
     LINKED GROUP's `ChatFull` differently from the target's; missing key
@@ -232,25 +238,51 @@ class FakeGateway:
         self.user_photos_calls: list[int] = []
         self.avatar_calls: list[int] = []
         self.reactions_calls: list[tuple[int, int, str | None]] = []
+        # Every `input_channel` `get_full_channel` was called with, so a test
+        # can tell the saved-key form from the from-message form (#84).
+        self.full_channel_inputs: list[dict] = []
+        self._receipts_served = 0
 
     async def resolve(self, target_value: str) -> dict:
         self.calls.append("resolve")
-        # `resolve_by_target` ({username: dict | BaseException}) answers
-        # several channels in one test (#68); missing key -> `resolve`.
-        by_target: dict[str, object] = self._fx.get("resolve_by_target", {})
-        if target_value in by_target:
-            value = by_target[target_value]
-            if isinstance(value, BaseException):
-                raise value
-            return cast(dict, value)
-        return self._fx["resolve"]
+        del target_value
+        value = self._fx["resolve"]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    @property
+    def replay(self) -> bool:
+        """A `channel_access` fixture (even `None`: a run with no receipt) makes
+        this fake a replay, as `RawReplayGateway` is."""
+        return "channel_access" in self._fx
+
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        # Not an RPC (so not in `calls`): the fixture (a receipt, or a list of
+        # them served in order) lets a test prove a recorded receipt beats the
+        # store, as replay does.
+        del target_raw
+        fx = self._fx.get("channel_access")
+        if fx is None:
+            return None
+        receipts = fx if isinstance(fx, list) else [fx]
+        index = self._receipts_served
+        self._receipts_served += 1
+        return receipts[index] if index < len(receipts) else None
 
     async def get_full_channel(self, input_channel: dict) -> dict:
         self.calls.append("get_full_channel")
+        self.full_channel_inputs.append(dict(input_channel))
         # `full_channel_by_id` lets a test answer the LINKED GROUP's ChatFull
         # (participants preflight) differently from the target's.
         by_id: dict[int, object] = self._fx.get("full_channel_by_id", {})
         value = by_id.get(input_channel["channel_id"], self._fx.get("full_channel"))
+        # `full_channel_sequence` answers the Nth call (0-based) of a run
+        # differently — e.g. a rejected first route then an accepted second
+        # (#84 route fallback); calls past its end use the fixtures above.
+        sequence: list[object] = self._fx.get("full_channel_sequence", [])
+        if len(self.full_channel_inputs) <= len(sequence):
+            value = sequence[len(self.full_channel_inputs) - 1]
         if isinstance(value, BaseException):
             raise value
         if value is None:
@@ -479,17 +511,36 @@ class FakeGateway:
         return value
 
 
-def _input_channel(input_channel: dict) -> InputChannel:
+def _input_channel(input_channel: dict) -> TypeInputChannel:
+    """`{"channel_id", "access_hash"}` → `InputChannel`; the from-message form
+    (`from_msg`: a chat whose own key is known + a message in it that showed
+    the channel) → `InputChannelFromMessage`. Mirrors `_input_user` (#84)."""
     from telethon.tl.types import InputChannel as _InputChannel
+    from telethon.tl.types import InputChannelFromMessage
 
+    from_msg = input_channel.get("from_msg")
+    if from_msg is not None:
+        return InputChannelFromMessage(
+            peer=_input_peer_channel(from_msg),
+            msg_id=from_msg["msg_id"],
+            channel_id=input_channel["channel_id"],
+        )
     return _InputChannel(
         channel_id=input_channel["channel_id"], access_hash=input_channel["access_hash"]
     )
 
 
-def _input_peer_channel(input_channel: dict) -> InputPeerChannel:
+def _input_peer_channel(input_channel: dict) -> TypeInputPeer:
     from telethon.tl.types import InputPeerChannel as _InputPeerChannel
+    from telethon.tl.types import InputPeerChannelFromMessage
 
+    from_msg = input_channel.get("from_msg")
+    if from_msg is not None:
+        return InputPeerChannelFromMessage(
+            peer=_input_peer_channel(from_msg),
+            msg_id=from_msg["msg_id"],
+            channel_id=input_channel["channel_id"],
+        )
     return _InputPeerChannel(
         channel_id=input_channel["channel_id"], access_hash=input_channel["access_hash"]
     )
@@ -605,18 +656,33 @@ class TelethonGateway:
         )
         return result.to_dict()
 
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        # Live: Step A is computed from the store by the collector and recorded.
+        del target_raw
+        return None
+
     async def get_full_channel(self, input_channel: dict) -> dict:
+        from telethon.errors import ChannelInvalidError
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.types.messages import ChatFull
 
+        from paperboy.budget import SkipAndRecord
+
         channel = _input_channel(input_channel)
-        result = cast(
-            ChatFull,
-            await self.budget.call(
-                "channels.getFullChannel",
-                lambda: self.client(GetFullChannelRequest(channel=channel)),
-            ),
-        )
+        try:
+            result = cast(
+                ChatFull,
+                await self.budget.call(
+                    "channels.getFullChannel",
+                    lambda: self.client(GetFullChannelRequest(channel=channel)),
+                ),
+            )
+        except ChannelInvalidError as exc:
+            # A stale saved key or from-message reference (message deleted, hash
+            # rotated) answers CHANNEL_INVALID: an access refusal the channel
+            # collector answers by trying its next route (#84, spec §2.2) — scoped
+            # here, not in `classify`, for the reason errors.py gives.
+            raise SkipAndRecord(str(exc)) from exc
         return result.to_dict()
 
     async def iter_history(

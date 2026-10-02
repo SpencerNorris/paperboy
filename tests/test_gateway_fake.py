@@ -316,3 +316,29 @@ async def test_fake_exception_fixtures_raise_for_walls_and_batches():
     assert (await gw.get_full_channel(ic))["full_chat"]["id"] == 77
     other_full = await gw.get_full_channel({"channel_id": 5, "access_hash": 1})
     assert other_full["full_chat"]["id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_fake_get_full_channel_records_the_input_form():
+    gw = FakeGateway({"full_channel": {"_": "ChatFull", "full_chat": {"id": 5}}})
+    from_msg = {"channel_id": 5, "from_msg": {"channel_id": 7, "access_hash": 11, "msg_id": 3}}
+    plain = {"channel_id": 5, "access_hash": 99}
+    assert (await gw.get_full_channel(from_msg))["_"] == "ChatFull"
+    await gw.get_full_channel(plain)
+    assert gw.full_channel_inputs == [from_msg, plain]
+
+
+@pytest.mark.asyncio
+async def test_fake_channel_access_receipt_is_a_fixture_not_an_rpc():
+    assert await FakeGateway({}).channel_access_receipt("123") is None
+    receipt = {"_": "ChannelAccess", "channel_id": 123, "via": "saved_key"}
+    gw = FakeGateway({"channel_access": receipt})
+    assert await gw.channel_access_receipt("123") == receipt
+    assert gw.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fake_resolve_raises_an_exception_fixture():
+    gw = FakeGateway({"resolve": SkipAndRecord("nope")})
+    with pytest.raises(SkipAndRecord):
+        await gw.resolve("x")
