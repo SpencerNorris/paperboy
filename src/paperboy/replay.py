@@ -720,6 +720,15 @@ class ReplaySource:
         granted" for stamped and pre-#84 runs alike (#68 spec 9.3)."""
         return bool(self._chatfull_entries(run, channel_id))
 
+    def established_channel_ids(self, run: ReplayRun) -> list[int]:
+        """Channel ids the run recorded a `ChatFull` for, in order."""
+        seen: dict[int, None] = {}
+        for e in self._chatfull_entries(run, None):
+            cid = e.ctx.get("channel_id")
+            if isinstance(cid, int):
+                seen.setdefault(cid)
+        return list(seen)
+
     def resolved_access_hash(self, run_id: str, channel_id: int) -> int:
         """The `access_hash` the `ChatFull` of run `run_id` recorded for
         `channel_id` (it carries the channel object, whichever route got the

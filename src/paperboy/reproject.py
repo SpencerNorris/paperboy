@@ -29,6 +29,7 @@ from paperboy.replay import (
     ReplaySource,
     ReprojectSourceError,
     ResolveRecord,
+    RunMarker,
 )
 from paperboy.store.db import Store, dumps
 from paperboy.targets import Target, TargetKind, UnsupportedTarget, parse_target
@@ -221,6 +222,23 @@ def _reset_incremental_backfill_state(out_store: Store) -> None:
             "UPDATE sync_state SET value_json = ? WHERE scope = 'history_sweep' AND key = ?",
             (dumps(value), row["key"]),
         )
+
+
+def _pin_selection(
+    clock: ReplayClock, selection: RunMarker | None, channel_id: int | None
+) -> None:
+    """Give the replayed `MediaSelection` its recorded stamp. A legacy selection
+    (`{msg_ids}`, recorded before it named its channel) is replayed in the
+    current shape, so its stamp is also pinned under that shape's payload."""
+    if selection is None:
+        return
+    clock.pin_json(selection.observed_at, selection.payload_json)
+    if "channel_id" not in selection.payload and channel_id is not None:
+        current = {
+            "channel_id": channel_id,
+            "msg_ids": sorted(set(selection.payload.get("msg_ids") or [])),
+        }
+        clock.pin_json(selection.observed_at, dumps(current))
 
 
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
@@ -421,8 +439,7 @@ async def reproject(
                 )
             clock = ReplayClock()
             clock.pin_json(marker.observed_at, marker.payload_json)
-            if selection is not None:
-                clock.pin_json(selection.observed_at, selection.payload_json)
+            _pin_selection(clock, selection, channel_id)
             context = ChannelContext(
                 {"channel_id": channel_id, "access_hash": access_hash}, channel_id,
                 marker.tier, source_run_id,
@@ -453,8 +470,8 @@ async def reproject(
                 continue  # logged above; belongs to the other output
             replayed_any = True
             clock = ReplayClock()
-            if selection is not None:
-                clock.pin_json(selection.observed_at, selection.payload_json)
+            established = source.established_channel_ids(run)
+            _pin_selection(clock, selection, established[0] if established else None)
             results.setdefault(raw_target, []).extend(
                 await _replay_one(
                     source, out_store, replay_settings, media_profile, run, list(run_phases),

@@ -16,8 +16,8 @@ from paperboy.media_list import (
 )
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
-from paperboy.store.peers import upsert_peer
 from paperboy.store.messages import mark_deleted, upsert_message
+from paperboy.store.peers import upsert_peer
 
 
 def _write(tmp_path: Path, name: str, text: str) -> Path:
