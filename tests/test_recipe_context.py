@@ -148,7 +148,47 @@ async def test_media_selection_is_recorded_once_when_media_runs_with_msgs(tmp_pa
             "SELECT run_id, payload_json FROM raw_records WHERE kind='MediaSelection'"
         ).fetchall()
         assert len(rows) == 1 and rows[0]["run_id"] == st.run_id
-        assert json.loads(rows[0]["payload_json"]) == {"msg_ids": [3, 5, 7]}
+        assert json.loads(rows[0]["payload_json"]) == {"channel_id": 5, "msg_ids": [3, 5, 7]}
+
+
+@pytest.mark.asyncio
+async def test_media_selection_names_the_established_channel_and_follows_channel_raws(tmp_path):
+    # The selection is written just before the media phase, once the channel is
+    # known (#68 spec 9.2): after the channel phase's raws, before media's.
+    class _ChannelWithRaw(_ChannelStub):
+        async def collect(self, ctx):
+            ctx.store.add_raw("ChatFull", {"x": 1}, "stranger", {"channel_id": 5})
+            return await super().collect(ctx)
+
+    class _MediaWithRaw(_SeenCtxStub):
+        async def collect(self, ctx):
+            ctx.store.add_raw("MediaDownload", {"y": 1}, "stranger", None)
+            return await super().collect(ctx)
+
+    settings = load_settings("default", {"media_msgs": [2, 1]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        await collect_channel(
+            FakeGateway({}), st, settings, parse_target("5"),
+            phases=["channel", "media"], log=_LOG,
+            collectors=[_ChannelWithRaw(), _MediaWithRaw()],
+        )
+        kinds = [r["kind"] for r in st.conn.execute("SELECT kind FROM raw_records ORDER BY id")]
+        assert kinds == ["ChatFull", "MediaSelection", "MediaDownload"]
+
+
+@pytest.mark.asyncio
+async def test_media_selection_absent_when_channel_not_established(tmp_path):
+    settings = load_settings("default", {"media_msgs": [1]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        results = await collect_channel(
+            FakeGateway({}), st, settings, parse_target("5"),
+            phases=["channel", "media"], log=_LOG,
+            collectors=[_Stub("channel", exc=SkipAndRecord("no route")), _SeenCtxStub()],
+        )
+        assert st.conn.execute(
+            "SELECT count(*) FROM raw_records WHERE kind='MediaSelection'"
+        ).fetchone()[0] == 0
+        assert [r.stopped for r in results][0] == "skip"
 
 
 @pytest.mark.asyncio

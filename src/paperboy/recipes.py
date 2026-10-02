@@ -172,19 +172,6 @@ async def collect_channel_with_context(
     if channel_context is not None:
         active = [c for c in active if c.name != "channel"]
     selected = set(phases) if phases is not None else {c.name for c in active}
-    if settings.media_msgs is not None and any(
-        c.name == "media" and c.name in selected for c in active
-    ):
-        # The media phase will walk only these ids. Recording them keeps the
-        # raw log sufficient to replay exactly the same rows: without it a
-        # reproject would walk every stored media message and re-derive dedup
-        # custody rows the live run never produced.
-        selection = {"msg_ids": sorted(set(settings.media_msgs))}
-        store.add_raw(
-            "MediaSelection", selection, ctx.tier, None,
-            observed_at=ctx.clock.for_payload(selection),
-        )
-
     results: list[CollectResult] = []
     progress = Progress(store, log)
     progress.begin()
@@ -193,6 +180,26 @@ async def collect_channel_with_context(
             if collector.name not in selected or not collector.applies_to(target):
                 continue
             progress.start_phase(collector.name)
+            if (
+                collector.name == "media"
+                and settings.media_msgs is not None
+                and ctx.channel_id is not None
+            ):
+                # The media phase will walk only these ids, in the channel the
+                # run established. Recording both keeps the raw log sufficient to
+                # replay exactly the same rows (a reproject would otherwise walk
+                # every stored media message and re-derive dedup custody rows the
+                # live run never produced) and lets replay tell "access granted"
+                # from "refused" (#68 spec 9.2-9.3). Written here, not up front,
+                # because only now is the channel known.
+                selection = {
+                    "channel_id": ctx.channel_id,
+                    "msg_ids": sorted(set(settings.media_msgs)),
+                }
+                store.add_raw(
+                    "MediaSelection", selection, ctx.tier, None,
+                    observed_at=ctx.clock.for_payload(selection),
+                )
             try:
                 result = await _run_one(collector, ctx)
             except SkipAndRecord as exc:

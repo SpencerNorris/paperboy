@@ -256,7 +256,11 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
         phases.append("graph")
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
-    if source.has_kind(run, "mediadownload") or source.media_selection(run) is not None:
+    selection = source.media_selection(run)
+    if source.has_kind(run, "mediadownload") or (
+        selection is not None
+        and source.channel_established(run, selection.payload.get("channel_id"))
+    ):
         phases.append("media")
     return phases
 
@@ -416,9 +420,9 @@ async def reproject(
                     f"channel {channel_id}"
                 )
             clock = ReplayClock()
-            clock.serve_json(marker.observed_at, marker.payload_json)
+            clock.pin_json(marker.observed_at, marker.payload_json)
             if selection is not None:
-                clock.serve_json(selection.observed_at, selection.payload_json)
+                clock.pin_json(selection.observed_at, selection.payload_json)
             context = ChannelContext(
                 {"channel_id": channel_id, "access_hash": access_hash}, channel_id,
                 marker.tier, source_run_id,
@@ -450,7 +454,7 @@ async def reproject(
             replayed_any = True
             clock = ReplayClock()
             if selection is not None:
-                clock.serve_json(selection.observed_at, selection.payload_json)
+                clock.pin_json(selection.observed_at, selection.payload_json)
             results.setdefault(raw_target, []).extend(
                 await _replay_one(
                     source, out_store, replay_settings, media_profile, run, list(run_phases),

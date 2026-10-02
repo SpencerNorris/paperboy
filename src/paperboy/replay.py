@@ -699,16 +699,33 @@ class ReplaySource:
         return self._markers(run, "channelcontextreused")
 
     def media_selection(self, run: ReplayRun) -> RunMarker | None:
-        """The run's `MediaSelection` record (payload `{msg_ids}`), if its media
-        phase was scoped to specific messages."""
+        """The run's `MediaSelection` record, if its media phase was scoped to
+        specific messages. Payload `{channel_id, msg_ids}`; runs recorded before
+        #68's by-id amendment carry the legacy `{msg_ids}` only."""
         found = self._markers(run, "mediaselection")
         return found[-1] if found else None
 
+    def _chatfull_entries(self, run: ReplayRun, channel_id: int | None) -> list[RawEntry]:
+        """The run's `ChatFull` records for `channel_id` (any when `None`)."""
+        entries = self.index(run).entries(("chatfull",))
+        if channel_id is None:
+            return entries
+        return [e for e in entries if e.ctx.get("channel_id") == channel_id]
+
+    def channel_established(self, run: ReplayRun, channel_id: int | None) -> bool:
+        """Whether the live run's `channel` phase got access to `channel_id`
+        (any channel when `None`, the legacy selection shape): it recorded that
+        channel's `ChatFull`. A granted `ChannelAccess` always precedes it, and
+        a refused or route-less attempt leaves none, so this is "access
+        granted" for stamped and pre-#84 runs alike (#68 spec 9.3)."""
+        return bool(self._chatfull_entries(run, channel_id))
+
     def resolved_access_hash(self, run_id: str, channel_id: int) -> int:
-        """The `access_hash` the `ResolvedPeer` of run `run_id` recorded for
-        `channel_id`. Raises `ReprojectSourceError` if that run is not in the
-        log or never resolved the channel - a marker pointing nowhere is a
-        corrupt source, never guessed around. A resolved chat that carries no int
+        """The `access_hash` the `ChatFull` of run `run_id` recorded for
+        `channel_id` (it carries the channel object, whichever route got the
+        run in). Raises `ReprojectSourceError` if that run is not in the log or
+        never established the channel - a marker pointing nowhere is a corrupt
+        source, never guessed around. A channel object that carries no int
         `access_hash` yields 0, a deliberate placeholder: `RawReplayGateway`
         keys its lookups on `channel_id` alone and never reads the hash."""
         run = next((r for r in self.runs() if r.run_id == run_id), None)
@@ -717,14 +734,14 @@ class ReplaySource:
                 f"a ChannelContextReused marker names source run {run_id!r}, "
                 "which is not in the raw log"
             )
-        entries = self.index(run).entries(("resolvedpeer",))
+        entries = self._chatfull_entries(run, channel_id)
         for row in self.payloads(e.id for e in entries).values():
             for chat in json.loads(row["payload_json"]).get("chats") or []:
                 if isinstance(chat, dict) and chat.get("id") == channel_id:
                     access_hash = chat.get("access_hash")
                     return access_hash if isinstance(access_hash, int) else 0
         raise ReprojectSourceError(
-            f"source run {run_id!r} never resolved channel {channel_id}, but a "
+            f"source run {run_id!r} never established channel {channel_id}, but a "
             "ChannelContextReused marker says its context was reused"
         )
 
