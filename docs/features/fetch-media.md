@@ -212,13 +212,15 @@ channel only and leaves no media or custody rows, exactly as live.
 ## Definition of done
 
 Redaction: channels are `@<channel>`, ids `<id>`; unredacted transcripts stay in
-`<scratch>/68/`. The operator's list, its rows and channels appear nowhere here.
+`<scratch>/68b/` (referenced by filename only). The operator's list, its rows and
+channels appear nowhere here. The by-id amendment (spec §9) superseded the
+earlier design, so every transcript below was re-run on this branch.
 
 ### Gates (pasted output)
 
 ```
 $ uv run pytest -q
-933 passed in 77.40s (0:01:17)
+1013 passed in 201.62s (0:03:21)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
@@ -227,10 +229,10 @@ $ uv run pyright
 
 ### Smoke test transcript
 
-**Offline, synthetic list** (`tests/fixtures/media_list/synthetic.csv` against a
-synthetic two-channel store; no gateway, no keychain, no network; the CLI tests
-assert both constructors are never called). Command:
-`PAPERBOY_DATA_DIR=<scratch>/68/synthetic paperboy fetch-media tests/fixtures/media_list/synthetic.csv --dry-run`
+**Offline, synthetic list**, with `--exclude-target 20` to show the new label
+(`tests/fixtures/media_list/synthetic.csv` against a synthetic two-channel store;
+no gateway, no keychain, no network; the CLI tests assert both constructors are
+never called):
 
 ```
   fetch-media: offline classification  
@@ -238,119 +240,135 @@ assert both constructors are never called). Command:
 ┃ outcome        ┃ rows ┃ declared GB ┃
 ┡━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
 │ duplicate_row  │    1 │        0.00 │
+│ excluded       │    2 │        0.00 │
 │ not_in_store   │    1 │        0.00 │
 │ deleted        │    0 │        0.00 │
 │ no_media       │    0 │        0.00 │
-│ unresolvable   │    0 │        0.00 │
 │ already_stored │    0 │        0.00 │
-│ pending        │    5 │        0.00 │
+│ pending        │    3 │        0.00 │
 │ total          │    7 │        0.00 │
 └────────────────┴──────┴─────────────┘
+                fetch-media: per channel (rows by outcome)                
+┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┓
+┃ channel id ┃ duplicate_row ┃ excluded ┃ not_in_store ┃ pending ┃ total ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━┩
+│         10 │             1 │        0 │            1 │       3 │     5 │
+│         20 │             0 │        2 │            0 │       0 │     2 │
+└────────────┴───────────────┴──────────┴──────────────┴─────────┴───────┘
          fetch-media: segment plan (list order)         
-┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
-┃ segment ┃ priority ┃ channel id ┃ rows ┃ declared GB ┃
-┡━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
 │       1 │ P1       │         10 │    1 │        0.00 │
-│       2 │ P1       │         20 │    1 │        0.00 │
-│       3 │ P2       │         10 │    2 │        0.00 │
-│       4 │ P2       │         20 │    1 │        0.00 │
-└─────────┴──────────┴────────────┴──────┴─────────────┘
+│       2 │ P2       │         10 │    2 │        0.00 │
 ```
-
-No `pacing:` line appears (no gateway was built).
 
 **Offline, the operator's full list on a `sqlite3 .backup` copy** (`<list>`, 1,719
-rows; `PAPERBOY_DATA_DIR=<scratch>/68 paperboy fetch-media <list> --dry-run --profile default`;
-exit 0; ids redacted; unredacted output in `<scratch>/68/full-dryrun.unredacted.txt`):
+rows; `PAPERBOY_DATA_DIR=<scratch>/68b paperboy fetch-media <list> --dry-run
+--profile default --exclude-target @<channel>`; exit 0; unredacted output in
+`full-dryrun.unredacted.txt`). The log says `excluding 2 channel id(s)` (the
+excluded channel and its linked group):
 
 ```
-[..] WARNING  fetch-media: channel <id> has no stored username and cannot be
-              resolved; its rows are reported unresolvable
-  fetch-media: offline classification
-┏━━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
 ┃ outcome        ┃ rows ┃ declared GB ┃
-┡━━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
 │ duplicate_row  │    0 │        0.00 │
+│ excluded       │   40 │        0.00 │
 │ not_in_store   │    0 │        0.00 │
 │ deleted        │    0 │        0.00 │
 │ no_media       │    0 │        0.00 │
-│ unresolvable   │   40 │        0.05 │
 │ already_stored │   99 │       12.36 │
 │ pending        │ 1580 │      149.80 │
-│ total          │ 1719 │      162.22 │
-└────────────────┴──────┴─────────────┘
+│ total          │ 1719 │      162.17 │
 ```
 
-The segment plan has 36 segments (P1 x9, P2 x8, P3 x9, PH x10; every row of the
-`pending` count is in exactly one segment; the largest is 294 rows). The single
-channel with no stored username (its 40 rows) is the linked group that was split
-out into a separate investigation: it is reported `unresolvable` and never
-fetched. `already_stored` is 99, equal to the catalogue's own "already
-downloaded" flag on this store (the plan's earlier 118 estimate does not hold
-against the actual store). `grep -c "pacing:"` on the unredacted output is 0: no
-gateway was built.
+The per-channel table has 11 rows (ids redacted; one is the excluded linked group
+with `excluded` 40, 0 pending; the other ten have 2 to 800 rows each, `pending`
+summing to 1580). The excluded channel itself has no row on the list, so
+`excluded` is the 40 linked-group rows only. `already_stored` is 99, equal to the
+catalogue's own flag (the plan's ~118 estimate does not hold against the store).
+`grep -c "pacing:"` on the unredacted output is 0: no gateway was built. Network
+absence is by construction: `cli.py` returns after `_print_plan` when `dry_run`,
+before `_run_fetch` (`build_secrets`, `build_gateway`, doctor);
+`excluded_channel_ids` and `classify_rows` are store queries;
+`test_dry_run_builds_no_gateway_and_no_secrets` asserts it. Without
+`--exclude-target` the same list reads `excluded` 0, `already_stored` 131,
+`pending` 1588: the 40 rows that the superseded design called `unresolvable` are
+now reachable by id.
 
-**Live, 3-row slice** (photo + 2 videos, 2 channels already in the store, each
-<= 20 MB, chosen offline from `<list>` and copied to `<scratch>/68/list-smoke.csv`).
-Its `--dry-run` reports `pending` 3, `already_stored` 0, 2 segments (PH 1 row, P1 2
-rows), 0.02 GB declared. Before each live invocation: `STOP-LIVE` absent,
-live-call counter 0 then 1 (of 5), and
+**Live, 3-row slice** (1 photo + 2 videos from 2 channels already in the store,
+each with a saved key, 0.9 MB in total, chosen offline and copied to
+`<scratch>/68b/list-smoke.csv`; `--exclude-target @<channel>` on every command
+because the real store is not yet split). Dry run: `pending` 3, 2 segments (PH 1
+row, P1 2 rows). Before each live invocation: `STOP-LIVE` absent, live-call
+counter 0 then 1 (of 5), and
 
 ```
 149.154.167.51 -> utun4
 91.108.56.130 -> utun4
 ```
 
-Invocation 1: `PAPERBOY_REQUIRE_PROXY=false paperboy fetch-media <scratch>/68/list-smoke.csv --profile default --max-rpc 60 --max-flood-sleep 60 --report <scratch>/68/report-1.csv`
-(exit 0, 18 RPCs of the 60 cap, no FLOOD_WAIT). Segment log excerpt:
+Invocation 1: `PAPERBOY_REQUIRE_PROXY=false paperboy fetch-media <scratch>/68b/list-smoke.csv --profile default --exclude-target @<channel> --max-rpc 60 --max-flood-sleep 60 --report <scratch>/68b/report-1.csv`
+(exit 0, 16 RPCs of the 60 cap, no FLOOD_WAIT, **no `resolve`**). Log excerpt:
 
 ```
-fetch-media: segment 1/2 priority=PH channel=<id> rows=1 end: {'downloaded': 1}
-fetch-media: segment 2/2 priority=P1 channel=<id> rows=2 end: {'downloaded': 2}
-fetch-media: {'downloaded': 3}; <bytes> bytes downloaded; report report-1.csv
-      fetch-media: result
-┃ outcome          ┃  rows ┃
-│ downloaded       │     3 │
-│ bytes downloaded │ <n>   │
+INFO  fetch-media: segment 1/2 priority=PH channel=<id> rows=1 start
+DEBUG rpc channels.getFullChannel attempt 1 (run call #8)
+INFO  channel access: id=<id> via=saved_key granted=True error=None
+INFO  fetch-media: segment 1/2 priority=PH channel=<id> rows=1 end: {'downloaded': 1}
+INFO  fetch-media: segment 2/2 priority=P1 channel=<id> rows=2 start
+INFO  channel access: id=<id> via=saved_key granted=True error=None
+INFO  fetch-media: segment 2/2 priority=P1 channel=<id> rows=2 end: {'downloaded': 2}
+INFO  fetch-media: {'downloaded': 3}; 883319 bytes downloaded; report report-1.csv
 ```
 
-Report (`report-1.csv`, URIs redacted, sha256/key abbreviated):
+Report (`report-1.csv`, ids and hashes abbreviated):
 
 ```
-line_no,uri,outcome,sha256,key
-2,tg:msg:<id>/<id>,downloaded,45f4f24f...7112,media/45/45f4f24f....jpg
-3,tg:msg:<id>/<id>,downloaded,79d8c006...,media/79/79d8c006....mp4
-4,tg:msg:<id>/<id>,downloaded,c46d95eb...78bb,media/c4/c46d95eb....mp4
+line_no,uri,outcome,sha256,key,reason
+2,tg:msg:<id>/<id>,downloaded,45f4f24f...7112,media/45/45f4f24f....jpg,
+3,tg:msg:<id>/<id>,downloaded,5c837795...ce62,media/5c/5c837795....mp4,
+4,tg:msg:<id>/<id>,downloaded,df805cf4...ab80,media/df/df805cf4....mp4,
 ```
 
-- `SELECT count(*) FROM raw_records WHERE kind='ChannelContextReused'` = 0. Each
-  channel had a single segment, so no channel was resolved twice and no marker was
-  needed (the marker appears only when a channel spans several segments; that path is
-  covered by `tests/test_recipe_context.py` and `tests/test_reproject_fetch_media.py`).
-- `ls -A <scratch>/68/default/media/.incoming | wc -l` = 0.
-- `shasum -a 256` of the third file =
-  `c46d95eb04b4decfb2e392fb1277a96026e668fbe297674970e5e6b02b4578bb`, equal to its
-  `media.sha256`.
-- The single `pacing:` line (`factor=2.0 default=2.0s`) appears in this run, where
-  a gateway is built.
+- Raw kinds of the two fetch runs: `ChannelAccess` 2, `ChatFull` 2,
+  `MediaSelection` 2 (one per segment), `MediaDownload` 3, `User` 2;
+  `ChannelContextReused` 0 (each channel had a single segment, so the reuse
+  path is covered by `tests/test_reproject_fetch_media.py`, not by this smoke).
+- `MediaSelection` rows with `json_extract(payload_json,'$.channel_id') IS NULL`: 0.
+- `ls -A <scratch>/68b/default/media/.incoming | wc -l` = 0.
+- `shasum -a 256` of the third file equals its `media.sha256`
+  (`df805cf4...ab80`).
+- One `pacing:` line (`factor=2.0 default=2.0s`) in this run, where a gateway is built.
 
-Invocation 2 (same command, `--report <scratch>/68/report-2.csv`, counter 1 then 2
-of 5, VPN check repeated and both `utun4`): exit 0, no `pacing:` line (no gateway
-built), no RPC.
+Invocation 2 (same command, `--report <scratch>/68b/report-2.csv`, counter 1 then
+2 of 5, VPN check repeated, both `utun4`): exit 0, no `pacing:` line, no RPC;
+`{'already_stored': 3}; 0 bytes downloaded`, `report-2.csv` has 3 rows, all
+`already_stored`.
+
+**Reproject equality** (offline; `PAPERBOY_DATA_DIR=<scratch>/68b paperboy reproject
+--profile default --include-target <id> --include-target <id>`, the two smoke
+channels; 41 other (run, target) pairs `decision=excluded`, 21 `decision=included`;
+about 28 minutes on the 600 MB copy). The scratch media directory holds only the
+three smoke files, so the older included runs' media rows replayed as
+`SkipAndRecord` "media file missing" (213 log lines): expected. Source vs
+`paperboy.reprojected.sqlite` for the three fetched uris:
 
 ```
-| already_stored   |    3 |      (offline classification: pending 0)
-| bytes downloaded |    0 |
-report-2.csv: 3 rows, all already_stored
+media rows:    source 3, reprojected 3   -> (message_uri, sha256, path) equal: True
+custody rows:  source 3, reprojected 3   -> equal: True
+raw kinds of the two fetch runs (ChannelAccess 2, ChatFull 2, MediaDownload 3,
+  MediaSelection 2, User 2): identical in both stores
 ```
 
-Totals: 2 of 5 live invocations, 3 files, well under the 3 GB cap. No STOP
-condition was hit; `STOP-LIVE` was never created.
+(`<scratch>/68b/compare.py`; the full-store reproject was not run, per the
+scoped-run decision.) Totals: 2 of 5 live invocations, 3 files, 0.9 MB, far under
+the 3 GB cap. No STOP condition was hit; `STOP-LIVE` was never created.
+
+Parity for the cases a live smoke cannot reach (a refused channel, a
+granted-but-zero-download segment, a legacy selection) is pinned by
+`tests/test_reproject_fetch_media.py`.
 
 ### Docs updated
 
-`docs/features/fetch-media.md` (new), `README.md` (command row, data layout,
-documentation list), `CLAUDE.md` (commands, status line), `docs/how-it-works.md`
-§6, `docs/features/pacing.md`, `docs/features/reproject.md`,
-`docs/adr/0005-run-structure.md`, `docs/data-model.md` (two raw kinds; no
-schema change), `docs/superpowers/plans/2026-09-29-media-list-fetch.md`.
+`docs/features/fetch-media.md`, `README.md` (command row, documentation list),
+`CLAUDE.md` (status line), `docs/how-it-works.md` §6, `docs/features/reproject.md`,
+`docs/features/collect-channel.md`, `docs/adr/0005-run-structure.md`,
+`docs/data-model.md` (`ChannelContextReused`, `MediaSelection` payloads; no
+schema change), `docs/superpowers/plans/2026-10-01-media-list-fetch-by-id.md`.
