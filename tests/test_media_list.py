@@ -16,6 +16,7 @@ from paperboy.media_list import (
 )
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
+from paperboy.store.peers import upsert_peer
 from paperboy.store.messages import mark_deleted, upsert_message
 
 
@@ -109,13 +110,19 @@ def test_empty_list_is_an_error(tmp_path):
 # ── classification + segments ──────────────────────────────────────────────
 
 
-def seed_channel(st, channel_id, username):
+def seed_channel(st, channel_id, username, access_hash=None):
+    """A `channels` row; with `access_hash`, also a full (non-`min`) `peers` row,
+    i.e. a saved key (route 1 of Step A, #84)."""
     chan = {"_": "channel", "id": channel_id, "access_hash": 1, "title": "T", "broadcast": True}
     if username:
         chan["username"] = username
     full = {"_": "channelFull", "id": channel_id, "pts": 1}
     raw = st.add_raw("channelFull", full, "stranger", None)
     upsert_channel(st, full, chan, raw, utc_now_iso())
+    if access_hash is not None:
+        peer = {"_": "channel", "id": channel_id, "title": "T", "access_hash": access_hash}
+        upsert_peer(st, peer, st.add_raw("Channel", peer, "stranger", None), utc_now_iso(),
+                    seen_in_chat=None, seen_in_msg=None)
 
 
 def seed_msg(st, channel_id, msg_id, *, doc_id=None, photo_id=None, text_only=False):
@@ -153,7 +160,7 @@ def test_classify_covers_every_offline_outcome(tmp_path):
         seed_msg(st, 10, 3, text_only=True)                  # no_media (geo)
         seed_msg(st, 10, 4, doc_id=1004)                     # deleted
         mark_deleted(st, 10, 4, "update", utc_now_iso())
-        seed_msg(st, 30, 5, doc_id=1005)                     # unresolvable
+        seed_msg(st, 30, 5, doc_id=1005)                     # pending (reached by id)
         seed_msg(st, 20, 6, doc_id=1002)                     # same file as 10/2, other channel
         seed_msg(st, 20, 7, photo_id=77)                     # pending via username row
         path = _write(
@@ -162,7 +169,7 @@ def test_classify_covers_every_offline_outcome(tmp_path):
             "tg:msg:10/2\n"          # already_stored
             "tg:msg:10/3\n"          # no_media
             "tg:msg:10/4\n"          # deleted
-            "tg:msg:30/5\n"          # unresolvable
+            "tg:msg:30/5\n"          # pending: no username needed, the id is the address
             "tg:msg:20/6\n"          # already_stored: key held by ANOTHER channel's file
             "tg:msg:10/999\n"        # not_in_store
             "https://t.me/Chan_B/7\n"  # username resolved offline -> pending
@@ -172,7 +179,7 @@ def test_classify_covers_every_offline_outcome(tmp_path):
         )
         out = classify_rows(st, parse_media_list(path))
         assert [c.outcome for c in out] == [
-            "pending", "already_stored", "no_media", "deleted", "unresolvable",
+            "pending", "already_stored", "no_media", "deleted", "pending",
             "already_stored", "not_in_store", "pending", "duplicate_row",
             "not_in_store", "duplicate_row",
         ]
@@ -194,12 +201,12 @@ def test_segments_group_by_priority_then_channel_in_first_appearance_order(tmp_p
             "tg:msg:10/1,P1\n"   # P1 chan_a again -> same segment as the first
             "tg:msg:20/2,P2\n",  # P2 chan_b
         )
-        segs = plan_segments(st, classify_rows(st, parse_media_list(path)))
-        assert [(s.priority, s.channel_id, s.username, s.msg_ids) for s in segs] == [
-            ("P1", 10, "chan_a", [1, 2]),
-            ("P1", 20, "chan_b", [1]),
-            ("P2", 10, "chan_a", [3]),
-            ("P2", 20, "chan_b", [2]),
+        segs = plan_segments(classify_rows(st, parse_media_list(path)))
+        assert [(s.priority, s.channel_id, s.msg_ids) for s in segs] == [
+            ("P1", 10, [1, 2]),
+            ("P1", 20, [1]),
+            ("P2", 10, [3]),
+            ("P2", 20, [2]),
         ]
 
 

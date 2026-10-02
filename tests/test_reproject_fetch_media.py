@@ -76,9 +76,7 @@ async def build_source(tmp_path: Path) -> Path:
             )
         gw = FakeGateway({
             "self": {"_": "user", "id": 1, "self": True},
-            "resolve_by_target": {
-                "chan_a": _resolved(10, "chan_a"), "chan_b": _resolved(20, "chan_b"),
-            },
+            "resolve": AssertionError("fetch-media addresses channels by id"),
             "full_channel_by_id": {10: _full(10, "chan_a"), 20: _full(20, "chan_b")},
             "media": {1: b"a1", 2: b"a2", 3: b"a3", 11: b"b11", 12: b"b12"},
         })

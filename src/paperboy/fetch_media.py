@@ -7,15 +7,23 @@ with `media_msgs` narrowed to the segment's ids - so budget, guardrails,
 dedup, custody, streaming and `--media-max-mb` all apply unchanged, and
 `reproject` replays a segment as it would any other run (ADR-0005).
 
-One gateway (one MTProto session, one `Budget`) serves the whole command. A
-channel is resolved once: later segments of it reuse the `ChannelContext` and
-append a `ChannelContextReused` marker instead of re-running `channel`.
+One gateway (one MTProto session, one `Budget`) serves the whole command. Each
+segment targets the channel BY ID (`parse_target(str(channel_id))`), so the
+standard `channel` collector reaches it through the #84 access routes (saved
+key, from-message, verified stored handle) and records a `ChannelAccess`
+receipt; no handle is ever looked up for a list row and no fetch-only collector
+exists, which is what lets `reproject` replay a segment with the very same
+collectors (docs/features/fetch-media.md). A channel is established once: later
+segments of it reuse the `ChannelContext` and append a `ChannelContextReused`
+marker instead of re-running `channel`.
 
 Stop policy (docs/features/fetch-media.md):
 
-* a `channel` phase that SKIPS (private channel, renamed handle, handle
-  resolving to another channel) marks that channel's remaining rows
-  `not_attempted` and the command continues with other channels;
+* a `channel` phase that SKIPS (no route to the channel, access refused,
+  private) marks that segment's rows AND the channel's later segments'
+  `no_access` (the routes come from the store, which does not change within
+  one command, so there is nothing to retry) and the command continues with
+  other channels;
 * ANY `PhaseStop` - in the `channel` phase (e.g. a FLOOD_WAIT on
   `contacts.resolveUsername`) or the `media` phase (free-disk floor, a
   FLOOD_WAIT over the ceiling, a sink error, repeated failures) - or a
@@ -37,8 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from paperboy.budget import SkipAndRecord
-from paperboy.collectors.base import ChannelContext, CollectContext, CollectResult
+from paperboy.collectors.base import ChannelContext
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.media_list import ClassifiedRow, Segment, plan_segments
@@ -50,7 +57,7 @@ if TYPE_CHECKING:
     from paperboy.gateway import Gateway
     from paperboy.store.db import Store
 
-REPORT_COLUMNS = ("line_no", "uri", "outcome", "sha256", "key")
+REPORT_COLUMNS = ("line_no", "uri", "outcome", "sha256", "key", "reason")
 # Outcomes for which the report names the stored file.
 _HAS_FILE = frozenset({"downloaded", "duplicate", "already_stored"})
 
@@ -61,6 +68,7 @@ class RowResult:
 
     classified: ClassifiedRow
     outcome: str
+    reason: str = ""
 
 
 @dataclass
@@ -79,40 +87,19 @@ class FetchSummary:
         return self.counts["not_attempted"] == 0
 
 
-class _ExpectChannel:
-    """The `channel` collector, then a guard that it resolved the channel the
-    segment asked for. A renamed handle can resolve to a DIFFERENT channel;
-    letting `media` run would fetch this segment's message ids from the wrong
-    one, so a mismatch clears the context and skips the phase."""
-
-    name = "channel"
-
-    def __init__(self, expected_channel_id: int) -> None:
-        self._inner = ChannelCollector()
-        self._expected = expected_channel_id
-
-    def applies_to(self, target) -> bool:
-        return self._inner.applies_to(target)
-
-    async def collect(self, ctx: CollectContext) -> CollectResult:
-        result = await self._inner.collect(ctx)
-        if ctx.channel_id != self._expected:
-            resolved = ctx.channel_id
-            ctx.input_channel = None
-            ctx.channel_id = None
-            raise SkipAndRecord(
-                f"handle resolved to channel {resolved}, expected {self._expected}; "
-                "not fetching under the wrong channel"
-            )
-        return result
-
-
 def initial_results(classified: list[ClassifiedRow]) -> list[RowResult]:
     """Offline outcomes as final; `pending` rows start as `not_attempted`."""
     return [
         RowResult(c, "not_attempted" if c.outcome == "pending" else c.outcome)
         for c in classified
     ]
+
+
+def _mark_no_access(seg: Segment, by_uri: dict[str, RowResult], reason: str) -> None:
+    for c in seg.rows:
+        result = by_uri.get(c.uri)
+        if result is not None:
+            result.outcome, result.reason = "no_access", reason
 
 
 async def _run_segments(
@@ -128,7 +115,7 @@ async def _run_segments(
     ended early (`None` if it ran to the end)."""
     by_uri = {r.classified.uri: r for r in results if r.classified.outcome == "pending"}
     contexts: dict[int, ChannelContext] = {}
-    dead_channels: set[int] = set()
+    dead_channels: dict[int, str] = {}
 
     for i, seg in enumerate(segments, start=1):
         label = (
@@ -136,7 +123,8 @@ async def _run_segments(
             f"channel={seg.channel_id} rows={len(seg.rows)}"
         )
         if seg.channel_id in dead_channels:
-            log.info("%s skipped: the channel stopped earlier in this run", label)
+            log.info("%s: no_access (the channel was refused earlier in this run)", label)
+            _mark_no_access(seg, by_uri, dead_channels[seg.channel_id])
             continue
         log.info("%s start", label)
         outcomes: dict[str, str] = {}
@@ -151,9 +139,9 @@ async def _run_segments(
         cached = contexts.get(seg.channel_id)
         try:
             phase_results, established = await collect_channel_with_context(
-                gateway, store, seg_settings, parse_target(f"@{seg.username}"),
+                gateway, store, seg_settings, parse_target(str(seg.channel_id)),
                 ["channel", "media"], log,
-                collectors=[_ExpectChannel(seg.channel_id), MediaCollector(outcomes=outcomes)],
+                collectors=[ChannelCollector(), MediaCollector(outcomes=outcomes)],
                 profile=profile, channel_context=cached,
             )
         finally:
@@ -177,11 +165,13 @@ async def _run_segments(
             log.warning("%s: channel phase stopped (%s); ending the command", label, reason)
             return f"channel phase_stop ({reason})"
         if channel_result is not None and channel_result.stopped is not None:
-            dead_channels.add(seg.channel_id)
+            reason = str(channel_result.stop_exc)
+            dead_channels[seg.channel_id] = reason
             log.warning(
-                "%s: channel phase %s; its remaining rows stay not_attempted",
-                label, channel_result.stopped,
+                "%s: channel phase %s (%s); its rows are no_access",
+                label, channel_result.stopped, reason,
             )
+            _mark_no_access(seg, by_uri, reason)
             continue
         if established is not None:
             contexts.setdefault(seg.channel_id, established)
@@ -208,7 +198,7 @@ def _stored_ref(store: Store, uri: str) -> tuple[str, str] | None:
 
 
 def write_report(path: Path, store: Store, results: list[RowResult]) -> None:
-    """CSV `line_no,uri,outcome,sha256,key` for every input row, in list order."""
+    """CSV `line_no,uri,outcome,sha256,key,reason` for every input row, in list order."""
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(REPORT_COLUMNS)
@@ -218,7 +208,9 @@ def write_report(path: Path, store: Store, results: list[RowResult]) -> None:
                 ref = _stored_ref(store, r.classified.uri) or r.classified.stored
                 if ref is not None:
                     sha, key = ref
-            writer.writerow([r.classified.row.line_no, r.classified.uri, r.outcome, sha, key])
+            writer.writerow([
+                r.classified.row.line_no, r.classified.uri, r.outcome, sha, key, r.reason,
+            ])
 
 
 def _bytes_downloaded(store: Store, results: list[RowResult]) -> int:
@@ -245,7 +237,7 @@ async def fetch_media(
     """Run every pending segment and write the report (also on a stop or an
     unexpected error). `gateway` may be `None` only when nothing is pending."""
     results = initial_results(classified)
-    segments = plan_segments(store, classified)
+    segments = plan_segments(classified)
     summary = FetchSummary(results)
     try:
         if segments:

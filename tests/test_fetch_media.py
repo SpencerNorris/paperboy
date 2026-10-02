@@ -4,6 +4,7 @@ Synthetic channels/messages only.
 """
 
 import csv
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -45,9 +46,7 @@ def _full(cid, username):
 def _gateway(media, **extra):
     fx = {
         "self": {"_": "user", "id": 1, "self": True},
-        "resolve_by_target": {
-            "chan_a": _resolved(10, "chan_a"), "chan_b": _resolved(20, "chan_b"),
-        },
+        "resolve": AssertionError("no handle lookup: list rows are fetched by id"),
         "full_channel_by_id": {10: _full(10, "chan_a"), 20: _full(20, "chan_b")},
         "media": media,
     }
@@ -60,8 +59,8 @@ def _settings(tmp_path):
 
 
 def _seed_store(st):
-    seed_channel(st, 10, "chan_a")
-    seed_channel(st, 20, "chan_b")
+    seed_channel(st, 10, "chan_a", access_hash=100)
+    seed_channel(st, 20, "chan_b", access_hash=200)
     for ch, mid in [(10, 1), (10, 2), (10, 3), (20, 11), (20, 12)]:
         seed_msg(st, ch, mid, photo_id=ch * 100 + mid)
 
@@ -103,8 +102,17 @@ async def test_end_to_end_two_channels_two_tiers(tmp_path):
         assert summary.bytes_downloaded == sum(len(b) for b in BYTES.values())
         # Segment order: P1(A), P1(B), P2(A: 2,3), P2(B: 12)
         assert gw.download_media_calls == [1, 11, 2, 3, 12]
-        # One resolve per channel per run, not per segment.
-        assert gw.calls.count("resolve") == 2
+        # By id: no handle lookup at all, and the key is fetched once per channel.
+        assert "resolve" not in gw.calls
+        assert [i["channel_id"] for i in gw.full_channel_inputs] == [10, 20]
+        access = [
+            json.loads(r["payload_json"]) for r in st.conn.execute(
+                "SELECT payload_json FROM raw_records WHERE kind='ChannelAccess' ORDER BY id"
+            )
+        ]
+        assert [(a["channel_id"], a["via"], a["granted"]) for a in access] == [
+            (10, "saved_key", True), (20, "saved_key", True),
+        ]
         markers = st.conn.execute(
             "SELECT run_id FROM raw_records WHERE kind='ChannelContextReused'"
         ).fetchall()
@@ -174,12 +182,14 @@ async def test_disk_floor_ends_the_command(tmp_path, monkeypatch):
     assert not summary.complete
     assert "DiskFloorStop" in (summary.stop_reason or "")
     assert gw.download_media_calls == []
-    assert gw.calls.count("resolve") == 1  # never went on to the next channel
+    assert gw.calls.count("get_full_channel") == 1  # never went on to the next channel
 
 
 @pytest.mark.asyncio
 async def test_channel_phase_skip_continues_with_other_channels(tmp_path):
-    gw = _gateway(BYTES, full_channel_by_id={
+    # The saved key is rejected, so Step A falls through to the stored handle
+    # (route 3), which resolves to 10 again and is rejected too.
+    gw = _gateway(BYTES, resolve=_resolved(10, "chan_a"), full_channel_by_id={
         10: SkipAndRecord("channel is private"), 20: _full(20, "chan_b"),
     })
     report = tmp_path / "r.csv"
@@ -189,28 +199,90 @@ async def test_channel_phase_skip_continues_with_other_channels(tmp_path):
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
-    assert not summary.complete and summary.stop_reason is None
-    assert [r["outcome"] for r in _report(report)] == [
-        "not_attempted", "downloaded", "not_attempted", "downloaded", "not_attempted",
+    rows = _report(report)
+    assert [r["outcome"] for r in rows] == [
+        "no_access", "downloaded", "no_access", "downloaded", "no_access",
     ]
-    # Channel A was tried once; its later segment was not re-resolved.
-    assert gw.calls.count("resolve") == 2
+    assert "cannot get access to channel 10" in rows[0]["reason"] and rows[1]["reason"] == ""
+    assert summary.complete  # every row has a final outcome
+    # Channel A's routes were tried once; its later segment was not retried.
+    assert [i["channel_id"] for i in gw.full_channel_inputs] == [10, 10, 20]
     assert gw.download_media_calls == [11, 12]
 
 
 @pytest.mark.asyncio
-async def test_handle_resolving_to_another_channel_fetches_nothing(tmp_path):
-    gw = _gateway(BYTES, resolve_by_target={
-        "chan_a": _resolved(99, "chan_a"), "chan_b": _resolved(20, "chan_b"),
-    }, full_channel_by_id={99: _full(99, "chan_a"), 20: _full(20, "chan_b")})
+async def test_stored_handle_now_elsewhere_still_fetches_by_id(tmp_path):
+    """The stored handle of channel 10 now belongs to channel 6, but the run
+    holds a saved key for 10: it goes by id and never looks the handle up."""
+    gw = _gateway(BYTES, resolve=_resolved(6, "chan_a"))
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
         summary = await fetch_media(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
-    assert gw.download_media_calls == [11, 12]  # nothing under the wrong channel
-    assert summary.counts["not_attempted"] == 3
+    assert summary.complete and summary.counts["downloaded"] == 5
+    assert "resolve" not in gw.calls
+    assert gw.download_media_calls == [1, 11, 2, 3, 12]
+
+
+@pytest.mark.asyncio
+async def test_segment_without_any_route_is_no_access_and_the_run_continues(
+    tmp_path, caplog
+):
+    """Channel 10 has no saved key, no from-message key and no stored handle:
+    route 4. Its rows are `no_access`; channel 20 still downloads."""
+    gw = _gateway(BYTES)
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        seed_channel(st, 10, None)
+        seed_channel(st, 20, "chan_b", access_hash=200)
+        for ch, mid in [(10, 1), (10, 2), (10, 3), (20, 11), (20, 12)]:
+            seed_msg(st, ch, mid, photo_id=ch * 100 + mid)
+        with caplog.at_level(logging.WARNING):
+            summary = await fetch_media(
+                gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+                profile="p", report_path=report,
+            )
+    assert summary.complete and summary.stop_reason is None
+    rows = _report(report)
+    assert [r["outcome"] for r in rows] == [
+        "no_access", "downloaded", "no_access", "downloaded", "no_access",
+    ]
+    assert gw.download_media_calls == [11, 12]
+    assert "resolve" not in gw.calls
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "no_access" in r.getMessage()
+    ]
+    assert len(warnings) == 1 and "channel=10" in warnings[0].getMessage()
+    assert rows[0]["reason"] and rows[0]["reason"] == rows[2]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_live_collector_list_is_the_standard_one(tmp_path, monkeypatch):
+    """No fetch-media-only collector: the live run uses `channel` + `media`."""
+    from paperboy import fetch_media as fm
+    from paperboy.collectors.channel import ChannelCollector
+    from paperboy.collectors.media import MediaCollector
+
+    seen = []
+    real = fm.collect_channel_with_context
+
+    async def spy(*args, **kwargs):
+        seen.append(kwargs["collectors"])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(fm, "collect_channel_with_context", spy)
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_media(
+            _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=tmp_path / "r.csv",
+        )
+    assert seen and all(
+        [type(c) for c in cs] == [ChannelCollector, MediaCollector] for cs in seen
+    )
 
 
 @pytest.mark.asyncio
@@ -275,7 +347,7 @@ async def test_channel_phase_stop_ends_the_command(tmp_path):
         )
     assert not summary.complete
     assert "channel phase_stop" in (summary.stop_reason or "")
-    assert gw.calls.count("resolve") == 1  # channel B never attempted
+    assert gw.calls.count("get_full_channel") == 1  # channel B never attempted
     assert gw.download_media_calls == []
     assert {r["outcome"] for r in _report(report)} == {"not_attempted"}
 

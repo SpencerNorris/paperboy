@@ -499,13 +499,7 @@ def fetch_media_cmd(
     log = logging.getLogger("paperboy.cli")
     with composition.build_store(settings, profile) as store:
         classified = classify_rows(store, rows)
-        segments = plan_segments(store, classified)
-        unresolvable = {c.channel_id for c in classified if c.outcome == "unresolvable"}
-        for channel_id in sorted(i for i in unresolvable if i is not None):
-            log.warning(
-                "fetch-media: channel %s has no stored username and cannot be resolved; "
-                "its rows are reported unresolvable", channel_id,
-            )
+        segments = plan_segments(classified)
         _print_plan(classified, segments)
         if dry_run:
             return

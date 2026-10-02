@@ -13,7 +13,7 @@ list up front, naming every bad line: nothing is fetched from a half-parsed
 list.
 
 `classify_rows` then decides, offline against the store, what can still
-happen to each row (`already_stored`, `unresolvable`, ...), and
+happen to each row (`already_stored`, `not_in_store`, ...), and
 `plan_segments` groups the rows that remain `pending` into the ordered
 `(priority, channel)` passes the driver runs (`fetch_media.py`).
 """
@@ -42,7 +42,7 @@ _LINK_USER_RE = re.compile(
 
 # The outcome vocabulary of a fetch-media report (docs/features/fetch-media.md).
 OFFLINE_OUTCOMES = (
-    "duplicate_row", "not_in_store", "deleted", "no_media", "unresolvable",
+    "duplicate_row", "not_in_store", "deleted", "no_media",
     "already_stored", "pending",
 )
 
@@ -199,7 +199,7 @@ def _global_indexes(store: Store) -> tuple[dict[tuple[str, int], tuple[str, str]
 
 def classify_rows(store: Store, rows: Iterable[ListRow]) -> list[ClassifiedRow]:
     """Offline outcome for every row, first match wins:
-    `duplicate_row`, `not_in_store`, `deleted`, `no_media`, `unresolvable`,
+    `duplicate_row`, `not_in_store`, `deleted`, `no_media`,
     `already_stored`, else `pending`. No network, no gateway."""
     index, stored_uris = _global_indexes(store)
     usernames = {
@@ -238,12 +238,6 @@ def classify_rows(store: Store, rows: Iterable[ListRow]) -> list[ClassifiedRow]:
         if (msg["media_kind"] or "").lower() not in DOWNLOADABLE_KINDS:
             out.append(ClassifiedRow(row, "no_media", uri, channel_id, declared))
             continue
-        chan = store.conn.execute(
-            "SELECT username FROM channels WHERE id = ?", (channel_id,)
-        ).fetchone()
-        if chan is None or not chan["username"]:
-            out.append(ClassifiedRow(row, "unresolvable", uri, channel_id, declared))
-            continue
         key = content_key(media)
         if uri in stored_uris or (key is not None and key in index):
             out.append(ClassifiedRow(
@@ -266,7 +260,6 @@ class Segment:
 
     priority: str | None
     channel_id: int
-    username: str
     rows: list[ClassifiedRow] = field(default_factory=list)
 
     @property
@@ -274,13 +267,9 @@ class Segment:
         return sorted({c.row.msg_id for c in self.rows})
 
 
-def plan_segments(store: Store, classified: Iterable[ClassifiedRow]) -> list[Segment]:
+def plan_segments(classified: Iterable[ClassifiedRow]) -> list[Segment]:
     """Group `pending` rows by `(priority, channel_id)` in order of first
-    appearance."""
-    usernames = {
-        r["id"]: r["username"]
-        for r in store.conn.execute("SELECT id, username FROM channels")
-    }
+    appearance. The channel id is the address (#68 amendment): no handle."""
     segments: dict[tuple[str | None, int], Segment] = {}
     for c in classified:
         if c.outcome != "pending":
@@ -289,8 +278,6 @@ def plan_segments(store: Store, classified: Iterable[ClassifiedRow]) -> list[Seg
         key = (c.row.priority, c.channel_id)
         seg = segments.get(key)
         if seg is None:
-            seg = segments[key] = Segment(
-                c.row.priority, c.channel_id, usernames[c.channel_id]
-            )
+            seg = segments[key] = Segment(c.row.priority, c.channel_id)
         seg.rows.append(c)
     return list(segments.values())
