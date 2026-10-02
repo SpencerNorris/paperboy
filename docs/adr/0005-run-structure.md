@@ -134,10 +134,12 @@ Option A, with structural-marker inference for legacy rows.
 - `fetch-media` (#68) adds two recipe-written raw kinds so runs that carry no
   `channel` phase, or whose media phase is scoped, still replay exactly.
   `ChannelContextReused` (`{channel_id, source_run_id}`, no access hash) marks a
-  media-only segment run that reused a channel resolved earlier in the same
-  process; replay finds the source run's `ResolvedPeer` for the access hash and
-  the target spelling, and runs only `media`. `MediaSelection` (`{msg_ids}`)
-  records the ids a scoped media phase walked, so replay walks the same rows
+  media-only segment run that reused a channel established earlier in the same
+  process; replay reads the access hash from the source run's `ChatFull` and
+  runs only `media`. `MediaSelection` (`{channel_id, msg_ids}`) records the
+  channel and the ids a scoped media phase walked (written just before the
+  phase, so its presence plus the channel's `ChatFull` says the phase ran),
+  so replay walks the same rows
   instead of re-deriving dedup custody rows for messages that run never
   considered. Phase detection also no longer infers `history` for a run with
   no history evidence (no message and no `getChannelDifference` raw), which

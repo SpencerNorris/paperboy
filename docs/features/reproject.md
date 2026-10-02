@@ -197,22 +197,34 @@ operator can eyeball the correction before swapping files.
 
 ## Replaying `fetch-media` runs (#68)
 
-A `fetch-media` segment is an ordinary run with two differences that replay
-must honour. (1) A segment that reuses an already-resolved channel has no
-`channel` phase and no `ResolvedPeer` of its own; it carries a
-`ChannelContextReused` marker, and `reproject` replays it as a media-only run:
-the channel id and tier come from the marker, the access hash and the target
-spelling from the *source* run's `ResolvedPeer` (an unknown or unresolved
-source run is a `ReprojectSourceError`, never guessed). Under
+A `fetch-media` segment is an ordinary run (the standard `channel` + `media`
+collectors, targeting the channel id) with two differences that replay must
+honour. (1) A segment that reuses an already-established channel has no
+`channel` phase; it carries a `ChannelContextReused` marker, and `reproject`
+replays it as a media-only run: the channel id and tier come from the marker,
+the access hash from the *source* run's `ChatFull` for that channel (it holds
+the channel object whichever Step A route got the run in, so a source run that
+took route 1 and has no `ResolvedPeer` works; an unknown source run or one that
+never established the channel is a `ReprojectSourceError`, never guessed), and
+the target spelling from the source run's resolve records. Under
 `--include-target`/`--exclude-target` the marker's channel id decides. (2) A
-media phase scoped to specific ids records them as a `MediaSelection` raw, and
-replay walks only those ids, so a repost that the live run never considered
-gets no dedup custody row on replay. Phase detection no longer infers
+media phase scoped to specific ids records `MediaSelection` `{channel_id,
+msg_ids}` (legacy: `{msg_ids}`), written just before the media phase and only
+when the channel was established; replay walks only those ids, so a repost that
+the live run never considered gets no dedup custody row on replay.
+
+**Phase rule: replay what executed, not what was intended.** `media` is a
+replayed phase iff the run has `MediaDownload` rows or its `MediaSelection`
+names a channel for which the run recorded a `ChatFull`
+(`ReplaySource.channel_established`; a granted `ChannelAccess` always precedes
+that `ChatFull`). A granted segment with zero downloads therefore still
+replays; a refused one does not. Phase detection also no longer infers
 `history` for a run with no message and no `getChannelDifference` raw (a
-`--phases channel` run, a first `fetch-media` segment): replaying it appended
-a synthetic difference raw the source did not have. Tests:
-`tests/test_reproject_fetch_media.py` (round-trip parity over a two-channel,
-four-segment run with a repost that is off the list).
+`--phases channel` run, a fetch-media segment). The paperboy-authored records
+keep their stored `observed_at` through `ReplayClock.pin_json`. Tests:
+`tests/test_reproject_fetch_media.py` (round-trip parity over a normal, a
+refused and a zero-download segment, a legacy selection, and the collector
+lists).
 
 ## Splitting a mixed profile (#70)
 

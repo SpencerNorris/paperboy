@@ -138,23 +138,27 @@ messages that can span many channels. In plain terms:
 1. **Read the list.** Each row names one message. If any row is malformed the
    whole command stops before touching anything and says which lines.
 2. **Sort the rows offline.** Against what is already stored, every row is
-   labelled: already downloaded, not in the store, no media, deleted, a
-   channel we cannot look up by name, or still to do. No network is used, so
-   `--dry-run` can show this for the whole list for free.
+   labelled: already downloaded, not in the store, no media, deleted,
+   excluded (`--exclude-target` names its channel), or still to do. No network
+   is used, so `--dry-run` can show this for the whole list, channel by
+   channel, for free.
 3. **Cut the to-do rows into segments.** One segment is "this priority, this
    channel", in the order they first appear in the list, so all the important
    rows are fetched before the rest. Inside a segment files come in message-id
    order.
-4. **Run each segment as an ordinary collect run** over the same session. A
-   channel is looked up by name once per command (that call is one of
-   Telegram's most rate-limited); later segments of the same channel reuse the
-   result and leave a small note in the receipts, `ChannelContextReused`
-   (channel id and the run that did the lookup, never the access hash). Each
-   segment also notes which message ids it was allowed to fetch
-   (`MediaSelection`).
+4. **Run each segment as an ordinary collect run** over the same session,
+   reaching the channel by its id the same way `collect` does (a key we
+   already saved, a message that mentioned it, or a handle we can verify; no
+   name lookup is needed when we hold a key). A channel we cannot reach is
+   marked `no_access` for its rows and the command goes on. Later segments of
+   a channel reuse the first one's access and leave a small note,
+   `ChannelContextReused` (channel id and the run that got access, never the
+   key). Each segment also notes which channel and which message ids it was
+   allowed to fetch (`MediaSelection`), just before the download starts.
 5. **Replay follows the notes.** `reproject` reads those two notes to rebuild
    exactly the same `media` and `custody_log` rows, offline, with no new
-   tables.
+   tables. It replays a download only where access was actually granted: a
+   channel that was refused leaves nothing to replay.
 6. **A report for every row.** The report CSV has one line per input row and
    what happened to it. If the command stops early (a hard stop, the disk
    floor, a long Telegram wait) the rows it did not reach say

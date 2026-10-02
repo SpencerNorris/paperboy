@@ -1,10 +1,14 @@
 # `fetch-media` — download media for an ordered cross-channel list (#68)
 
-Spec: `docs/superpowers/specs/2026-09-28-media-list-fetch-design.md`. Plan:
-`docs/superpowers/plans/2026-09-29-media-list-fetch.md`. Shared constraints and
+Spec: `docs/superpowers/specs/2026-09-28-media-list-fetch-design.md` (§9 is
+the by-id amendment and supersedes §3.3/§4). Plans:
+`docs/superpowers/plans/2026-09-29-media-list-fetch.md` (first design, handle
+based) and `docs/superpowers/plans/2026-10-01-media-list-fetch-by-id.md` (the
+by-id delta). Shared constraints and
 the live smoke protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 Plain-language walk-through: `docs/how-it-works.md` §6. **No migration** (schema
-unchanged); two recipe-written raw kinds are new (see "Replay").
+unchanged); two recipe-written raw kinds are new (see "Replay"). Builds on #84
+(collect by channel id).
 
 ## Purpose
 
@@ -16,6 +20,7 @@ every row.
 ```
 paperboy fetch-media LIST [--profile P] [--media-max-mb N] [--media-min-free-gb G]
                           [--report OUT.csv] [--dry-run] [--unsafe]
+                          [--exclude-target T ...]
                           [--max-rpc N] [--pacing-factor F] [--max-flood-sleep S]
 ```
 
@@ -34,7 +39,17 @@ paperboy fetch-media LIST [--profile P] [--media-max-mb N] [--media-min-free-gb 
   every offending line number.
 
 Username links resolve **offline** through `channels.username`; a username the
-store never saw is `not_in_store`.
+store never saw is `not_in_store`. Nothing is ever looked up on Telegram by
+handle for a list row: the channel id is the address (see "Segments and Step A").
+
+`--exclude-target T` (repeatable; the forms `reproject --exclude-target` takes:
+a handle, `123`, `-100123`, `t.me/c/123`) marks every row of that channel
+`excluded`, offline, with no network. A channel's linked discussion group
+follows its parent (via the stored `linked_group` edge). It is a guard for
+running against a store that still holds an investigation the operator does not
+want pulled. A target the store has never seen, or one that is not a channel
+handle/id, exits 1 before anything else is done (excluding nothing by accident
+would download what was meant to be kept out).
 
 ## Outcomes
 
@@ -43,25 +58,25 @@ Offline classification (no network), first match wins:
 | Outcome | Meaning |
 |---|---|
 | `duplicate_row` | An earlier row already names this message. |
+| `excluded` | The row's channel (or the linked group of one) is named by `--exclude-target`. Tested right after `duplicate_row`, so it wins over every later label, `already_stored` included. |
 | `not_in_store` | No `messages` row (or an unknown username). |
 | `deleted` | The message is tombstoned (`deleted_at`); the media collector never selects these. |
 | `no_media` | The message has no downloadable media (photo/document only). |
-| `unresolvable` | The channel has no stored username (e.g. a linked discussion group): paperboy does not persist access hashes, so it can only reach a channel by resolving its username this run. Reported once per channel as a WARNING. |
 | `already_stored` | The Telegram document/photo id is already in `media` (anywhere in the store, not only this channel), or this message already has a `media` / `custody_log` row. Reposts share content ids, so this count can exceed the catalogue's own "already downloaded" flag. |
 | `pending` | To fetch. |
 
 After fetching, a `pending` row becomes one of the collector's outcomes:
 `downloaded`, `duplicate` (same bytes/content id as a stored file; custody
 recorded), `too_large` (`--media-max-mb`), `size_mismatch`, `unavailable`,
-`skipped` (per-file skip, e.g. an expired file reference), or `not_attempted`
-(the command stopped first). `unresolvable`, `no_media`, `too_large`, ... are
-final; only `not_attempted` makes the exit code 1.
+`skipped` (per-file skip, e.g. an expired file reference), `no_access` (the
+channel could not be reached at run time, below), or `not_attempted` (the
+command stopped first). `excluded`, `no_media`, `no_access`, `too_large`, ...
+are final; only `not_attempted` makes the exit code 1.
 
-Classification order is deliberate: `unresolvable` is tested before
-`already_stored`, so a linked-group row reads `unresolvable` even if its file is
-stored.
+There is no `unresolvable`: a channel no longer needs a stored username (a
+linked discussion group is fetched like any other channel, by id).
 
-## Segments and the one-resolve rule
+## Segments and Step A (by channel id)
 
 Pending rows are grouped by `(priority, channel_id)` in order of first
 appearance of the pair, so every P1 segment runs before any P2 segment (without
@@ -69,22 +84,37 @@ a `priority` column: one segment per channel). Within a segment the collector
 fetches by ascending message id (`media_msgs` is a set); list order decides only
 the order of segments.
 
-Each segment is one ordinary `collect_channel` run over `channel` + `media`, with
-`media_msgs` narrowed to the segment's ids. Budget, guardrails, dedup, custody,
-streaming, `--media-max-mb` and the free-disk floor therefore apply unchanged. One
-gateway (one MTProto session, one `Budget`) serves the whole command, so
-`--max-rpc` bounds it all. `contacts.resolveUsername` (5 s base, 10 s at the
-default `--pacing-factor 2`) runs **once per channel per command**: the first
-segment of a channel runs `channel`; later ones receive the cached
-`ChannelContext` (in-process only, never persisted) and skip it. A resolve that
-answers with a *different* channel id than the segment's is treated as a channel
-stop, never fetched under the wrong id.
+Each segment is one ordinary `collect_channel` run over the **standard**
+`ChannelCollector` and `MediaCollector`, with the **id target** `<channel_id>`
+(from the list row) and `media_msgs` narrowed to the segment's ids. `channel`
+therefore reaches the channel through #84's Step A (saved key, then a message
+that referenced it, then a verified stored handle; see
+`docs/features/collect-channel.md`), records a `ChannelAccess` receipt, and
+refuses an answer for any other id (`full_chat.id == requested id`). A handle
+that has changed hands cannot redirect a segment, and no wrapper collector
+exists: **there is no fetch-media-only collector in the live or the replay
+list**, so the two cannot drift. Budget, guardrails, dedup, custody, streaming,
+`--media-max-mb` and the free-disk floor apply unchanged. One gateway (one
+MTProto session, one `Budget`) serves the whole command, so `--max-rpc` bounds it
+all.
 
+A channel is established once per command: later segments of it receive the
+cached `ChannelContext` (in-process only, never persisted) and skip `channel`,
+appending one `ChannelContextReused` marker instead. With a saved key (the
+usual case) a list run makes no `contacts.resolveUsername` call at all.
+
+Why identity holds: the only input that shapes which channel a segment fetches
+from is its id, and that id is in the raw log twice over (the `ChannelAccess`
+receipt and the `MediaSelection` below). The old design's input, "the handle
+must still be channel N", lived only in memory.
 ## Stop policy
 
-* `channel` phase **skip** (private, renamed handle, handle resolving to another
-  channel): that channel's remaining rows stay `not_attempted`, WARNING once, the
-  command continues with other channels.
+* `channel` phase **skip** (Step A found no route, every route was refused, the
+  channel is private): the segment's rows **and every later segment of that
+  channel** are `no_access` (reason in the report's `reason` column), one
+  WARNING per channel carries the reason (#84's route message), and the command
+  continues with other channels. Later segments are not retried: the routes
+  come from the store, which does not change within one command.
 * **Any** `PhaseStop` in the `channel` phase (e.g. FLOOD_WAIT on
   `contacts.resolveUsername`) or the `media` phase (free-disk floor, a FLOOD_WAIT over
   `--max-flood-sleep`, a sink write error, repeated failures) or a `HardStop`
@@ -103,14 +133,16 @@ stop, never fetched under the wrong id.
 
 `--report` (default `<data_dir>/<profile>/fetch-media-<YYYYmmddTHHMMSSZ>.csv`),
 opened for writing **before** any segment (an unwritable path fails immediately),
-rewritten at the end: `line_no,uri,outcome,sha256,key` for every input row in list
-order. `uri` is normalised to `tg:msg:<channel_id>/<msg_id>` where resolvable.
+rewritten at the end: `line_no,uri,outcome,sha256,key,reason` for every input row
+in list order. `reason` is empty except for `no_access` (why the channel could
+not be reached) and `excluded`. `uri` is normalised to `tg:msg:<channel_id>/<msg_id>` where resolvable.
 `sha256`/`key` (the profile-relative media key, ADR-0007) are filled for
 `downloaded`, `duplicate` and `already_stored` rows.
 
 `--dry-run` runs parse and classify only (no keychain, no gateway, no doctor, no
-report) and prints two tables: outcome / rows / declared GB, and the segment plan
-(priority, channel **id**, rows, declared GB). A list with **zero pending rows**
+report) and prints three tables: outcome / rows / declared GB; channel **id** x
+outcome (what each channel would cost, before any network call); and the segment
+plan (priority, channel **id**, rows, declared GB). A list with **zero pending rows**
 (e.g. a re-run) builds no gateway either. Exit code: 0 iff no row is
 `not_attempted`.
 
@@ -120,14 +152,35 @@ Each segment is a normal run, with two additions so `reproject` reproduces it
 (see `docs/features/reproject.md`, "Replaying `fetch-media` runs", and ADR-0005):
 
 * `ChannelContextReused` `{channel_id, source_run_id}` (no access hash) opens a
-  segment that reused a channel; replay runs it as media-only.
-* `MediaSelection` `{msg_ids}` is written whenever a media phase is scoped with
-  `media_msgs`; replay walks only those ids. (Found by the parity test: a first
-  segment replayed with `duplicates=2` because the repost of a listed file was
-  walked; the live run never considered it.)
+  segment that reused a channel; replay runs it as media-only, rebuilding the
+  context from the source run's `ChatFull` (which carries the channel object
+  whichever route got the run in; a first segment that took route 1 has no
+  `ResolvedPeer`).
+* `MediaSelection` `{channel_id, msg_ids}` is written whenever a media phase is
+  scoped with `media_msgs`, **just before the media phase runs** and only if the
+  channel was established; replay walks only those ids. Pre-amendment runs carry
+  `{msg_ids}` only and replay as before (the replayed record is minted in the
+  current shape).
+* Both are paperboy-authored, not gateway responses, and the recipe may write
+  them between gateway calls. `ReplayClock.pin_json` keeps their stored
+  `observed_at` across the re-batching every served response does.
+
+**Rule (spec 9.3): replay what executed, not what was intended.** `media`
+replays for a run iff it has `MediaDownload` rows, or its `MediaSelection` names
+a channel the run established (a `ChatFull` for that id, which a granted
+`ChannelAccess` always precedes). So: access granted but zero files downloaded
+(every row a dedup) still replays media and re-derives the custody rows; access
+refused (no route, or a handle that now answers for another channel) replays
+channel only and leaves no media or custody rows, exactly as live.
 
 ## Deviations from the plan / spec
 
+* By-id amendment (spec §9, orchestrator decisions of 2026-10-01): the
+  `_ExpectChannel` guard, `Segment.username`, `resolve_by_target` and the
+  `unresolvable` outcome are gone; `excluded` and `no_access` are new; the
+  report gained a `reason` column; `MediaSelection` moved from "before any
+  phase" to "just before media" and names the channel, which needed
+  `ReplayClock.pin_json`.
 * Per-row outcomes are a caller-owned `MediaCollector(outcomes=dict)` instead of
   `CollectResult.outcomes` (a `DiskFloorStop`/`HardStop` discards the result, yet
   the report needs the rows finished before the stop). Orchestrator decision 3.
@@ -140,8 +193,14 @@ Each segment is a normal run, with two additions so `reproject` reproduces it
 
 ## Known limitations
 
-* Linked-group rows (no username of their own) are `unresolvable`; resolving them
-  through the parent's `getFullChannel` chats vector is out of scope (spec §8).
+* A channel for which Step A finds no route and has nothing to try (route 4,
+  nothing tried) writes no `ChannelAccess`, so that segment's run holds only the
+  self `User` raw and `reproject` skips it with its "no resolve records"
+  WARNING (#84 behaviour). Media and custody are unaffected: the segment
+  downloaded nothing.
+* Not fixed here, orthogonal (`fetch-media` never runs `history`):
+  `has_history_evidence` can read a history phase that left no raw trace as
+  never-run. The orchestrator files it as its own issue.
 * Within a segment files arrive in id order, not list order.
 * A segment whose files are all duplicates leaves no `MediaDownload` raw. Its
   dedup custody rows are still reproduced, because replay walks the recorded
