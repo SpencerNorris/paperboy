@@ -11,11 +11,13 @@ from paperboy.ids import utc_now_iso
 from paperboy.media_list import (
     MediaListError,
     classify_rows,
+    excluded_channel_ids,
     parse_media_list,
     plan_segments,
 )
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
+from paperboy.store.edges import add_edge
 from paperboy.store.messages import mark_deleted, upsert_message
 from paperboy.store.peers import upsert_peer
 
@@ -221,3 +223,48 @@ def test_private_link_without_message_id_is_malformed(tmp_path):
     with pytest.raises(MediaListError) as exc:
         parse_media_list(path)
     assert exc.value.line_nos == [2]
+
+
+def test_exclude_target_marks_rows_excluded_offline(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_channel(st, 20, "chan_b")
+        seed_msg(st, 10, 1, doc_id=1001)   # would be pending
+        seed_msg(st, 10, 2, doc_id=1002)   # would be already_stored
+        record_media(st, "tg:msg:10/2", "a" * 64)
+        seed_msg(st, 20, 7, photo_id=77)
+        path = _write(
+            tmp_path, "l.txt",
+            "tg:msg:10/1\ntg:msg:10/2\ntg:msg:10/999\n"  # not_in_store, but excluded first
+            "https://t.me/chan_a/1\n"                       # username row: resolved, then excluded
+            "tg:msg:20/7\n",
+        )
+        out = classify_rows(
+            st, parse_media_list(path), excluded_ids=frozenset({10})
+        )
+    assert [c.outcome for c in out] == [
+        "excluded", "excluded", "excluded", "excluded", "pending",
+    ]
+    assert out[3].uri == "tg:msg:10/1" and out[3].channel_id == 10
+
+
+def test_excluded_channel_ids_follows_the_linked_group(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_channel(st, 77, None)
+        seed_channel(st, 20, "chan_b")
+        add_edge(st, "tg:channel:10", "linked_group", "tg:channel:77",
+                 utc_now_iso(), "stranger", None, None)
+        for spec in ("@chan_a", "chan_a", "10", "-10010", "t.me/c/10"):
+            assert excluded_channel_ids(st, [spec]) == frozenset({10, 77}), spec
+        assert excluded_channel_ids(st, ["@chan_b", "@chan_a"]) == frozenset({10, 20, 77})
+        assert excluded_channel_ids(st, []) == frozenset()
+
+
+@pytest.mark.parametrize("spec", ["@nobody", "999", "t.me/+AbCdEf123", "+15551234567", "#tag"])
+def test_excluded_channel_ids_rejects_unknown_or_non_channel_specs(tmp_path, spec):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        with pytest.raises(MediaListError) as exc:
+            excluded_channel_ids(st, [spec])
+    assert spec in str(exc.value)

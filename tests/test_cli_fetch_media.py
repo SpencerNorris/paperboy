@@ -171,3 +171,41 @@ def test_gateway_build_failure_still_writes_the_report(tmp_path, monkeypatch):
     assert result.exit_code == 1
     with report.open(newline="") as fh:
         assert {r["outcome"] for r in csv.DictReader(fh)} == {"not_attempted"}
+
+
+def test_dry_run_prints_per_channel_counts_and_excludes(tmp_path, monkeypatch):
+    path = _prepare(tmp_path)
+    _forbid_network(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--exclude-target", "10"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 0, result.stdout
+    out = result.stdout
+    assert "per channel" in out.lower()
+    # Channel 10 has 3 of the 5 rows, all excluded; channel 20's 2 are pending.
+    per_channel = out[out.lower().index("per channel"):]
+    header = next(ln for ln in per_channel.splitlines() if "excluded" in ln and "pending" in ln)
+    cols = [c.strip() for c in header.strip("┃│ ").replace("┃", "│").split("│")]
+    rows = {}
+    for ln in per_channel.splitlines():
+        cells = [c.strip() for c in ln.strip().strip("│").split("│")]
+        if len(cells) == len(cols) and cells[0] in ("10", "20"):
+            rows[cells[0]] = dict(zip(cols, cells, strict=True))
+    assert rows["10"]["excluded"] == "3" and rows["10"]["pending"] == "0"
+    assert rows["20"]["pending"] == "2" and rows["20"]["excluded"] == "0"
+    assert "chan_a" not in out
+    assert "unresolvable" not in out
+
+
+def test_unknown_exclude_target_exits_1_before_anything_else(tmp_path, monkeypatch):
+    path = _prepare(tmp_path)
+    _forbid_network(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--exclude-target", "999"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 1
+    assert "999" in result.stdout

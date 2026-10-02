@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from paperboy.collectors.media import DOWNLOADABLE_KINDS, content_key, recorded_size
-from paperboy.ids import msg_uri
+from paperboy.ids import msg_uri, parse_uri
+from paperboy.store.channels import find_channel_id
+from paperboy.targets import TargetKind, UnsupportedTarget, parse_target
 
 if TYPE_CHECKING:
     from paperboy.store.db import Store
@@ -42,7 +44,7 @@ _LINK_USER_RE = re.compile(
 
 # The outcome vocabulary of a fetch-media report (docs/features/fetch-media.md).
 OFFLINE_OUTCOMES = (
-    "duplicate_row", "not_in_store", "deleted", "no_media",
+    "duplicate_row", "excluded", "not_in_store", "deleted", "no_media",
     "already_stored", "pending",
 )
 
@@ -197,9 +199,43 @@ def _global_indexes(store: Store) -> tuple[dict[tuple[str, int], tuple[str, str]
     return index, uris
 
 
-def classify_rows(store: Store, rows: Iterable[ListRow]) -> list[ClassifiedRow]:
+def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
+    """The channel ids `--exclude-target` names, offline: each spec is a handle
+    or a channel id (the forms `reproject` takes), looked up in the store, plus
+    the channel's linked discussion group (a group follows its parent, #70).
+    Raises `MediaListError` for a spec that does not parse, is not a channel
+    handle/id, or names a channel the store has never seen: excluding nothing
+    by accident would download what the operator meant to keep out."""
+    ids: set[int] = set()
+    for spec in specs:
+        try:
+            target = parse_target(spec)
+        except UnsupportedTarget as exc:
+            raise MediaListError(f"--exclude-target {spec!r}: {exc}") from None
+        if target.kind not in (TargetKind.USERNAME, TargetKind.PEER_ID):
+            raise MediaListError(
+                f"--exclude-target {spec!r}: expected a channel handle or id"
+            )
+        channel_id = find_channel_id(store, target)
+        if channel_id is None:
+            raise MediaListError(f"--exclude-target {spec!r}: no such channel in this store")
+        ids.add(channel_id)
+        for edge in store.conn.execute(
+            "SELECT object_uri FROM edges WHERE subject_uri = ? AND predicate = 'linked_group'",
+            (f"tg:channel:{channel_id}",),
+        ):
+            kind, (group_id,) = parse_uri(edge["object_uri"])
+            if kind == "channel":
+                ids.add(group_id)
+    return frozenset(ids)
+
+
+def classify_rows(
+    store: Store, rows: Iterable[ListRow], *, excluded_ids: frozenset[int] = frozenset()
+) -> list[ClassifiedRow]:
     """Offline outcome for every row, first match wins:
-    `duplicate_row`, `not_in_store`, `deleted`, `no_media`,
+    `duplicate_row`, `excluded` (its channel is in `excluded_ids`; a username
+    row is resolved first), `not_in_store`, `deleted`, `no_media`,
     `already_stored`, else `pending`. No network, no gateway."""
     index, stored_uris = _global_indexes(store)
     usernames = {
@@ -220,6 +256,9 @@ def classify_rows(store: Store, rows: Iterable[ListRow]) -> list[ClassifiedRow]:
                 out.append(ClassifiedRow(row, "not_in_store", row.uri))
                 continue
         uri = msg_uri(channel_id, row.msg_id)
+        if channel_id in excluded_ids:
+            out.append(ClassifiedRow(row, "excluded", uri, channel_id))
+            continue
         if (channel_id, row.msg_id) in seen:  # a link and a tg:msg: for one message
             out.append(ClassifiedRow(row, "duplicate_row", uri, channel_id))
             continue

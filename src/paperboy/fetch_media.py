@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from paperboy.store.db import Store
 
 REPORT_COLUMNS = ("line_no", "uri", "outcome", "sha256", "key", "reason")
+EXCLUDED_REASON = "channel excluded by --exclude-target"
 # Outcomes for which the report names the stored file.
 _HAS_FILE = frozenset({"downloaded", "duplicate", "already_stored"})
 
@@ -90,7 +91,11 @@ class FetchSummary:
 def initial_results(classified: list[ClassifiedRow]) -> list[RowResult]:
     """Offline outcomes as final; `pending` rows start as `not_attempted`."""
     return [
-        RowResult(c, "not_attempted" if c.outcome == "pending" else c.outcome)
+        RowResult(
+            c,
+            "not_attempted" if c.outcome == "pending" else c.outcome,
+            EXCLUDED_REASON if c.outcome == "excluded" else "",
+        )
         for c in classified
     ]
 

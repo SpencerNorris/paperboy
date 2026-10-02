@@ -370,3 +370,27 @@ async def test_inherited_media_since_does_not_filter_list_rows(tmp_path):
         )
     assert summary.complete
     assert "not_attempted" not in {r["outcome"] for r in _report(report)}
+
+
+@pytest.mark.asyncio
+async def test_excluded_rows_are_never_fetched_and_say_why(tmp_path):
+    gw = _gateway(BYTES)
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        path = tmp_path / "list.csv"
+        path.write_text(LIST, encoding="utf-8")
+        classified = classify_rows(
+            st, parse_media_list(path), excluded_ids=frozenset({10})
+        )
+        summary = await fetch_media(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+    assert summary.complete
+    rows = _report(report)
+    assert [r["outcome"] for r in rows] == [
+        "excluded", "downloaded", "excluded", "downloaded", "excluded",
+    ]
+    assert rows[0]["reason"] == "channel excluded by --exclude-target"
+    assert [i["channel_id"] for i in gw.full_channel_inputs] == [20]
+    assert gw.download_media_calls == [11, 12]

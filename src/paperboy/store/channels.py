@@ -8,6 +8,7 @@ import hashlib
 
 from paperboy.ids import channel_uri, primary_username
 from paperboy.store.db import Store, dumps
+from paperboy.targets import Target, TargetKind
 
 # `min` is a whole-object serialization marker (this payload was a reduced
 # object), not a channel property — it is recorded on `peers.is_min` and
@@ -16,6 +17,20 @@ from paperboy.store.db import Store, dumps
 # they carry real metadata about a specific flag rather than misdescribing the
 # channel.
 _FLAG_EXCLUDE = frozenset({"min"})
+
+
+def find_channel_id(store: Store, target: Target) -> int | None:
+    """The locally stored channel a target names, offline: by id for the id forms
+    (#84), else by username. `None` when the store has never seen it."""
+    if target.kind is TargetKind.PEER_ID:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE id = ?", (int(target.value),)
+        ).fetchone()
+    else:
+        row = store.conn.execute(
+            "SELECT id FROM channels WHERE username = ?", (target.value.lstrip("@"),)
+        ).fetchone()
+    return row["id"] if row else None
 
 
 def channel_flags(full: dict, chan: dict) -> dict[str, bool]:

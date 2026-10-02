@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ from paperboy.media_list import (
     MediaListError,
     Segment,
     classify_rows,
+    excluded_channel_ids,
     parse_media_list,
     plan_segments,
 )
@@ -44,7 +46,8 @@ from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
 from paperboy.reproject import reproject as reproject_run
-from paperboy.targets import Target, TargetKind, UnsupportedTarget, parse_target
+from paperboy.store.channels import find_channel_id
+from paperboy.targets import Target, UnsupportedTarget, parse_target
 
 app = typer.Typer(
     add_completion=False,
@@ -92,17 +95,8 @@ def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
 
 
 def _find_channel_id(store, target: Target) -> int | None:
-    """The locally stored channel a `status`/`export` target names, offline:
-    by id for the id forms (#84), else by username."""
-    if target.kind is TargetKind.PEER_ID:
-        row = store.conn.execute(
-            "SELECT id FROM channels WHERE id = ?", (int(target.value),)
-        ).fetchone()
-    else:
-        row = store.conn.execute(
-            "SELECT id FROM channels WHERE username = ?", (target.value.lstrip("@"),)
-        ).fetchone()
-    return row["id"] if row else None
+    """`status`/`export`: the locally stored channel a target names."""
+    return find_channel_id(store, target)
 
 
 @app.command()
@@ -381,9 +375,9 @@ def _gb(nbytes: int) -> str:
 
 
 def _print_plan(classified: list[ClassifiedRow], segments: list[Segment]) -> None:
-    """The two offline tables: outcome -> rows -> declared GB, and the segment
-    plan. Channels appear by numeric id only (logs/consoles reference targets
-    by id)."""
+    """The three offline tables: outcome -> rows -> declared GB, channel x
+    outcome, and the segment plan. Channels appear by numeric id only
+    (logs/consoles reference targets by id)."""
     by_outcome: dict[str, list[ClassifiedRow]] = {}
     for c in classified:
         by_outcome.setdefault(c.outcome, []).append(c)
@@ -397,6 +391,25 @@ def _print_plan(classified: list[ClassifiedRow], segments: list[Segment]) -> Non
     total_bytes = sum(c.declared_bytes or 0 for c in classified)
     outcomes.add_row("total", str(len(classified)), _gb(total_bytes))
     console.print(outcomes)
+
+    # Per channel (by id) x outcome, over the outcomes that occur: the operator's
+    # view of what each channel will cost before anything is fetched.
+    seen_outcomes = [n for n in OFFLINE_OUTCOMES if n in by_outcome]
+    per_channel: dict[str, Counter[str]] = {}
+    for c in classified:
+        label = str(c.channel_id) if c.channel_id is not None else "-"
+        per_channel.setdefault(label, Counter())[c.outcome] += 1
+    channels = Table(title="fetch-media: per channel (rows by outcome)")
+    channels.add_column("channel id", justify="right")
+    for name in seen_outcomes:
+        channels.add_column(name, justify="right")
+    channels.add_column("total", justify="right")
+    for label in sorted(per_channel, key=lambda x: (x == "-", int(x) if x != "-" else 0)):
+        counts = per_channel[label]
+        channels.add_row(
+            label, *(str(counts[n]) for n in seen_outcomes), str(sum(counts.values()))
+        )
+    console.print(channels)
 
     plan = Table(title="fetch-media: segment plan (list order)")
     for column in ("segment", "priority", "channel id", "rows", "declared GB"):
@@ -463,6 +476,15 @@ def fetch_media_cmd(
                  "(default <data_dir>/<profile>/fetch-media-<timestamp>.csv).",
         ),
     ] = None,
+    exclude_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-target",
+            help="Never fetch rows of this channel (repeatable; same forms as "
+                 "`reproject`: handle or channel id; a linked group follows its parent). "
+                 "Those rows are reported `excluded`.",
+        ),
+    ] = None,
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help="Classify offline and print the plan; no keychain, no network, no report.",
@@ -498,7 +520,15 @@ def fetch_media_cmd(
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
     with composition.build_store(settings, profile) as store:
-        classified = classify_rows(store, rows)
+        try:
+            excluded_ids = excluded_channel_ids(store, exclude_target or [])
+        except MediaListError as exc:
+            console.print(f"[red]{escape(str(exc))}[/]")
+            raise typer.Exit(code=1) from None
+        if excluded_ids:
+            log.info("fetch-media: excluding %d channel id(s): %s",
+                     len(excluded_ids), sorted(excluded_ids))
+        classified = classify_rows(store, rows, excluded_ids=excluded_ids)
         segments = plan_segments(classified)
         _print_plan(classified, segments)
         if dry_run:
