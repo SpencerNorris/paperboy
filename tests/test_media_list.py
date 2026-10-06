@@ -163,40 +163,76 @@ def record_media_custody(st, message_uri, sha, store):
 
 
 def test_classify_covers_every_offline_outcome(tmp_path):
+    """After #91 only `duplicate_row`, `excluded` and `pending` are offline
+    outcomes; the rest of the old vocabulary became flags on pending rows."""
     with Store.open(tmp_path / "p.sqlite") as st:
         seed_channel(st, 10, "chan_a")
         seed_channel(st, 20, "chan_b")
         seed_channel(st, 30, None)  # linked group: no username
-        seed_msg(st, 10, 1, doc_id=1001)                     # pending
-        seed_msg(st, 10, 2, doc_id=1002)                     # already_stored
+        seed_msg(st, 10, 1, doc_id=1001)                     # in store, media not held
+        seed_msg(st, 10, 2, doc_id=1002)                     # in store, media held
         record_media(st, "tg:msg:10/2", "a" * 64)
-        seed_msg(st, 10, 3, text_only=True)                  # no_media (geo)
-        seed_msg(st, 10, 4, doc_id=1004)                     # deleted
+        seed_msg(st, 10, 3, text_only=True)                  # in store, no media (geo)
+        seed_msg(st, 10, 4, doc_id=1004)                     # tombstoned in store
         mark_deleted(st, 10, 4, "update", utc_now_iso())
-        seed_msg(st, 30, 5, doc_id=1005)                     # pending (reached by id)
+        seed_msg(st, 30, 5, doc_id=1005)                     # reached by id
         seed_msg(st, 20, 6, doc_id=1002)                     # same file as 10/2, other channel
-        seed_msg(st, 20, 7, photo_id=77)                     # pending via username row
+        seed_msg(st, 20, 7, photo_id=77)                     # via username row
         path = _write(
             tmp_path, "l.txt",
-            "tg:msg:10/1\n"          # pending
-            "tg:msg:10/2\n"          # already_stored
-            "tg:msg:10/3\n"          # no_media
-            "tg:msg:10/4\n"          # deleted
+            "tg:msg:10/1\n"          # pending, in store
+            "tg:msg:10/2\n"          # pending, media_held
+            "tg:msg:10/3\n"          # pending, in store (a text post is still re-fetched)
+            "tg:msg:10/4\n"          # pending: tombstoned rows are re-fetched too
             "tg:msg:30/5\n"          # pending: no username needed, the id is the address
-            "tg:msg:20/6\n"          # already_stored: key held by ANOTHER channel's file
-            "tg:msg:10/999\n"        # not_in_store
+            "tg:msg:20/6\n"          # pending, media_held: key held by ANOTHER channel's file
+            "tg:msg:10/999\n"        # pending, not yet collected
             "https://t.me/Chan_B/7\n"  # username resolved offline -> pending
             "tg:msg:20/7\n"          # duplicate of the username row after resolution
-            "t.me/nobody/1\n"        # username not in store
+            "t.me/nobody/1\n"        # username the store never saw: needs_resolve
             "tg:msg:10/1\n",         # duplicate_row at parse time
         )
         out = classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
         assert [c.outcome for c in out] == [
-            "pending", "already_stored", "no_media", "deleted", "pending",
-            "already_stored", "not_in_store", "pending", "duplicate_row",
-            "not_in_store", "duplicate_row",
+            "pending", "pending", "pending", "pending", "pending", "pending",
+            "pending", "pending", "duplicate_row", "pending", "duplicate_row",
         ]
+        assert [c.in_store for c in out[:8]] == [
+            True, True, True, True, True, True, False, True,
+        ]
+        assert [c.media_held for c in out[:8]] == [
+            False, True, False, False, False, True, False, False,
+        ]
+        assert [c.needs_resolve for c in out] == [False] * 9 + [True, False]
         assert out[7].uri == "tg:msg:20/7" and out[7].channel_id == 20
+        assert out[9].uri == "t.me/nobody/1" and out[9].channel_id is None
+
+
+def test_unknown_username_makes_a_handle_segment(tmp_path):
+    """A handle row whose channel the store never saw is addressed by handle."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        path = _write(tmp_path, "l.txt", "t.me/Nobody/3\nt.me/nobody/1\ntg:msg:10/1\n")
+        segs = plan_segments(
+            classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
+        )
+    assert [(s.channel_id, s.username, s.msg_ids, s.media_ids) for s in segs] == [
+        (None, "nobody", [1, 3], [1, 3]),
+        (10, None, [1], [1]),
+    ]
+
+
+def test_segment_media_ids_exclude_held_rows(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_msg(st, 10, 1, doc_id=1001)
+        seed_msg(st, 10, 2, doc_id=1002)
+        record_media(st, "tg:msg:10/2", "a" * 64)
+        path = _write(tmp_path, "l.txt", "tg:msg:10/1\ntg:msg:10/2\ntg:msg:10/3\n")
+        segs = plan_segments(
+            classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
+        )
+    assert [(s.msg_ids, s.media_ids) for s in segs] == [([1, 2, 3], [1, 3])]
 
 
 def test_segments_group_by_priority_then_channel_in_first_appearance_order(tmp_path):
@@ -247,7 +283,7 @@ def test_exclude_target_marks_rows_excluded_offline(tmp_path):
         seed_msg(st, 20, 7, photo_id=77)
         path = _write(
             tmp_path, "l.txt",
-            "tg:msg:10/1\ntg:msg:10/2\ntg:msg:10/999\n"  # not_in_store, but excluded first
+            "tg:msg:10/1\ntg:msg:10/2\ntg:msg:10/999\n"  # not yet collected, but excluded first
             "https://t.me/chan_a/1\n"                       # username row: resolved, then excluded
             "tg:msg:20/7\n",
         )
@@ -301,19 +337,19 @@ def test_already_stored_is_per_store(tmp_path):
         rows = parse_media_list(path)
 
         local = classify_rows(st, rows, media_store=LocalMediaStore(tmp_path))
-        assert [c.outcome for c in local] == ["already_stored"]  # custody says local: no stat
+        assert [c.media_held for c in local] == [True]  # custody says local: no stat
 
         pending = classify_rows(st, rows, media_store=bucket_store)
-        assert [c.outcome for c in pending] == ["pending"]
+        assert [c.media_held for c in pending] == [False]
         assert client.bucket("bkt").calls["exists"] == 1  # one metadata check, no custody row
 
         client.bucket("bkt").objects[f"p/x/{key}"] = b"x"  # the object is there by hand
         held = classify_rows(st, rows, media_store=bucket_store)
-        assert [c.outcome for c in held] == ["already_stored"]
+        assert [c.media_held for c in held] == [True]
 
         calls_before = client.bucket("bkt").calls["exists"]
         record_media_custody(st, "tg:msg:10/1", sha, "gs://bkt/p/x")
         client.bucket("bkt").objects.clear()
         fast = classify_rows(st, rows, media_store=bucket_store)
-        assert [c.outcome for c in fast] == ["already_stored"]  # a custody row names the bucket
+        assert [c.media_held for c in fast] == [True]  # a custody row names the bucket
         assert client.bucket("bkt").calls["exists"] == calls_before  # zero HEADs
