@@ -54,6 +54,13 @@ receipts, and `RawReplayGateway.get_messages` already serves them.
 
 - `not_in_store` disappears as a final outcome. Those rows become `pending`,
   and their posts are fetched.
+- **Amendment (orchestrator decision, 2026-10-06):** a `t.me/<handle>/<id>` row
+  for a channel the store has never seen is not a dead end. Its segment targets
+  the handle and the channel is resolved live through #84's `handle` route (a
+  `ChannelAccess` receipt with `via: handle`). `--dry-run`, being offline,
+  reports these rows as `needs_resolve`. Tombstoned-in-store rows are fetched
+  again like any other row; Telegram's answer decides between `deleted_upstream`
+  and a live post.
 - New live outcomes: `deleted_upstream` (Telegram returned `MessageEmpty`),
   `no_media` (fetched, but the post has no media, so there's nothing to
   download), and `post_only` (fetched with `--no-media`).

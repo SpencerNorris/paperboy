@@ -125,9 +125,11 @@ replays exactly as it did then (handle path) and writes no `ChannelAccess` row
   resolvable yet. An id target is only reachable when this account has
   already been shown the channel (a saved key, a referencing message, or a
   known handle; Step A route 4 otherwise).
-- `fetch-media` (#68) reaches every list channel through this same Step A
-  (id target, standard `channel` collector); a route-4 channel's rows are
-  `no_access` there (`docs/features/fetch-media.md`).
+- `fetch-from-list` (#68, renamed in #91) reaches every list channel through
+  this same Step A (id target, standard `channel` collector); a route-4
+  channel's rows are `no_access` there. A handle row for a channel the store
+  has never seen goes through the `handle` route (#91;
+  `docs/features/fetch-from-list.md`).
 - When Step A finds no route (route 4) no `ChannelAccess` receipt is written,
   so that run has no target for `reproject`, which logs its existing "no
   resolve records" warning and drops it.
