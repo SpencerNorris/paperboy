@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from typer.testing import CliRunner
 from paperboy.budget import PhaseStop
 from paperboy.cli import app
 from paperboy.config import load_settings
+from paperboy.media_keys import is_media_key, resolve_key_under
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource
 from paperboy.reproject import detect_phases
@@ -29,7 +33,7 @@ runner = CliRunner()
 @pytest.mark.asyncio
 async def test_detect_phases_reflects_recorded_raw_kinds(tmp_path):
     db = await run_full_collect(tmp_path)
-    src = ReplaySource.open(db, tmp_path / "default" / "media")
+    src = ReplaySource.open(db, tmp_path / "default")
     phases = detect_phases(src, src.runs()[0])
     assert phases[:2] == ["channel", "history"]
     assert "graph" in phases and "web" in phases and "media" in phases
@@ -46,7 +50,7 @@ async def test_detect_phases_minimal_source(tmp_path):
             parse_target("@durov"), phases=["channel", "history"],
             log=logging.getLogger("t"),
         )
-    src = ReplaySource.open(db, tmp_path / "default" / "media")
+    src = ReplaySource.open(db, tmp_path / "default")
     assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
 
 
@@ -180,6 +184,45 @@ def test_cli_reproject_custom_out_path(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert custom_out.exists()
     assert not (tmp_path / "default" / "paperboy.reprojected.sqlite").exists()
+
+
+def test_reproject_out_ending_in_dot_log_keeps_db_and_log_separate(tmp_path, monkeypatch):
+    """`--out x.log` must not make the log path equal the output DB (the
+    FileHandler would append JSON into the SQLite file)."""
+    asyncio.run(run_full_collect(tmp_path))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    out = tmp_path / "replay.log"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert out.read_bytes()[:16] == b"SQLite format 3\x00"
+    with sqlite3.connect(out) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    log = tmp_path / "replay.log.log"
+    assert log.exists() and log.read_text().strip()
+
+
+def test_reproject_logs_beside_the_output_not_into_the_source_profile(tmp_path, monkeypatch):
+    """The source profile is read-only to replay (#64 §2.3): the log goes next
+    to `--out`, and the default `--out` gives `paperboy.reprojected.sqlite.log`."""
+    asyncio.run(run_full_collect(tmp_path))
+    profile = tmp_path / "default"
+    main_log = profile / "paperboy.log"
+    log_before = main_log.read_bytes() if main_log.exists() else None
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    result = runner.invoke(
+        app, ["reproject", "--profile", "default", "--out", str(elsewhere / "out.sqlite")]
+    )
+    assert result.exit_code == 0, result.output
+    out_log = elsewhere / "out.sqlite.log"
+    assert out_log.exists() and out_log.read_text().strip()
+    assert (main_log.read_bytes() if main_log.exists() else None) == log_before
+
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert (profile / "paperboy.reprojected.sqlite.log").exists()
 
 
 def test_one_bad_historical_target_does_not_abort_other_targets(tmp_path, monkeypatch):
@@ -446,7 +489,7 @@ def test_source_without_graph_reprojects_without_graph(tmp_path, monkeypatch):
     db1 = asyncio.run(
         _collect_with_fixtures(tmp_path, full_collect_fixtures(), ["channel", "history"])
     )
-    src = ReplaySource.open(db1, tmp_path / "default" / "media")
+    src = ReplaySource.open(db1, tmp_path / "default")
     assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
     src.close()
 
@@ -501,12 +544,166 @@ def test_reproject_never_rewrites_media_files(tmp_path, monkeypatch):
     asyncio.run(run_full_collect(tmp_path))
     monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
 
-    def _no_write(self, data):
-        raise AssertionError(f"reproject wrote a media file: {self}")
+    media = tmp_path / "default" / "media"
 
-    monkeypatch.setattr(Path, "write_bytes", _no_write)
+    def _snapshot() -> dict[str, tuple[int, str]]:
+        return {
+            str(p.relative_to(media)): (
+                p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest()
+            )
+            for p in media.rglob("*")
+            if p.is_file() and ".incoming" not in p.parts
+        }
+
+    before = _snapshot()
+    assert before  # the fixture really stored media
+
+    def _no_replace(src, dst):
+        raise AssertionError(f"reproject moved a temp file over a final name: {dst}")
+
+    # A replay's temp copy is discarded; nothing may be renamed to a final name.
+    monkeypatch.setattr(os, "replace", _no_replace)
     result = runner.invoke(app, ["reproject", "--profile", "default"])
     assert result.exit_code == 0, result.output
+    assert _snapshot() == before
+    assert list((media / ".incoming").iterdir()) == []
+
+
+def _digest(root):
+    """{relpath: (size, mtime_ns)} of every file and dir under `root`."""
+    return {
+        str(p.relative_to(root)): (p.stat().st_size, p.stat().st_mtime_ns)
+        for p in [root, *root.rglob("*")]
+    }
+
+
+def test_reproject_works_against_a_read_only_source_profile(tmp_path, monkeypatch):
+    """Replay writes NOTHING into the source profile (#64 §2.3): every dir 0555
+    and file 0444 (a WAL source with no -shm/-wal sidecars, so SQLite cannot
+    open it plain read-only — the `immutable=1` fallback must engage), the
+    size+mtime digest of the whole profile is unchanged, no `.incoming`, and
+    media/custody parity holds."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        src_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+        src_custody = conn.execute("SELECT count(*) FROM custody_log").fetchone()[0]
+    assert src_media > 0 and src_custody > 0
+    # Make the fixture sidecar-free the way a cleanly closed archive is: fold
+    # the WAL in, and drop the -shm/-wal the fixture's open handles left behind.
+    ckpt = sqlite3.connect(db1)
+    ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    ckpt.close()
+    for sidecar in (tmp_path / "default").glob("paperboy.sqlite-*"):
+        sidecar.unlink()
+
+    profile = tmp_path / "default"
+    before = _digest(profile)
+    entries = list(profile.rglob("*"))
+    modes = {p: p.stat().st_mode for p in [profile, *entries]}
+    for p in [profile, *entries]:
+        p.chmod(0o555 if p.is_dir() else 0o444)
+    out = tmp_path / "out" / "out.sqlite"
+    out.parent.mkdir()
+    try:
+        monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+        result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out)])
+    finally:
+        for p, m in modes.items():
+            p.chmod(m)
+    assert result.exit_code == 0, result.output
+    assert _digest(profile) == before
+    # (the collect's own empty `.incoming` pre-exists; the digest proves replay
+    # created nothing new, and no partial file may be left in it)
+    assert not list(profile.rglob("*.part"))
+    assert "immutable" in out.with_name(out.name + ".log").read_text()
+    with sqlite3.connect(out) as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media
+        assert conn.execute("SELECT count(*) FROM custody_log").fetchone()[0] == src_custody
+
+
+def test_writable_wal_source_opens_plain_read_only(tmp_path):
+    """The immutable fallback is only for sources SQLite cannot open plain
+    read-only: a normal writable profile must not use it."""
+    from paperboy.replay import ReplaySource
+
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    src = ReplaySource.open(db1, db1.parent)
+    try:
+        assert not src.opened_immutable
+        assert src.conn.execute("SELECT count(*) FROM raw_records").fetchone()[0] > 0
+    finally:
+        src.close()
+
+
+def test_reproject_skips_a_missing_stored_file_with_a_warning(tmp_path, monkeypatch):
+    """A `MediaDownload` whose stored file is gone is skipped with a WARNING and
+    no `media`/`custody_log` row; nothing is created under `media/` (§2.3)."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        src_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+        src_custody = conn.execute("SELECT count(*) FROM custody_log").fetchone()[0]
+    media = tmp_path / "default" / "media"
+    files = sorted(p for p in media.rglob("*") if p.is_file())
+    assert files
+    files[0].unlink()
+    before = sorted(str(p.relative_to(media)) for p in media.rglob("*"))
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media - 1
+        assert conn.execute("SELECT count(*) FROM custody_log").fetchone()[0] == src_custody - 1
+    # `configure_logging` owns the `paperboy` logger's handlers, so read the
+    # run's own log file (beside --out) rather than caplog.
+    log_lines = (tmp_path / "default" / "paperboy.reprojected.sqlite.log").read_text().splitlines()
+    warnings = [ln for ln in log_lines if "media file missing for sha" in ln]
+    assert len(warnings) == 1 and '"WARNING"' in warnings[0].upper()
+    assert sorted(str(p.relative_to(media)) for p in media.rglob("*")) == before
+
+
+def test_reproject_skips_a_corrupt_stored_file_with_a_warning(tmp_path, monkeypatch):
+    """A stored file whose bytes no longer hash to its receipt (#70) is skipped
+    with a WARNING naming the sha, not filed under the wrong name."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        src_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    media = tmp_path / "default" / "media"
+    victim = sorted(p for p in media.rglob("*") if p.is_file())[0]
+    victim.write_bytes(b"x" + victim.read_bytes()[1:])  # same size, one byte changed
+    before = {p: p.read_bytes() for p in media.rglob("*") if p.is_file()}
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == src_media - 1
+    log = (tmp_path / "default" / "paperboy.reprojected.sqlite.log").read_text().splitlines()
+    warned = [ln for ln in log if "does not match its receipt" in ln]
+    assert len(warned) == 1 and victim.stem[:12] in warned[0]
+    assert {p: p.read_bytes() for p in media.rglob("*") if p.is_file()} == before
+
+
+def test_reproject_ignores_the_live_free_disk_floor(tmp_path, monkeypatch):
+    """The free-disk floor protects the disk from downloads; replay downloads
+    nothing, so it must never even consult the disk: `shutil.disk_usage`
+    raising proves it is not called."""
+    db1 = asyncio.run(run_full_collect(tmp_path))
+    with sqlite3.connect(db1) as conn:
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+
+    import shutil
+
+    def _boom(path):
+        raise AssertionError("replay consulted the disk floor")
+
+    monkeypatch.setattr(shutil, "disk_usage", _boom)
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    with sqlite3.connect(tmp_path / "default" / "paperboy.reprojected.sqlite") as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
 
 
 # ---------------------------------------------------------------------------
@@ -686,3 +883,257 @@ def test_reproject_does_not_truncate_a_backward_multi_run_backfill(tmp_path, mon
     assert sweep["max_id_seen"] == 1000
     assert sweep["pending_high"] == 1000
     assert sweep["backfill_complete"] is True
+
+
+def test_reproject_from_moved_profile_dir_with_legacy_payloads(tmp_path, monkeypatch):
+    """A pre-#62 archive (absolute paths in its raw payloads) whose profile dir
+    was moved elsewhere still reprojects, and the output holds only keys (#62)."""
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    src_db = asyncio.run(run_full_collect(old_root))
+    with sqlite3.connect(src_db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', "
+            "? || '/default/media/' || substr(json_extract(payload_json, '$.sha256'), 1, 2) "
+            "|| '/' || json_extract(payload_json, '$.sha256') || '.txt') "
+            "WHERE lower(kind) IN ('mediadownload', 'avatardownload')",
+            (str(old_root),),
+        )
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+    shutil.copytree(old_root / "default", new_root / "default")
+    shutil.rmtree(old_root / "default")  # the recorded absolute paths now dangle
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(new_root))
+    out_db = new_root / "out.sqlite"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out_db)])
+    assert result.exit_code == 0, result.output
+
+    with sqlite3.connect(out_db) as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
+        for table in ("media", "custody_log"):
+            paths = [r[0] for r in conn.execute(f"SELECT path FROM {table}")]
+            assert paths
+            for path in paths:
+                assert is_media_key(path)
+                assert resolve_key_under(new_root / "default", path).exists()
+
+
+@pytest.mark.parametrize("suffix", [". 5", ".\u062a\u0642\u0631\u064a\u0631"])
+def test_reproject_keeps_legacy_media_with_non_canonical_suffix(tmp_path, monkeypatch, suffix):
+    """Pre-#62 files sit on disk under whatever Path(file_name).suffix gave. Their
+    suffix fails the strict grammar for NEW keys, but reproject must still find
+    them, keep the media row, and not write a second (extensionless) copy."""
+    src_db = asyncio.run(run_full_collect(tmp_path))
+    media_root = tmp_path / "default" / "media"
+    for f in list(media_root.rglob("*.txt")):
+        f.rename(f.with_name(f.name[: -len(".txt")] + suffix))
+    with sqlite3.connect(src_db) as conn:
+        for table in ("media", "custody_log"):
+            conn.execute(
+                f"UPDATE {table} SET path = substr(path, 1, length(path) - 4) || ?", (suffix,)
+            )
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', "
+            "'media/' || substr(json_extract(payload_json, '$.sha256'), 1, 2) || '/' "
+            "|| json_extract(payload_json, '$.sha256') || ?) "
+            "WHERE lower(kind) IN ('mediadownload', 'avatardownload')",
+            (suffix,),
+        )
+        source_media = conn.execute("SELECT count(*) FROM media").fetchone()[0]
+    assert source_media > 0
+    files_before = sorted(p.name for p in media_root.rglob("*") if p.is_file())
+    assert files_before and all(n.endswith(suffix) for n in files_before)
+
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    out_db = tmp_path / "out.sqlite"
+    result = runner.invoke(app, ["reproject", "--profile", "default", "--out", str(out_db)])
+    assert result.exit_code == 0, result.output
+
+    assert sorted(p.name for p in media_root.rglob("*") if p.is_file()) == files_before
+    with sqlite3.connect(out_db) as conn:
+        assert conn.execute("SELECT count(*) FROM media").fetchone()[0] == source_media
+        for table in ("media", "custody_log"):
+            paths = [r[0] for r in conn.execute(f"SELECT path FROM {table}")]
+            assert paths
+            for path in paths:
+                assert path.endswith(suffix)
+                assert resolve_key_under(tmp_path / "default", path).exists()
+
+
+# ---------------------------------------------------------------------------
+# Immutable fallback guards (WAL contents, missing file)
+# ---------------------------------------------------------------------------
+
+
+def _wal_source(tmp_path, *, keep_wal: bool):
+    """A WAL DB with a live writer holding its `-wal`. Returns (db, writer)."""
+    db = tmp_path / "src" / "paperboy.sqlite"
+    db.parent.mkdir()
+    w = sqlite3.connect(db)
+    w.execute("PRAGMA journal_mode=WAL")
+    w.execute("PRAGMA wal_autocheckpoint=0")
+    w.execute("CREATE TABLE raw_records (id INTEGER PRIMARY KEY, kind TEXT)")
+    w.execute("INSERT INTO raw_records (kind) VALUES ('x')")
+    w.commit()
+    if not keep_wal:
+        w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return db, w
+
+
+def test_immutable_fallback_refused_when_wal_is_non_empty(tmp_path):
+    from paperboy.replay import ReplaySource, ReplaySourceError
+
+    db, w = _wal_source(tmp_path, keep_wal=True)
+    wal = db.with_name(db.name + "-wal")
+    # Simulate an un-checkpointed WAL surviving without its -shm (crash/copy).
+    snapshot = wal.read_bytes()
+    w.close()
+    for sc in db.parent.glob("paperboy.sqlite-*"):
+        sc.unlink()
+    wal.write_bytes(snapshot)
+    assert wal.stat().st_size > 0
+    db.parent.chmod(0o555)
+    try:
+        with pytest.raises(ReplaySourceError, match="checkpoint"):
+            ReplaySource.open(db, db.parent)
+    finally:
+        db.parent.chmod(0o755)
+
+
+def test_immutable_fallback_taken_when_no_wal_file(tmp_path):
+    from paperboy.replay import ReplaySource
+
+    db, w = _wal_source(tmp_path, keep_wal=False)
+    w.close()
+    for sc in db.parent.glob("paperboy.sqlite-*"):
+        sc.unlink()
+    db.parent.chmod(0o555)
+    try:
+        src = ReplaySource.open(db, db.parent)
+        try:
+            assert src.opened_immutable
+            assert src.conn.execute("SELECT count(*) FROM raw_records").fetchone()[0] == 1
+        finally:
+            src.close()
+    finally:
+        db.parent.chmod(0o755)
+
+
+def test_missing_source_file_propagates_sqlite_error(tmp_path):
+    from paperboy.replay import ReplaySource
+
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        ReplaySource.open(tmp_path / "nope.sqlite", tmp_path)
+
+
+# --- #84: runs started by id, per route; legacy (pre-receipt) runs -------------------
+
+
+def _route_source(data_dir: Path, *, fallback: bool) -> Path:
+    """Two runs, the second collecting channel 5 BY ID.
+
+    Default: run 1 collects `@alpha` (channel 7), whose history carries a post
+    authored by channel 5 -> a `min` peer for 5 with provenance (7, msg 2), so
+    run 2 takes route 2 (from_message).
+
+    `fallback`: run 1 collects `@five` itself (a saved full key AND a handle),
+    and Telegram rejects the saved key in run 2, so Step A falls through to
+    route 3 (the handle) and the run holds a refused receipt, then the final one."""
+    from telethon.errors import ChannelPrivateError
+
+    from paperboy.budget import SkipAndRecord
+    from paperboy.collectors.channel import ChannelCollector
+    from paperboy.collectors.history import HistoryCollector
+    from tests.test_profile_split import _channel_fixtures
+
+    settings = load_settings("default", {"data_dir": data_dir})
+    db = data_dir / "default" / "paperboy.sqlite"
+    run2 = _channel_fixtures(5, "five", linked=None, media={})
+    if fallback:
+        first = ("@five", _channel_fixtures(5, "five", linked=None, media={}))
+        rejected = SkipAndRecord("CHANNEL_PRIVATE")
+        rejected.__cause__ = ChannelPrivateError(None)
+        run2["full_channel_sequence"] = [rejected]
+    else:
+        alpha = _channel_fixtures(7, "alpha", linked=None, media={})
+        alpha["history"].append({
+            "_": "message", "id": 2, "message": "m2", "date": 1767322500,
+            "from_id": {"_": "PeerChannel", "channel_id": 5},
+        })
+        first = ("@alpha", alpha)
+
+    async def go() -> None:
+        with Store.open(db) as store:
+            for target, fixtures in (first, ("5", run2)):
+                await collect_channel(
+                    FakeGateway(fixtures), store, settings, parse_target(target),
+                    ["channel", "history"], logging.getLogger("t"),
+                    collectors=[ChannelCollector(), HistoryCollector()],
+                )
+
+    asyncio.run(go())
+    return db
+
+
+def _receipts(db: Path) -> list[tuple[str, dict]]:
+    conn = sqlite3.connect(db)
+    try:
+        return [
+            (r[0], json.loads(r[1]))
+            for r in conn.execute(
+                "SELECT context_json, payload_json FROM raw_records "
+                "WHERE kind='ChannelAccess' ORDER BY id"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _reproject_cli(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    return tmp_path / "default" / "paperboy.reprojected.sqlite"
+
+
+def test_route_2_started_run_round_trips(tmp_path, monkeypatch):
+    """Spec §4: a from-message (route 2) start reprojects to identical tables,
+    with Step A served from the receipt."""
+    db1 = _route_source(tmp_path, fallback=False)
+    assert [r["via"] for _, r in _receipts(db1)] == ["handle", "from_message"]
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert_round_trip(db1, out)
+    assert _receipts(out) == _receipts(db1)
+
+
+def test_rejected_route_round_trips_with_the_same_receipt_sequence(tmp_path, monkeypatch):
+    """Spec §2.2 fallback: route 1 refused, route 3 succeeds. Replay reproduces
+    the refused attempt and the final one, in order, and the same tables."""
+    db1 = _route_source(tmp_path, fallback=True)
+    seq = [(r["via"], r["granted"]) for _, r in _receipts(db1)]
+    assert seq == [("handle", True), ("saved_key", False), ("handle", True)]
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert_round_trip(db1, out)
+    assert _receipts(out) == _receipts(db1)
+
+
+def test_legacy_run_without_receipts_reprojects_as_before_and_writes_none(
+    tmp_path, monkeypatch
+):
+    """Spec §2.6: a pre-#84 source has no ChannelAccess. Replay must take the
+    handle path exactly as before and must NOT mint a receipt (a replay with no
+    receipt is not a live run)."""
+    db1 = _route_source(tmp_path, fallback=False)
+    conn = sqlite3.connect(db1)
+    conn.execute("DELETE FROM raw_records WHERE kind='ChannelAccess'")
+    conn.commit()
+    conn.close()
+    out = _reproject_cli(tmp_path, monkeypatch)
+    assert _receipts(out) == []
+    conn = sqlite3.connect(out)
+    try:
+        kinds = {r[0] for r in conn.execute("SELECT kind FROM raw_records")}
+        assert "contacts.resolvedPeer" in kinds or "ResolvedPeer" in kinds
+        assert conn.execute("SELECT count(*) FROM channels WHERE id=7").fetchone()[0] == 1
+    finally:
+        conn.close()

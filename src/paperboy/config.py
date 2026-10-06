@@ -109,7 +109,13 @@ class Settings(BaseSettings):
     require_proxy: bool = True
     device: DeviceIdentity = Field(default_factory=DeviceIdentity)
     min_session_age_days: int = 7
-    flood_sleep_threshold: int = 60
+    # Ceiling (seconds) on a single FLOOD_WAIT we will sleep through (`--max-flood-sleep`,
+    # ADR-0003 amendment #69). The test is against the *applied* wait (server seconds plus
+    # margin); above it the phase stops and the cooldown is persisted for the next run.
+    flood_sleep_threshold: int = Field(default=3600, ge=0)
+    # Safety multiplier on every interval WE assume (`--pacing-factor`, #69). Never applied
+    # to server-mandated FLOOD_WAITs. 1.0 = the base intervals; lower is rejected.
+    pacing_factor: float = Field(default=2.0, ge=1.0)
     max_rpc_per_run: int = 20000
     profile_budget: int = 2000
     discussion_page_budget: int = 500
@@ -140,6 +146,10 @@ class Settings(BaseSettings):
     # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
     # stored message, exceeds this many MB (10^6 bytes). None = no cap.
     media_max_mb: int | None = Field(default=None, ge=1)
+    # `--media-min-free-gb` (issue #53): floor of free space on the media
+    # volume. Checked before each download against `free - declared size`;
+    # the media phase stops cleanly when it would be crossed. 0 disables.
+    media_min_free_gb: float = Field(default=5.0, ge=0)
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 

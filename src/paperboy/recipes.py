@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.clock import LiveClock
-from paperboy.collectors.base import CollectContext, CollectResult
+from paperboy.collectors.base import ChannelContext, CollectContext, CollectResult
 from paperboy.collectors.channel import ChannelCollector
 from paperboy.collectors.discussion import DiscussionCollector
 from paperboy.collectors.graph import GraphCollector
@@ -105,7 +105,7 @@ async def _run_one(collector: Collector, ctx: CollectContext) -> CollectResult:
     return result
 
 
-async def collect_channel(
+async def collect_channel_with_context(
     gateway: Gateway,
     store: Store,
     settings: Settings,
@@ -119,7 +119,8 @@ async def collect_channel(
     profile: str = "default",
     clock: Clock | None = None,
     run_id: str | None = None,
-) -> list[CollectResult]:
+    channel_context: ChannelContext | None = None,
+) -> tuple[list[CollectResult], ChannelContext | None]:
     """Run `channel`, then `history` (+ its `catch_up`), then `graph`, against `target`.
 
     `phases` filters which collectors run by name (`None` runs all of the
@@ -136,19 +137,41 @@ async def collect_channel(
     to one collect pass — `None` (live callers) mints a fresh opaque id;
     `reproject` passes the SOURCE run's id so a reprojected DB carries the
     same pass boundaries and is itself re-reprojectable.
+
+    `channel_context` (#68) is a channel this process already resolved: the
+    `channel` phase is skipped (no `resolveUsername`/`getFullChannel`) and one
+    `ChannelContextReused` raw marker (channel id + the establishing run's id,
+    no access hash) is appended first, so `reproject` can rebuild the context
+    for this otherwise channel-less run. Returns the results plus the
+    `ChannelContext` this run ended with (`None` if `channel` did not complete),
+    for the caller to reuse on the next segment.
     """
     store.begin_run(run_id)
     ctx = CollectContext(
         gateway, store, settings, target, None, None, "stranger", log, profile,
         clock or LiveClock(),
     )
+    if channel_context is not None:
+        ctx.input_channel = channel_context.input_channel
+        ctx.channel_id = channel_context.channel_id
+        ctx.tier = channel_context.tier
+        marker = {
+            "channel_id": channel_context.channel_id,
+            "source_run_id": channel_context.source_run_id,
+        }
+        store.add_raw(
+            "ChannelContextReused", marker, ctx.tier,
+            {"channel_id": channel_context.channel_id},
+            observed_at=ctx.clock.for_payload(marker),
+        )
     include_media = media or (phases is not None and "media" in phases)
     include_web = web or (phases is not None and "web" in phases)
     active = collectors if collectors is not None else _default_collectors(
         include_media=include_media, include_web=include_web
     )
+    if channel_context is not None:
+        active = [c for c in active if c.name != "channel"]
     selected = set(phases) if phases is not None else {c.name for c in active}
-
     results: list[CollectResult] = []
     progress = Progress(store, log)
     progress.begin()
@@ -157,6 +180,26 @@ async def collect_channel(
             if collector.name not in selected or not collector.applies_to(target):
                 continue
             progress.start_phase(collector.name)
+            if (
+                collector.name == "media"
+                and settings.media_msgs is not None
+                and ctx.channel_id is not None
+            ):
+                # The media phase will walk only these ids, in the channel the
+                # run established. Recording both keeps the raw log sufficient to
+                # replay exactly the same rows (a reproject would otherwise walk
+                # every stored media message and re-derive dedup custody rows the
+                # live run never produced) and lets replay tell "access granted"
+                # from "refused" (#68 spec 9.2-9.3). Written here, not up front,
+                # because only now is the channel known.
+                selection = {
+                    "channel_id": ctx.channel_id,
+                    "msg_ids": sorted(set(settings.media_msgs)),
+                }
+                store.add_raw(
+                    "MediaSelection", selection, ctx.tier, None,
+                    observed_at=ctx.clock.for_payload(selection),
+                )
             try:
                 result = await _run_one(collector, ctx)
             except SkipAndRecord as exc:
@@ -169,7 +212,9 @@ async def collect_channel(
                 _record_run_event(
                     store, ctx.channel_id, collector.name, "skip", {"error": str(exc)}
                 )
-                results.append(CollectResult(name=collector.name, counts={}, stopped="skip"))
+                results.append(
+                    CollectResult(name=collector.name, counts={}, stopped="skip", stop_exc=exc)
+                )
                 continue
             except PhaseStop as exc:
                 # A stopped phase may still have done real work — a page-budget
@@ -183,7 +228,10 @@ async def collect_channel(
                     {"error": str(exc), "counts": stopped_counts},
                 )
                 results.append(
-                    CollectResult(name=collector.name, counts=stopped_counts, stopped="phase_stop")
+                    CollectResult(
+                        name=collector.name, counts=stopped_counts, stopped="phase_stop",
+                        stop_exc=exc,
+                    )
                 )
                 continue
             except HardStop as exc:
@@ -192,7 +240,11 @@ async def collect_channel(
                 _record_run_event(
                     store, ctx.channel_id, collector.name, "hard_stop", {"error": str(exc)}
                 )
-                results.append(CollectResult(name=collector.name, counts={}, stopped="hard_stop"))
+                results.append(
+                    CollectResult(
+                        name=collector.name, counts={}, stopped="hard_stop", stop_exc=exc
+                    )
+                )
                 break
             else:
                 progress.end_phase(collector.name, result.counts)
@@ -204,4 +256,34 @@ async def collect_channel(
     finally:
         await progress.close()
 
+    established: ChannelContext | None = None
+    if ctx.input_channel is not None and ctx.channel_id is not None:
+        established = channel_context or ChannelContext(
+            ctx.input_channel, ctx.channel_id, ctx.tier, store.run_id or ""
+        )
+    return results, established
+
+
+async def collect_channel(
+    gateway: Gateway,
+    store: Store,
+    settings: Settings,
+    target: Target,
+    phases: list[str] | None,
+    log: logging.Logger,
+    *,
+    collectors: Sequence[Collector] | None = None,
+    media: bool = False,
+    web: bool = False,
+    profile: str = "default",
+    clock: Clock | None = None,
+    run_id: str | None = None,
+    channel_context: ChannelContext | None = None,
+) -> list[CollectResult]:
+    """`collect_channel_with_context` without the returned context; see there."""
+    results, _ = await collect_channel_with_context(
+        gateway, store, settings, target, phases, log,
+        collectors=collectors, media=media, web=web, profile=profile,
+        clock=clock, run_id=run_id, channel_context=channel_context,
+    )
     return results

@@ -53,11 +53,12 @@ async def test_get_full_user_turns_channel_invalid_into_skip_and_record(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_get_full_channel_reraises_channel_invalid_uncaught(tmp_path):
-    # The scoping cuts both ways: a CHANNEL_INVALID on the collection target
-    # itself (not a profiles user lookup) must still surface as a real
-    # failure, not be silently turned into a SkipAndRecord — this is exactly
-    # the regression `classify`'s former global skip entry would have caused.
+async def test_get_full_channel_turns_channel_invalid_into_skip_and_record(tmp_path):
+    # #84: a stale saved key / from-message reference answers CHANNEL_INVALID on
+    # getFullChannel. That is an access refusal the channel collector falls back
+    # from, so it is a SkipAndRecord (scoped here, not in `classify`); the
+    # original error stays on `__cause__` so the receipt can name it.
     gw, store = _gateway(tmp_path, ChannelInvalidError(None))
-    with store, pytest.raises(ChannelInvalidError):
+    with store, pytest.raises(SkipAndRecord) as exc:
         await gw.get_full_channel({"channel_id": 7, "access_hash": 4242})
+    assert isinstance(exc.value.__cause__, ChannelInvalidError)

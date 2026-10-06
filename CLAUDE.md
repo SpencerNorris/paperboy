@@ -28,8 +28,28 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 (migration `0004_people.sql`) and reproject-replay support. See
 `docs/features/person-layer.md` and `docs/adr/0006-person-layer-storage.md`.
 
+**In progress on `dev/media-storage` (2026-09-29, not yet on `main`):** #69
+pacing (`--pacing-factor`, `--max-flood-sleep`; migration 0005) and #62
+profile-relative media keys (ADR-0007; migration 0006) have merged. #64 media streaming is on `feat/media-streaming`
+(PR pending; `docs/features/media-streaming.md`): streamed downloads,
+`size_mismatch`, `--media-min-free-gb` (#53), replay leaves the source
+untouched. #75 replay lookup performance is on
+`perf/replay-lookup` (PR pending; per-run in-memory raw index, no migration —
+`docs/features/reproject.md`). #70 profile split is on `feat/profile-split`
+(PR pending; `reproject --include-target/--exclude-target/--out-profile`,
+`scripts/unreferenced_media.py`, replay now verifies each media sha; no
+migration — `docs/features/reproject.md` "Splitting a mixed profile"). #84 collect
+by id is merged (PR #86; `docs/features/collect-channel.md`). #68
+`fetch-media LIST` is on `feat/fetch-media-by-id` (PR pending →
+`dev/media-storage`; `docs/features/fetch-media.md`): ordered cross-channel media
+pull, each channel reached by id through the standard `channel` phase,
+`--exclude-target`, `MediaSelection` names the channel so reproject walks the same
+rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+
 ## Read these first
 
+- `docs/how-it-works.md` — plain-language map of the system (raw vs.
+  projections, replay/reproject, profiles, media keys). Keep it current.
 - `docs/research/telegram-extraction-surface.md` — what the Telegram API does
   and does not expose, by access tier, with the hard walls. Cited raw
   sub-reports in `docs/research/sources/`.
@@ -58,6 +78,10 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
   (keeps the `upsert_peer` #38/#39 lattice untouched); tri-state fields are
   `present | absent | hidden_from_you` in `field_states_json`, and "no photo"
   is never recorded as a fact (ADR-0006).
+- Media locations (`media.path`, `custody_log.path`, `MediaDownload`/
+  `AvatarDownload` payloads) are profile-relative keys
+  `media/<sha[:2]>/<sha><ext>` (ADR-0007), never absolute or cwd-relative
+  paths; construct with `media_keys.media_key`, resolve at read time.
 - `min` peers are stored with `(seen_in_chat, seen_in_msg)` provenance and
   fetched via `inputUserFromMessage`; optional user fields are tri-state
   (present / not-set / hidden-from-you) — never record "no photo".
@@ -84,13 +108,20 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
-[--phases channel,history] [--unsafe]`, `status [TARGET]`, `export TARGET
+[--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S]`
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv] [--exclude-target T …]` (ordered cross-channel
+media pull, #68 — `docs/features/fetch-media.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out
-PATH] [--phases a,b,c]` needs none of that — it never touches the network or
-the keychain, only a source `paperboy.sqlite`'s `raw_records`. `watch`/
-`lookup` exit 1 with a "Phase 2" message — not implemented yet.
+PATH | --out-profile NAME] [--include-target T | --exclude-target T] [--phases a,b,c]`
+needs none of that — it never touches the network or the keychain, only a
+source `paperboy.sqlite`'s `raw_records` (the target flags split a mixed
+profile, #70; `scripts/unreferenced_media.py --profile P` lists orphaned media). `watch`/
+`lookup` exit 1 with a "Phase 2" message — not implemented yet. `TARGET` for
+`collect`/`status`/`export` is a handle or a channel id (`123`, `-100123` after
+`--`, `t.me/c/123`; #84) — by id the account must already have been shown the
+channel.
 
 ## Workflow
 

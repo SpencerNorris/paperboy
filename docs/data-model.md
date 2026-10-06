@@ -49,6 +49,27 @@ Every Telegram object exactly as received, before any normalization.
 | `context_json` | TEXT | Optional capture context (e.g. resolve target, request params). |
 | `payload_json` | TEXT | The full TL object as JSON (`to_dict()`). |
 
+**Paperboy-authored kinds** (not Telegram objects, but recorded the same way so
+replay can serve them): `MediaDownload`, `RosterWalled`, and `ChannelAccess`
+(#84), the receipt of how the `channel` phase obtained access to a channel,
+appended before `getFullChannel`. Payload: `channel_id`, `requested` (the
+target as typed), `via` (`saved_key` | `from_message` | `handle`), `granted`
+(false when a stored handle now resolves to a different channel, with
+`resolved_channel_id` and `input_channel: null`, or when Telegram rejected the
+route's key at `getFullChannel`, with the `error` class name and `reason`: one
+receipt per route attempted, the refused ones then the final one), `input_channel`
+(`{channel_id, access_hash}` or `{channel_id, from_msg: {channel_id,
+access_hash, msg_id}}`), `key_source_raw_id` (a live-store raw id,
+informational, not a cross-store foreign key) and, for `handle`, `handle`.
+Context: `{target, channel_id}`. Only stamped runs carry it.
+
+Two more kinds are written by paperboy itself for `fetch-media` (#68, no schema
+change, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
+segment that reused an already-established channel) and `MediaSelection`
+(`{channel_id, msg_ids}`; legacy `{msg_ids}`; the message ids a scoped media phase
+was allowed to walk, written just before the media phase). `reproject` reads them
+to replay those runs exactly.
+
 ## Entities (current state)
 
 ### `channels` — the channel/supergroup itself
@@ -130,10 +151,10 @@ Content-addressed by SHA-256; deduped across messages.
 | `message_uri` | TEXT | Message the file came from. |
 | `kind` | TEXT | `photo` (server-re-encoded) or `document` (byte-exact). |
 | `mime_type` | TEXT | MIME type (documents). |
-| `size` | INTEGER | Byte size. |
+| `size` | INTEGER | Bytes received (streamed and counted; equals the declared size for documents, #64). |
 | `file_name` | TEXT | Original filename (documents). |
 | `attributes_json` | TEXT | Video/audio/sticker attributes. |
-| `path` | TEXT | Where the file was written on disk. |
+| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
 | `downloaded_at` | TEXT | Download time. |
 | `exif_json` | TEXT | Extracted EXIF/metadata (documents). |
 
@@ -277,7 +298,7 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | INTEGER PK | Row id. |
-| `path` | TEXT | File path. |
+| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
 | `sha256` | TEXT | Hash at write time. |
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |

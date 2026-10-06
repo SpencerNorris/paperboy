@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from collections.abc import Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from paperboy import app as composition
@@ -27,19 +29,50 @@ from paperboy.config import (
 )
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
+from paperboy.fetch_media import FetchSummary, fetch_media, initial_results, write_report
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
+from paperboy.media_list import (
+    OFFLINE_OUTCOMES,
+    ClassifiedRow,
+    MediaListError,
+    Segment,
+    classify_rows,
+    excluded_channel_ids,
+    parse_media_list,
+    plan_segments,
+)
 from paperboy.recipes import collect_channel
-from paperboy.replay import ReprojectSourceError
-from paperboy.reproject import ReprojectError
+from paperboy.replay import ReplaySource, ReprojectSourceError
+from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
 from paperboy.reproject import reproject as reproject_run
-from paperboy.targets import parse_target
+from paperboy.store.channels import find_channel_id
+from paperboy.targets import Target, UnsupportedTarget, parse_target
 
 app = typer.Typer(
     add_completion=False,
     help="Local, read-only Telegram channel OSINT collector. See docs/opsec.md first.",
 )
 console = Console()
+
+
+def _parse_target_or_exit(raw: str) -> Target:
+    """`parse_target`, but an unparsable TARGET is a clean one-line CLI error
+    (exit 1) rather than an uncaught exception with a Rich traceback."""
+    try:
+        return parse_target(raw)
+    except UnsupportedTarget as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
+
+_PACING_HELP = (
+    "Multiply every request interval we assume by this (default 2.0, min 1.0). "
+    "Never applied to server-mandated FLOOD_WAITs."
+)
+_FLOOD_HELP = (
+    "Longest single FLOOD_WAIT (seconds, margin included) to sleep through before "
+    "stopping the phase (default 3600)."
+)
 
 
 def _settings_with_overrides(profile: str, **overrides: object) -> Settings:
@@ -61,11 +94,9 @@ def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
         raise typer.Exit(code=1) from None
 
 
-def _find_channel_id(store, username: str) -> int | None:
-    row = store.conn.execute(
-        "SELECT id FROM channels WHERE username = ?", (username.lstrip("@"),)
-    ).fetchone()
-    return row["id"] if row else None
+def _find_channel_id(store, target: Target) -> int | None:
+    """`status`/`export`: the locally stored channel a target names."""
+    return find_channel_id(store, target)
 
 
 @app.command()
@@ -100,9 +131,13 @@ def auth(profile: str = typer.Option("default", "--profile")) -> None:
 def doctor(
     profile: str = typer.Option("default", "--profile"),
     strict: bool = typer.Option(False, "--strict"),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
 ) -> None:
     """Opsec preflight: proxy, session age, 2FA, privacy keys, profile minimalism."""
-    settings = _settings_with_overrides(profile)
+    settings = _settings_with_overrides(
+        profile, pacing_factor=pacing_factor, flood_sleep_threshold=max_flood_sleep
+    )
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=False)
     secrets = composition.build_secrets(profile)
 
@@ -167,8 +202,11 @@ def collect(
     ),
     profile_interval: float = typer.Option(
         None, "--profile-interval",
-        help="Seconds between full-profile RPCs (default: Budget's 1.0s).",
+        help="Base seconds between full-profile RPCs (default 1.0), multiplied by "
+             "--pacing-factor.",
     ),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
     profile_refresh_after: str = typer.Option(
         None, "--profile-refresh-after",
         help="Skip re-enriching users enriched more recently than this (e.g. 7d, 12h, 30m).",
@@ -185,6 +223,11 @@ def collect(
     media_max_mb: int = typer.Option(
         None, "--media-max-mb", min=1,
         help="With --media: skip any file larger than this many MB (size as Telegram records it).",
+    ),
+    media_min_free_gb: float = typer.Option(
+        None, "--media-min-free-gb", min=0.0,
+        help="With --media: stop the media phase when free disk on the media volume, minus "
+             "the next file's declared size, would fall below this many GB (default 5).",
     ),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
@@ -204,6 +247,10 @@ def collect(
         overrides["enrich_profiles"] = True
     if profile_interval is not None:
         overrides["profile_interval"] = profile_interval
+    if pacing_factor is not None:
+        overrides["pacing_factor"] = pacing_factor
+    if max_flood_sleep is not None:
+        overrides["flood_sleep_threshold"] = max_flood_sleep
     if profile_refresh_after is not None:
         try:
             overrides["profile_refresh_after"] = parse_duration(profile_refresh_after)
@@ -221,6 +268,8 @@ def collect(
             raise typer.BadParameter(str(exc), param_hint="--media-msgs") from None
     if media_max_mb is not None:
         overrides["media_max_mb"] = media_max_mb
+    if media_min_free_gb is not None:
+        overrides["media_min_free_gb"] = media_min_free_gb
     if unsafe:
         overrides["unsafe"] = True
     settings = load_settings(profile, overrides)
@@ -232,7 +281,7 @@ def collect(
 
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
-    parsed_target = parse_target(target)
+    parsed_target = _parse_target_or_exit(target)
     secrets = composition.build_secrets(profile)
     phase_list = phases.split(",") if phases else None
     _dependent_phases = [
@@ -321,6 +370,201 @@ async def _run_collect(
     )
 
 
+def _gb(nbytes: int) -> str:
+    return f"{nbytes / 1e9:.2f}"
+
+
+def _print_plan(classified: list[ClassifiedRow], segments: list[Segment]) -> None:
+    """The three offline tables: outcome -> rows -> declared GB, channel x
+    outcome, and the segment plan. Channels appear by numeric id only
+    (logs/consoles reference targets by id)."""
+    by_outcome: dict[str, list[ClassifiedRow]] = {}
+    for c in classified:
+        by_outcome.setdefault(c.outcome, []).append(c)
+    outcomes = Table(title="fetch-media: offline classification")
+    outcomes.add_column("outcome")
+    outcomes.add_column("rows", justify="right")
+    outcomes.add_column("declared GB", justify="right")
+    for name in OFFLINE_OUTCOMES:
+        rows = by_outcome.get(name, [])
+        outcomes.add_row(name, str(len(rows)), _gb(sum(c.declared_bytes or 0 for c in rows)))
+    total_bytes = sum(c.declared_bytes or 0 for c in classified)
+    outcomes.add_row("total", str(len(classified)), _gb(total_bytes))
+    console.print(outcomes)
+
+    # Per channel (by id) x outcome, over the outcomes that occur: the operator's
+    # view of what each channel will cost before anything is fetched.
+    seen_outcomes = [n for n in OFFLINE_OUTCOMES if n in by_outcome]
+    per_channel: dict[str, Counter[str]] = {}
+    for c in classified:
+        label = str(c.channel_id) if c.channel_id is not None else "-"
+        per_channel.setdefault(label, Counter())[c.outcome] += 1
+    channels = Table(title="fetch-media: per channel (rows by outcome)")
+    channels.add_column("channel id", justify="right")
+    for name in seen_outcomes:
+        channels.add_column(name, justify="right")
+    channels.add_column("total", justify="right")
+    for label in sorted(per_channel, key=lambda x: (x == "-", int(x) if x != "-" else 0)):
+        counts = per_channel[label]
+        channels.add_row(
+            label, *(str(counts[n]) for n in seen_outcomes), str(sum(counts.values()))
+        )
+    console.print(channels)
+
+    plan = Table(title="fetch-media: segment plan (list order)")
+    for column in ("segment", "priority", "channel id", "rows", "declared GB"):
+        plan.add_column(column, justify="right" if column != "priority" else "left")
+    for i, seg in enumerate(segments, start=1):
+        plan.add_row(
+            str(i), seg.priority or "-", str(seg.channel_id), str(len(seg.rows)),
+            _gb(sum(c.declared_bytes or 0 for c in seg.rows)),
+        )
+    console.print(plan)
+
+
+def _print_summary(summary: FetchSummary) -> None:
+    table = Table(title="fetch-media: result")
+    table.add_column("outcome")
+    table.add_column("rows", justify="right")
+    for name, n in sorted(summary.counts.items()):
+        table.add_row(name, str(n))
+    table.add_row("bytes downloaded", str(summary.bytes_downloaded))
+    console.print(table)
+
+
+async def _run_fetch(settings, profile, store, classified, log, report_path):
+    try:
+        secrets = composition.build_secrets(profile)
+        gateway = await composition.build_gateway(settings, secrets, profile, store)
+        checks = [] if settings.unsafe else await run_doctor(gateway, settings)
+    except BaseException:
+        # The report is written in every case, including auth/keychain and
+        # doctor-preflight failures.
+        write_report(report_path, store, initial_results(classified))
+        raise
+    if not settings.unsafe and doctor_blocks(checks):
+        write_report(report_path, store, initial_results(classified))
+        console.print(
+            "[red]doctor preflight failed[/] — refusing to fetch. "
+            "Run `paperboy doctor` for details, or pass --unsafe to override."
+        )
+        raise typer.Exit(code=1)
+    return await fetch_media(
+        gateway, store, settings, classified, log, profile=profile, report_path=report_path
+    )
+
+
+@app.command(name="fetch-media")
+def fetch_media_cmd(
+    list_file: Annotated[
+        Path, typer.Argument(metavar="LIST", help="CSV with a `uri` column, or one URI per line.")
+    ],
+    profile: str = typer.Option("default", "--profile"),
+    media_max_mb: int = typer.Option(
+        None, "--media-max-mb", min=1, help="Skip any file larger than this many MB."
+    ),
+    media_min_free_gb: float = typer.Option(
+        None, "--media-min-free-gb", min=0.0,
+        help="Stop when free disk, minus the next file's declared size, would fall below "
+             "this many GB (default 5).",
+    ),
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            "--report",
+            help="Where to write the per-row report CSV "
+                 "(default <data_dir>/<profile>/fetch-media-<timestamp>.csv).",
+        ),
+    ] = None,
+    exclude_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-target",
+            help="Never fetch rows of this channel (repeatable; same forms as "
+                 "`reproject`: handle or channel id; a linked group follows its parent). "
+                 "Those rows are reported `excluded`.",
+        ),
+    ] = None,
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Classify offline and print the plan; no keychain, no network, no report.",
+    ),
+    max_rpc: int = typer.Option(None, "--max-rpc"),
+    unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
+    pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
+    max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
+) -> None:
+    """Download media for an ordered list of message URIs across channels
+    (resumable; every input row gets an outcome in the report)."""
+    try:
+        rows = parse_media_list(list_file)
+    except (MediaListError, OSError) as exc:
+        console.print(f"[red]{list_file}: {exc}[/]")
+        raise typer.Exit(code=1) from None
+
+    overrides: dict[str, object] = {}
+    if media_max_mb is not None:
+        overrides["media_max_mb"] = media_max_mb
+    if media_min_free_gb is not None:
+        overrides["media_min_free_gb"] = media_min_free_gb
+    if max_rpc is not None:
+        overrides["max_rpc_per_run"] = max_rpc
+    if pacing_factor is not None:
+        overrides["pacing_factor"] = pacing_factor
+    if max_flood_sleep is not None:
+        overrides["flood_sleep_threshold"] = max_flood_sleep
+    if unsafe:
+        overrides["unsafe"] = True
+    settings = load_settings(profile, overrides)
+
+    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    log = logging.getLogger("paperboy.cli")
+    with composition.build_store(settings, profile) as store:
+        try:
+            excluded_ids = excluded_channel_ids(store, exclude_target or [])
+        except MediaListError as exc:
+            console.print(f"[red]{escape(str(exc))}[/]")
+            raise typer.Exit(code=1) from None
+        if excluded_ids:
+            log.info("fetch-media: excluding %d channel id(s): %s",
+                     len(excluded_ids), sorted(excluded_ids))
+        classified = classify_rows(store, rows, excluded_ids=excluded_ids)
+        segments = plan_segments(classified)
+        _print_plan(classified, segments)
+        if dry_run:
+            return
+
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        report_path = report or profile_dir(settings, profile) / f"fetch-media-{stamp}.csv"
+        try:
+            # Fail before any segment, not after hours of downloading.
+            report_path.open("w", encoding="utf-8").close()
+        except OSError as exc:
+            console.print(f"[red]cannot write the report {report_path}: {exc}[/]")
+            raise typer.Exit(code=1) from None
+
+        if segments:
+            summary = _run_async_or_exit(
+                _run_fetch(
+                    settings, profile, store, classified, log, report_path,
+                )
+            )
+        else:
+            summary = asyncio.run(
+                fetch_media(
+                    None, store, settings, classified, log,
+                    profile=profile, report_path=report_path,
+                )
+            )
+
+    _print_summary(summary)
+    console.print(f"report: {report_path}")
+    if summary.stop_reason:
+        console.print(f"[red]stopped early: {summary.stop_reason}[/] — re-run to resume.")
+    if not summary.complete:
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def status(
     target: str = typer.Argument(None),
@@ -335,8 +579,8 @@ def status(
 
         channel_id = None
         if target:
-            parsed = parse_target(target)
-            channel_id = _find_channel_id(store, parsed.value)
+            parsed = _parse_target_or_exit(target)
+            channel_id = _find_channel_id(store, parsed)
             if channel_id is None:
                 console.print(f"[yellow]No local data for {target!r} yet — run `collect` first.[/]")
                 raise typer.Exit(code=1)
@@ -384,9 +628,9 @@ def export_cmd(
         raise typer.Exit(code=1)
 
     settings = _settings_with_overrides(profile)
-    parsed = parse_target(target)
+    parsed = _parse_target_or_exit(target)
     with composition.build_store(settings, profile) as store:
-        channel_id = _find_channel_id(store, parsed.value)
+        channel_id = _find_channel_id(store, parsed)
         if channel_id is None:
             console.print(f"[red]No local data for {target!r}. Run `collect` first.[/]")
             raise typer.Exit(code=1)
@@ -401,6 +645,29 @@ def export_cmd(
     console.print(table)
 
 
+def _out_profile_store_path(settings: Settings, profile: str, name: str) -> Path:
+    """`<data_dir>/<name>/paperboy.sqlite` for `--out-profile`, or exit 1.
+
+    The name becomes a directory under the data dir, so it must be a plain
+    name (no separators, not `.`/`..`), differ from the source profile, and
+    must not already hold a store — a split never merges into an existing
+    profile."""
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        console.print(f"[red]--out-profile {name!r} is not a plain profile name[/]")
+        raise typer.Exit(code=1)
+    if name == profile:
+        console.print(f"[red]--out-profile must differ from the source --profile ({profile!r})[/]")
+        raise typer.Exit(code=1)
+    path = profile_dir(settings, name) / "paperboy.sqlite"
+    if path.exists():
+        console.print(
+            f"[red]profile {name!r} already has a store at {path} — pick a fresh "
+            "--out-profile or move it aside[/]"
+        )
+        raise typer.Exit(code=1)
+    return path
+
+
 @app.command()
 def reproject(
     profile: str = typer.Option("default", "--profile"),
@@ -413,27 +680,78 @@ def reproject(
         None, "--phases",
         help="Comma-separated phase subset; default: auto-detected from the raw log.",
     ),
+    include_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include-target",
+            help="Replay ONLY this target (@username, username or channel id; repeatable). "
+                 "Its linked discussion group follows it. See 'Splitting a mixed profile'.",
+        ),
+    ] = None,
+    exclude_target: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-target",
+            help="Replay everything EXCEPT this target (repeatable; exclusive with "
+                 "--include-target).",
+        ),
+    ] = None,
+    out_profile: str = typer.Option(
+        None, "--out-profile",
+        help="Write the output to <data_dir>/<name>/paperboy.sqlite and copy the media it "
+             "references into <data_dir>/<name>/media/ (exclusive with --out).",
+    ),
 ) -> None:
     """Rebuild all projections from raw_records into a fresh DB — offline,
     no network, no credentials. See docs/features/reproject.md."""
     settings = _settings_with_overrides(profile)
-    out_path = Path(out) if out else profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
     phase_list = phases.split(",") if phases else None
+    include_target, exclude_target = include_target or [], exclude_target or []
+    if include_target and exclude_target:
+        console.print("[red]--include-target and --exclude-target are mutually exclusive[/]")
+        raise typer.Exit(code=1)
+    if out_profile is not None and out:
+        console.print("[red]--out and --out-profile are mutually exclusive[/]")
+        raise typer.Exit(code=1)
+    if out_profile is not None:
+        out_path = _out_profile_store_path(settings, profile, out_profile)
+    elif out:
+        out_path = Path(out)
+    else:
+        out_path = profile_dir(settings, profile) / "paperboy.reprojected.sqlite"
+
+    target_filter: TargetFilter | None = None
+
+    def _check_targets(source: ReplaySource) -> None:
+        # Runs before the output exists: an unknown target must write nothing.
+        nonlocal target_filter
+        target_filter = resolve_target_filter(source, include_target, exclude_target)
 
     try:
-        source, out_store = composition.build_reproject(settings, profile, out_path)
-    except composition.ConfigError as exc:
+        source, out_store = composition.build_reproject(
+            settings, profile, out_path, check=_check_targets
+        )
+    except (composition.ConfigError, ReprojectError) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from None
-    # Only now that the profile is validated: configure_logging mkdirs the
-    # profile dir, so doing it earlier manufactured `data/<typo>/` for a
-    # profile build_reproject was about to reject (#33 round-2 smoke case 8).
-    configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
+    # The log lives beside the output, never in the source profile: replay
+    # must not write there (#64 §2.3, a read-only profile must work).
+    # `build_reproject` has already validated the profile and created
+    # `out_path`'s parent, so this cannot manufacture `data/<typo>/`.
+    configure_logging(out_path.with_name(out_path.name + ".log"), console=True)
     log = logging.getLogger("paperboy.cli")
+    if source.opened_immutable:
+        log.warning(
+            "source DB could not be opened plain read-only (read-only directory, WAL "
+            "sidecars absent); opened with immutable=1 - it must not be written concurrently"
+        )
     try:
         with source, out_store:
             summary = asyncio.run(
-                reproject_run(source, out_store, settings, profile, phase_list, log)
+                reproject_run(
+                    source, out_store, settings, profile, phase_list, log,
+                    target_filter=target_filter, out_profile=out_profile,
+                )
             )
     except (ReprojectError, ReprojectSourceError) as exc:
         console.print(f"[red]{exc}[/]")

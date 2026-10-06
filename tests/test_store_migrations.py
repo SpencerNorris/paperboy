@@ -71,6 +71,21 @@ def test_expected_tables_exist(tmp_path):
             assert expected in names, f"missing table {expected}"
 
 
+def test_0005_flood_applied_column(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        applied = {r["name"] for r in st.conn.execute("select name from schema_migrations")}
+        assert "0005_flood_applied" in applied
+        cols = {r["name"] for r in st.conn.execute("pragma table_info(flood_log)")}
+        assert "applied_seconds" in cols
+        # Pre-#69 rows have NULL applied_seconds and must still be insertable/readable.
+        st.conn.execute(
+            "insert into flood_log(method, until, seconds, recorded_at) "
+            "values ('m', '2026-01-01T00:00:00+00:00', 3, '2026-01-01T00:00:00+00:00')"
+        )
+        row = st.conn.execute("select applied_seconds from flood_log").fetchone()
+        assert row["applied_seconds"] is None
+
+
 def test_0002_web_migration_applied(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         applied = {

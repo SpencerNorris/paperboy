@@ -12,12 +12,14 @@ exception type. That is safe only for errors whose meaning does not depend
 on which method raised them (e.g. `CHAT_ADMIN_REQUIRED`). `CHANNEL_INVALID`
 is not one of those: on `users.getFullUser`/`users.getUsers` (an
 `inputUserFromMessage` whose provenance went stale) it means "skip this one
-user"; on `channels.getFullChannel`/`updates.getChannelDifference` (the
-collection target itself) it means the whole run is broken and must surface,
-not be silently skipped. That case is therefore handled locally — the two
-`TelethonGateway` methods that can legitimately see a stale-provenance
-`CHANNEL_INVALID` catch it themselves and raise `SkipAndRecord`, and
-`CHANNEL_INVALID` is deliberately absent from `_skip_error_classes` below.
+user"; on `updates.getChannelDifference` (the collection target itself) it
+means the whole run is broken and must surface, not be silently skipped; on
+`channels.getFullChannel` it is the access step's "this key no longer works"
+(#84), which the channel collector answers by trying its next route. That is
+therefore handled locally — the three `TelethonGateway` methods that can
+legitimately see a stale key or provenance (`getUsers`, `getFullUser`,
+`getFullChannel`) catch `CHANNEL_INVALID` themselves and raise
+`SkipAndRecord`, and it is deliberately absent from `_skip_error_classes` below.
 """
 
 from __future__ import annotations
@@ -134,6 +136,17 @@ def _hard_stop_error_classes() -> tuple[type[Exception], ...]:
         SessionRevokedError,
         FakePeerFlood,
     )
+
+
+def is_flood_wait(exc: BaseException) -> bool:
+    """True for a server-mandated wait (`FloodWaitError`, or the `FakeFlood` double).
+
+    `Budget` uses this to own the sleep-vs-stop decision itself (it compares the
+    *applied* wait, not the raw seconds, against the ceiling — #69).
+    """
+    from telethon.errors import FloodWaitError
+
+    return isinstance(exc, FloodWaitError | FakeFlood)
 
 
 def classify(exc: BaseException, threshold: int = DEFAULT_FLOOD_SLEEP_THRESHOLD) -> Disposition:

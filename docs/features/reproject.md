@@ -65,6 +65,29 @@ scoped to that run's own `raw_records` rowid range, and each run's raw
 via `collect_channel(run_id=...)` — so a reprojected DB carries the same
 pass structure as its source and is itself faithfully re-reprojectable.
 
+A run's targets are identified by its `ResolvedPeer` **or `ChannelAccess`**
+records (#84): a run started by channel id has a receipt and no `ResolvedPeer`
+(unless it took the handle route), and replay serves Step A from the receipt,
+never from the output store's `peers`. `--include-target/--exclude-target`
+accept the marked `-100…` form as well as the bare id. A refused receipt
+(`granted: false` with `resolved_channel_id`: the stored handle now belongs to
+another channel) leaves the run a stray, as a non-channel resolution does.
+
+A run holds one receipt per Step A route attempted. When Telegram rejected a
+route (a `granted: false` receipt carrying an `error` name) and the collect fell
+through to the next one, `RawReplayGateway.channel_access_receipt` serves the
+refused attempts and then the final one, in recorded order, and the replayed
+run reproduces the same receipts and tables. A refused-by-error receipt still
+names the requested channel, so the `--include/--exclude-target` filter files
+the run under it.
+
+**Legacy runs** (recorded before #84) have no `ChannelAccess` at all. A replay
+with no receipt is told apart from a live run by the gateway's explicit
+`replay` flag, not by inspecting the store; such a run takes the handle path it
+took then (`resolve` the target, address the channel by the resolve-side key)
+and writes **no** `ChannelAccess` row into the output. Receipts appear in a
+reprojected store only for runs that recorded them.
+
 `HistoryCollector`'s live-collection incremental-vs-full-sweep bookkeeping
 (`sync_state` scopes `history`/`history_sweep`) needs *some* per-run reset
 before replaying, because a run's own raw window naturally running dry is a
@@ -103,7 +126,8 @@ real design changes, not that round's narrow scope.
 ## CLI
 
 ```
-paperboy reproject [--profile P] [--out PATH] [--phases a,b,c]
+paperboy reproject [--profile P] [--out PATH | --out-profile NAME] [--phases a,b,c]
+                   [--include-target T ... | --exclude-target T ...]
 ```
 
 - `--profile` (default `default`): selects `<data_dir>/<profile>/paperboy.sqlite`
@@ -111,6 +135,18 @@ paperboy reproject [--profile P] [--out PATH] [--phases a,b,c]
 - `--out` (default `<data_dir>/<profile>/paperboy.reprojected.sqlite`):
   refuses to overwrite an existing file — move it aside or pass a fresh path.
 - `--phases`: comma-separated override of the auto-detected phase set.
+- `--include-target T` / `--exclude-target T` (repeatable, mutually
+  exclusive; #70): replay only / everything but the named targets. `T` is
+  `@username`, `username`, `t.me/username` or a channel id; matching is by the
+  **resolved channel id**, so `@x` and `x` (both occur in real sources) are one
+  target. A linked discussion group follows its parent. See "Splitting a mixed
+  profile" below.
+- `--out-profile NAME` (#70; exclusive with `--out`): write the store to
+  `<data_dir>/NAME/paperboy.sqlite` and **copy** the media it references into
+  `<data_dir>/NAME/media/`. `NAME` must be a plain name, differ from
+  `--profile`, and not already hold a store. The log is
+  `<data_dir>/NAME/paperboy.sqlite.log` (the beside-`--out` rule); a later live
+  `collect --profile NAME` writes `paperboy.log`, a different file.
 
 On success: a per-target, per-phase counts table (mirroring `collect`'s own
 output), then a row-count diff — source vs. reprojected — per table, so the
@@ -124,10 +160,286 @@ operator can eyeball the correction before swapping files.
   Asserted in test by monkeypatching all three real constructors to raise.
 - **Zero credentials.** No keychain access anywhere on this path (asserted
   by monkeypatching `keyring.get_password` to raise).
-- **No media re-download or re-write.** `download_media` reads bytes back
-  from the source profile's content-addressed store; a live collect's own
-  write-if-not-exists guard (added as part of this feature) makes the
-  guarantee free to verify by monkeypatching `Path.write_bytes` to raise.
+- **No media re-download or re-write of final files.** `download_media`
+  streams the stored file back from the source profile's content-addressed
+  store into the collector's `MediaSink` (re-verifying its sha on the way
+  through): each payload's location is resolved as a media key under the
+  source profile dir (ADR-0007), and legacy absolute/cwd-relative payloads
+  are normalised by their sha, so a moved profile dir still replays. The
+  collector then finds the destination already present and records rows
+  only, so no final-name file is ever created or replaced; the test asserts
+  `os.replace` is never called and every stored file's size and sha are
+  unchanged. Replay uses a file-less hash-and-count sink (#64), so it writes
+  nothing into the source profile: a read-only source profile works (tested
+  by a size+mtime digest of the whole profile before and after). The one
+  exception is `--out-profile` (#70), which copies into the OUTPUT profile's
+  `media/` through the live write path; the source profile is still never
+  written.
+- **Log beside `--out`.** `reproject` writes `<out filename>.log` (`x.sqlite.log`, `x.log.log`;
+  never equal to the output DB; default `paperboy.reprojected.sqlite.log`), never into the source profile's
+  `paperboy.log`.
+- **WAL source in a read-only directory.** The source is opened `mode=ro`. A
+  WAL database whose `-shm`/`-wal` sidecars are absent, in a directory the
+  process cannot write, cannot be opened that way (SQLite must create the
+  sidecars; https://sqlite.org/wal.html, "Read-only databases"). `reproject`
+  then falls back to `immutable=1` and logs a WARNING: the source must not be
+  written concurrently while it is read. `immutable=1` ignores the WAL, so the
+  fallback is taken only for a real, existing source with no `-wal` (or an empty
+  one); a non-empty `-wal` in a non-writable directory is refused with an error
+  telling the operator to checkpoint the source from a writable location or
+  make its directory writable. A missing or corrupt source still fails with
+  SQLite's own error. All paths are tested. (A source that
+  is being written by a live `collect` should be `.backup`ed first.)
+- **Free-disk floor never consulted in replay** (tested by making
+  `shutil.disk_usage` raise). A stored file that is missing is `skipped` with
+  a WARNING and gets no `media` row. See the "Replay smoke (spec §4.1)" in
+  `media-streaming.md`.
+
+## Replaying `fetch-media` runs (#68)
+
+A `fetch-media` segment is an ordinary run (the standard `channel` + `media`
+collectors, targeting the channel id) with two differences that replay must
+honour. (1) A segment that reuses an already-established channel has no
+`channel` phase; it carries a `ChannelContextReused` marker, and `reproject`
+replays it as a media-only run: the channel id and tier come from the marker,
+the access hash from the *source* run's `ChatFull` for that channel (it holds
+the channel object whichever Step A route got the run in, so a source run that
+took route 1 and has no `ResolvedPeer` works; an unknown source run or one that
+never established the channel is a `ReprojectSourceError`, never guessed), and
+the target spelling from the source run's resolve records. Under
+`--include-target`/`--exclude-target` the marker's channel id decides. (2) A
+media phase scoped to specific ids records `MediaSelection` `{channel_id,
+msg_ids}` (legacy: `{msg_ids}`), written just before the media phase and only
+when the channel was established; replay walks only those ids, so a repost that
+the live run never considered gets no dedup custody row on replay.
+
+**Phase rule: replay what executed, not what was intended.** `media` is a
+replayed phase iff the run has `MediaDownload` rows or its `MediaSelection`
+names a channel for which the run recorded a `ChatFull`
+(`ReplaySource.channel_established`; a granted `ChannelAccess` always precedes
+that `ChatFull`). A granted segment with zero downloads therefore still
+replays; a refused one does not. Phase detection also no longer infers
+`history` for a run with no message and no `getChannelDifference` raw (a
+`--phases channel` run, a fetch-media segment). The paperboy-authored records
+keep their stored `observed_at` through `ReplayClock.pin_json`. Tests:
+`tests/test_reproject_fetch_media.py` (round-trip parity over a normal, a
+refused and a zero-download segment, a legacy selection, and the collector
+lists).
+
+## Splitting a mixed profile (#70)
+
+**Problem.** One `paperboy.sqlite` mixes two investigations (a channel of an
+unrelated investigation, plus its linked discussion group, was collected into
+`default`). Deleting rows from a copy would have to chase every table a
+channel touches and gets shared entities wrong. Instead the split is **two
+filtered reprojections of the untouched source**: each output is rebuilt from
+exactly the runs it should contain, raw rows included. Spec:
+`docs/superpowers/specs/2026-09-28-profile-split-design.md`; plan:
+`docs/superpowers/plans/2026-09-29-profile-split.md`. Below, the split-out
+investigation is `@<target>` and its new profile `<target-profile>`.
+
+**Operator procedure** (the agent never performs the swap on a real profile):
+
+1. Back up: `cp data/default/paperboy.sqlite data/default/paperboy.pre-split.sqlite`.
+2. Run the two splits, one after the other (each reads the source read-only):
+   ```
+   paperboy reproject --profile default --exclude-target @<target> \
+       --out data/default/paperboy.split.sqlite          # media stays where it is
+   paperboy reproject --profile default --include-target @<target> \
+       --out-profile <target-profile>                    # media is COPIED there
+   ```
+3. Verify both outputs (the leak checks and row-count table in the DoD below).
+4. Swap `data/default/paperboy.split.sqlite` in as `paperboy.sqlite` (keep the
+   pre-split backup until the bucket holds a verified clean snapshot).
+5. List, do not delete, media in `data/default/media/` that the new default no
+   longer references: `uv run python scripts/unreferenced_media.py --profile default`
+   (`media_audit.py`; prints `key  size` and a total; opens the store without
+   writing; deletion is the operator's call).
+6. Upload the clean snapshot as usual and replace the VM copy. Objects already
+   in the bucket stay under its retention policy.
+
+**Semantics.**
+
+- The filter unit is the `(run, raw target)` pair: a run can hold more than
+  one resolve. A pair is decided by the channel id its `ResolvedPeer` resolved
+  to; a wholly excluded run is skipped without building its index. Every pair
+  is logged (`reproject: run=… target=… channel_id=… decision=included|excluded`)
+  plus one summary line (`targets replayed=N skipped=M runs_touched=K filter=…`).
+- An unknown target (never resolved to a channel anywhere in the source) is an
+  error listing what the source contains (`@a (id) [+ linked group id]`, and how
+  many resolves went to non-channel peers). It is raised before any output
+  exists, so nothing is written. Naming a linked group's id is an unknown target.
+- **Stray resolves.** A pair that resolved to no channel (a user: the "stray
+  intrusion" of ADR-0005) inherits the channel decisions of its run: it goes
+  with the channel it sat beside. In a run whose channels split between the two
+  outputs, it is replayed in **both**, with a WARNING naming the run. Alone in
+  its run it is kept under `--exclude-target` (an unfiltered reproject replays
+  it to the same recorded `channel: skip`) and dropped under `--include-target`.
+- `--out-profile` reuses the **live write path** with the replay gateway as the
+  byte source: stream into `<NAME>/media/.incoming/<uuid>.part`, atomic
+  `os.replace` to `media/<xx>/<sha><ext>`, the free-disk floor
+  (`--media-min-free-gb`) checked against the **destination**, and the same
+  dedup (content id, sha, existing file). This is the one case a replay writes
+  files, and only ever under the output profile, never the source. A file both
+  investigations reference exists in both profiles. Rerun after an interrupt:
+  delete `<data_dir>/NAME/` first (the CLI removes only a half-made database on
+  an error; stale `.part` files are swept after an hour).
+- Every replayed media stream is now **verified against its receipt** (both
+  modes): a stored file whose bytes no longer hash to the receipt's sha is
+  `skipped` with a WARNING naming the sha prefix, instead of surfacing as a
+  misleading "not found" (or, when copying, landing under the wrong name).
+- No schema change: `docs/data-model.md` is unchanged.
+
+**Residuals inherited from reproject** (the outputs are reprojections, not
+surgical deletions): #36 (custody undercount for a run that only re-saw media),
+#37 (backfill absorbed into sync bookkeeping), #38/#39 (order-dependent peer
+lineage), #50 (person-layer bookkeeping) and #74 (`web_snapshots`). The DoD
+measures them rather than assuming they are zero. Entities another channel
+forwarded or mentioned (`peers`, `edges`, `users` rows naming the split-out
+channel) are legitimate in the clean store and are reported, not treated as
+leaks.
+
+### Definition of done — offline transcript (#70)
+
+Code under test: `1ebb45f` (all code commits of this change; docs followed).
+**Zero live Telegram calls**: `live-calls.log` was never created, no `doctor`,
+no credentials, no VPN check needed. Everything ran against a copy of the real
+store in a scratch data dir (`<scratch>`); the real data dir (`<data-dir>`) was
+only read through `sqlite3 ... ".backup ..."` and `stat`. Transcripts are
+unredacted in `<scratch>` (`setup.out`, `split-exclude.out`,
+`split-include.out`, `reproject-full.out`, `verify.out`, `verify2.out`,
+`audit.out`); below, the split-out investigation is `@<target>` (channel `T`,
+its linked group `L`) and its new profile `<target-profile>`.
+
+**Setup** (`setup.out`): the store is a `.backup` of the real one; its media is
+a real directory of 754 per-file symlinks into the real media dir, never a link
+to the whole directory. Real media dir, before:
+
+```
+find <data-dir>/default/media -type f ! -path '*/.incoming/*' | wc -l          -> 754
+... -exec stat -f %z {} + | awk '{s+=$1} END {print NR, s}'                     -> 754 34153238030
+find <scratch>/default/media -type l | wc -l                                    -> 754
+```
+
+**The two splits, run one after the other** (`/usr/bin/time -l`, exit 0 both):
+
+```
+paperboy reproject --profile default --exclude-target @<target> --out <scratch>/default/paperboy.split.sqlite
+  reproject: targets replayed=53 skipped=7 runs_touched=53 filter=exclude ids=[T]
+  2465.31 s real, 170852352 B max RSS, exit 0
+paperboy reproject --profile default --include-target @<target> --out-profile <target-profile>
+  reproject: targets replayed=7 skipped=53 runs_touched=6 filter=include ids=[T]
+  142.70 s real, 59572224 B max RSS, exit 0
+```
+
+To attribute differences to reproject's known behaviour rather than to the
+split, an **unfiltered** reproject of the same source was run as a baseline
+(`full`; 2923.36 s, exit 0, `reproject-full.out`).
+
+**Partition of the run/target pairs** (parsed from the two logs beside the
+outputs): `pairs=60 in clean only=53 in split-out only=7 in both=0 in
+neither=0`. The one pair with no channel id (a foreign resolve that landed on a
+user, the ADR-0005 "stray intrusion" in `legacy-0002`) followed the channel of
+its run: `excluded` from the clean store, `included` in the split-out one.
+
+**Leak checks** (`verify.out`):
+
+```
+## clean default (all must be 0)
+messages in T/L: 0            raw_records ctx channel_id in T/L: 0
+raw ResolvedPeer naming @<target>: 0
+media via message_uri: 0      custody via source uri: 0     custody uri prefix T/L: 0
+channels T/L: 0               participants T/L: 0
+## shared-entity mentions, reported (not leaks): peers naming T/L: 0   edges naming T/L: 0
+## split-out profile
+messages NOT in T/L: 0        channels not T/L: 0
+messages T / L: 543 / 4953    media / custody: 449 / 599    raw_records: 6262
+stray user-resolve raw rows: split-out 1, clean 0, source 1
+clean-store users who authored only T/L messages: 0
+```
+
+**Row counts** for every reprojected table (`verify.out`; `full` = the
+unfiltered baseline; last column = `source - split-out`, to compare with
+`clean`):
+
+```
+table                  source   full   clean  split-out   source-split-out
+raw_records             65827  65846   58089      6262    59565
+channels                   14     14      13         1       13
+channel_snapshots          61     61      55         6       55
+peers                     306    308     148       160      146
+messages                59050  59050   53554      5496    53554
+message_revisions       59050  59050   53554      5496    53554
+message_metrics         57071  57253   53051      4202    52869
+message_tombstones       3486   3486    3228       258     3228
+edges                    6076   6095    3573      2522     3554
+media                     755    753     304       449      306
+custody_log              1144   2434    1835       599      545
+web_snapshots           15314   2003    1641       362    14952
+users                     216    216     101         0      216
+user_snapshots            245    245     125         0      245
+user_photos                 0      0       0         0        0
+participants               34     34      34         0       34
+participant_snapshots      76     76      76         0       76
+```
+
+Reading it:
+
+- **The split is an exact partition** of an unfiltered reprojection wherever
+  the table is a projection of a run: `full = clean + split-out` for channels,
+  channel_snapshots, peers, messages, revisions, metrics, tombstones, edges,
+  media (753 = 304 + 449), custody_log (2434 = 1835 + 599), web_snapshots
+  (2003 = 1641 + 362), participants and participant_snapshots. No entity is
+  shared between the outputs (peers 308 = 148 + 160), so the "shared entity
+  seen in both" case did not arise on this store.
+- `source - split-out` differs from `clean` only through reproject's own
+  residuals, all present in `full` too: **#74** (web_snapshots 15314 -> 2003),
+  **#36/#37** (media 755 -> 753: the two files of `@<target>` missing on disk,
+  451 -> 449, `skipped` with a WARNING; custody_log: the unfiltered baseline
+  has MORE rows than the source, 2434 vs 1144, so this store no longer shows
+  the earlier 607 -> 599 undercount — the cause was not investigated here; it
+  is identical in `full`, so the split neither creates nor worsens it),
+  message_metrics (57071 vs 57253) and raw_records (65827 vs 65846) likewise.
+- **users / user_snapshots / raw `user` rows** are the one place the split
+  loses something: `full` has 216 users, `clean` 101, `split-out` 0, so 115
+  users (and their 120 snapshots, and 1495 raw rows = 115 x 13 runs) are in
+  neither output. All 115 authored messages only in `@<target>`/its group; they
+  are correctly absent from the clean store (no person-layer leak), but their
+  profiles were fetched inside 13 runs of OTHER targets (consistent with the
+  store-wide candidate list of the `profiles` triage), so the split-out profile
+  does not receive them. The source
+  and the pre-split backup keep them. Filed as
+  [#81](https://github.com/SpencerNorris/paperboy/issues/81) (needs per-row
+  provenance; not patched here).
+
+**Copied media in the split-out profile** (`verify2.out`): 449 files,
+720150296 bytes (= the stored bytes of the 449 present files); `.incoming/`
+empty, no `*.part`, no symlinks (real copies), every `media.path` resolves
+under `<target-profile>`. Sha spot check of 5 files, `shasum -a 256` == the
+file name == `media.sha256`: `OK` x 5 (`3c1a1e...`, `3d7564...`, `3dfc99...`,
+`3e65bf...`, `3f01fb...`).
+
+**`paperboy status`** (`verify2.out`): `<target-profile>` -> channels 1,
+messages 5496, peers 160, edges 2522, users 0, participants 0; the clean store
+(copied to `<scratch>/clean/paperboy.sqlite`, since `status` has no `--db`) ->
+channels 13, messages 53554, peers 148, edges 3573, users 101, participants 34.
+
+**Unreferenced-media audit** on the clean store (`audit.out`,
+`scripts/unreferenced_media.py --profile clean`, exit 0): `total: 450 file(s),
+720193308 bytes` = the 449 copied files (720150296 B) plus a stray
+`media/.DS_Store` (43012 B) that no row references; the listed keys equal the
+split-out profile's file list exactly apart from `.DS_Store`. Nothing was
+deleted.
+
+**Real media dir, after**: `754` / `754 34153238030` — identical to before.
+The source symlink farm gained no entry (`find ... -newer setup.out` -> 0) and
+holds no regular file. The only new files in `<scratch>/default` are the
+outputs, their logs and SQLite `-wal`/`-shm` sidecars (including the source's
+own: `ReplaySource` opens `mode=ro` in a writable directory).
+
+**Smoke verdict: PASS** — no non-zero exit, no leak query != 0, no copied-file
+sha mismatch, real media dir unchanged. The swap (procedure step 4) was not
+performed on any real profile.
 
 ## Design deviations from the spec (D4, plan §"Locked design decisions")
 
@@ -159,8 +471,130 @@ types with their TL namespace (`contacts.resolvedPeer` for `ResolvedPeer`,
 `ChannelDifference*`) but not others (`Message`, `ChatInvite*`,
 `SponsoredMessage`, `MediaDownload`, ...) — collectors record
 `payload.get("_", ...)` verbatim, so every kind lookup in `replay.py` matches
-a bare kind *or* any `<namespace>.<kind>` suffix (`_kind_clause`), not an
-exact string.
+a bare kind *or* any `<namespace>.<kind>` suffix (`kind_matches`, the Python
+twin of the SQL `_kind_clause` that the per-run walk still uses — see
+"Performance" below), not an exact string.
+
+## Performance — per-run raw index (#75)
+
+**Problem (measured).** Every replayed request used to be one SQL lookup shaped
+`lower(kind) = ? OR lower(kind) LIKE '%.k'` plus `json_extract(context_json,
+…)` plus `id BETWEEN run.lo AND run.hi`. `EXPLAIN QUERY PLAN` showed
+`SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)`: every
+lookup read every row of the run, `payload_json` included. On a `.backup` copy
+of the real store (65,827 raw rows, 65 runs, largest run 27,567 rows) one
+`MediaDownload` lookup that finds nothing took 6-11 s, and the store has
+~44,000 media-bearing messages, so the `media` phase was projected in days.
+
+**Mechanism (chosen: M5).** `ReplaySource.index(run)` walks the run's rowid
+window **once** (`RunIndex.WALK_SQL`, the only range query left) and keeps one
+small `RawEntry` per row (`id`, lower-cased kind, tier, `observed_at`, parsed
+context, and for message kinds `CAST($.id AS INTEGER)`, for web kinds `$.url`;
+never the payload). Every gateway method, `resolve`, `iter_history`, the
+`get_channel_difference` nested-message match and stamp, the web replay client
+and the phase-detection helpers (`resolve_targets`, `linked_group_ids`,
+`has_kind`, `has_context_channel`, `has_context_value`) answer from that index;
+a hit then fetches its payload by rowid (`SEARCH ... (rowid=?)`). One run is
+resident at a time (the next run replaces it). Results are identical by
+construction: same rows, same `id` order, payload text read verbatim, the SQL
+`CAST` kept in the walk, `NULL` never matching. The reproject parity suite is
+unchanged and green.
+
+| # | Option | Media lookup, a miss | Migration |
+|---|--------|----------------------|-----------|
+| M0 | today: `LIKE` + rowid range | 9.4-10 s (planner probe) | no |
+| M1 | `kind IN (exact spellings)` on the existing kind index | 61 ms first, ~0 after; message-kind lookups stay O(run) (1.1-1.6 s) and lose the early exit on hits | no |
+| M2/M3/M4 | new `(kind, id)`, expression, or `json_extract` indexes | 0.3-0.8 ms | yes, and one index per lookup shape |
+| **M5** | **per-run in-memory index** | **17,654 lookups in 13-20 ms** (build ~4-5 s once per run) | **no** |
+
+**Why not an index.** `ReplaySource` opens the source `mode=ro` (or
+`immutable=1`) and never migrates it — only the *output* goes through
+`Store.open`. An index migration would therefore silently not exist on an old,
+read-only or hand-copied source, which is exactly the case reproject serves.
+M5 needs nothing from the source, and it is the only option that also fixes
+`iter_history` (2.8-3.9 s per page x 252 pages on the biggest run before),
+`get_messages` misses, the diff's nested lookups and the once-per-run
+`has_context_value` / `MAX(observed_at)` walks. No schema, index or raw change,
+so no ADR (ADR-0005 has a one-line note) and no `docs/data-model.md` change.
+
+**Memory and logging.** About 0.9 KB per row (23.7 MB for the 27,567-row run,
+Python overhead included). Each run logs one INFO line from `paperboy.replay`:
+`replay index run=… rows=… message_rows=… context_bytes=… approx_bytes=…
+elapsed=…`, and a WARNING when one run's estimate exceeds 512 MB
+(`replay.INDEX_WARN_BYTES`). There is no hard cap and no failure.
+
+**Tests.** `tests/test_replay_index.py`: `kind_matches` equals the SQL clause
+over the stored spellings; entries are id-ordered and bucketed; `None` never
+matches; the SQL `CAST` semantics; one walk per run; the INFO/WARNING lines; a
+gateway lookup issues no `raw_records` SQL beyond one rowid point-fetch; a
+50,000-row run (5,000 media-bearing) with a timing bound; namespaced kinds.
+
+### Definition of done — offline transcript (#75)
+
+Offline only (no Telegram call). Source = a `sqlite3 .backup` copy of the real
+store in `<scratch>/75/default` (65,827 raw rows, 65 runs; the real data dir was
+only read by `.backup`); media = a per-file symlink farm (753 links, 2 missing
+files) into `<scratch>/75/default/media`, never a link to the real dir.
+Unredacted transcripts stay in `<scratch>/75/`.
+
+Before and after, `find -L <scratch>/75/default/media -type f | wc -l` -> `753`
+both times; `du -shL` -> `32G` both times; `find <scratch>/75/default -name
+'*.log' -o -name '.incoming'` -> nothing (the source was not written).
+
+**Before** (today's media lookup SQL, biggest run = 27,567 rows, an id with no
+`MediaDownload`; `before.py`):
+
+```
+runs()=65 in 10.7s
+EXPLAIN QUERY PLAN:
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+one missing-message media lookup #1: 5.77s row=None
+one missing-message media lookup #2: 9.20s row=None
+one missing-message media lookup #3: 10.70s row=None
+```
+
+**After** (`RunIndex` on the same run; `after.py`):
+
+```
+EXPLAIN QUERY PLAN of RunIndex.WALK_SQL (once per run):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+EXPLAIN QUERY PLAN of the payload fetch (per served hit):
+   SEARCH raw_records USING INTEGER PRIMARY KEY (rowid=?)
+media-bearing messages in the run: 17654
+index(run) build: 4.34s rows=27567
+17654 download_media misses through the gateway: 0.013s
+```
+
+**Full run** (background, PID recorded; phases `channel,history,media`, not
+narrowed): `reproject --profile default --phases channel,history,media`.
+
+```
+wall time                 1754.27 real (29 min 14 s)   34.75 user   35.72 sys
+maximum resident set size 71385088 bytes
+peak memory footprint     109085224 bytes
+index lines               65 (one per run); largest: rows=27567 message_rows=27341
+                          context_bytes=727748 approx_bytes=17267948 elapsed=5.03s
+media phase (first run with downloads) downloaded=150 duplicates=0
+media phase (a later run)               downloaded=0 duplicates=449 unavailable=5
+media phase (final run)                downloaded=2 duplicates=169 unavailable=6403
+```
+
+| table | source (backup) | reprojected (output) |
+|-------|-----------------|----------------------|
+| raw_records | 65827 | 57110 |
+| messages | 59050 | 52633 |
+| media | 755 | 753 |
+| custody_log | 1144 | 4593 |
+| web_snapshots | 15314 | 0 |
+
+(The reprojected column covers only the requested phases: no `web`, `graph`,
+`participants` or `profiles`, so `users`/`web_snapshots`/... are 0 by
+construction; `web_snapshots` is also #74's known loss, out of scope. Two
+missing stored files -> `media` 753 of 755.) The media phase, which made no
+visible progress in 3.5 h before this change, completes with the whole
+reproject in under 30 minutes; the bulk of the remaining time is hashing 32 GB
+of media.
+
 
 ## Round-trip equality contract (D5)
 

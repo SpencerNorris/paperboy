@@ -14,9 +14,14 @@ that paces every RPC and classifies every error per spec §8.
 
 ## Inputs
 
-- `TARGET`: `@name`, `t.me/name`, `t.me/name/123`, or a bare handle
-  (`targets.py`). v1 acts on channel-like targets only (invite hashes and
-  numeric peer ids parse but aren't resolvable yet — see Known limitations).
+- `TARGET` (`targets.py`), either a **handle** (`@name`, `name`, `t.me/name`,
+  `t.me/name/123`) or a channel **id** (#84): bare `123`, marked `-100123`,
+  or `t.me/c/123[/456]` (the message part is ignored). All id forms normalise
+  to the bare id. A leading `-` needs `--` on the command line
+  (`paperboy collect -- -100123`). A negative id without `-100` is a basic
+  group or user id and is rejected. Collecting by id requires that this
+  account has already been shown the channel (see Step A below); invite
+  hashes still parse but aren't resolvable.
 - `--profile`: selects the session/database compartment (`config.profile_dir`).
 - `--phases channel,history`: restricts which collectors run (default: both).
 - `--unsafe`: skips the `doctor` preflight gate.
@@ -38,9 +43,10 @@ that paces every RPC and classifies every error per spec §8.
 
 ## How it works
 
-`cli.py` → `recipes.collect_channel` runs `ChannelCollector` (resolve →
-`getFullChannel` → upsert channel + snapshot + `linked_group` edge → seed
-`pts` → upsert peers → identify `self`), then `HistoryCollector`: pages
+`cli.py` → `recipes.collect_channel` runs `ChannelCollector` (identify
+`self` → **Step A, get access** → `getFullChannel` → upsert channel +
+snapshot + `linked_group` edge → seed `pts` → upsert peers), then
+`HistoryCollector`: pages
 `getHistory` newest→oldest into `sync_ranges`, probes every id in the swept
 span that `getHistory` didn't return via `getMessages` (chunks of ≤200),
 tombstones any `messageEmpty` result (`evidence="empty"`), then immediately
@@ -48,6 +54,48 @@ runs `catch_up()` (`updates.getChannelDifference` from the stored `pts`) so
 the channel's sync state is current as of *now*. Every Telegram RPC goes
 through `Budget.call` (per-method pacing, persisted flood cooldowns, a
 per-run cap) — no collector or gateway method calls Telethon directly.
+
+### Step A: getting access to the channel (#84)
+
+Every channel request needs the id plus a per-account `access_hash` that
+Telegram only hands to an account when it shows it the channel. Step A
+obtains one, never guessing, by the first route that works (spec
+`docs/superpowers/specs/2026-09-30-collect-by-id-design.md` §2):
+
+1. **saved key**: a full (non-`min`) `access_hash` in `peers`.
+2. **from message**: a `min` peer with `(seen_in_chat, seen_in_msg)`
+   provenance into a chat whose own key is full, used as
+   `inputChannelFromMessage`. A `min` hash is never used as a key.
+3. **handle**: the stored username, resolved with `contacts.resolveUsername`
+   and accepted only if it resolves to the requested id (else
+   `the stored handle for channel N now belongs to channel M`, and the phase
+   is skipped). A handle target is this route without the verification.
+4. Nothing worked: the phase is skipped with an error naming what would
+   make each route work.
+
+"Works" means `getFullChannel` accepts the key. If it rejects a saved key, a
+from-message reference or a verified handle with an access error
+(`CHANNEL_INVALID`, `CHANNEL_PRIVATE`, `MSG_ID_INVALID`, i.e. what
+`Budget.call` turns into `SkipAndRecord` for that call), that attempt is
+recorded as a `ChannelAccess` receipt with `granted: false` and the `error`
+name, and the next route is tried (1, then 2, then 3, then the route-4 failure,
+which lists every route tried and its error). Floods, hard stops and phase
+stops are not access errors: they propagate and never trigger a fallback. A
+handle target has the one route, so its rejection is recorded (`granted: false` plus the error) and then propagates.
+
+Step A always appends a `ChannelAccess` raw record (`via`, `input_channel`,
+`granted`, ...; see `docs/data-model.md`) before `getFullChannel`, so replay
+serves Step A from the receipt instead of recomputing it from the output
+store. `getFullChannel`'s identity check is the verification for every route;
+afterwards the run uses the full key it returns, so a from-message start is a
+saved key next time. `status` and `export` also accept the id forms,
+offline, via `channels.id`. An id beyond SQLite's signed 64-bit range is
+rejected at parse time with a one-line message (exit 1, no traceback).
+
+On reproject, the refused attempts and the final one are replayed from the
+recorded receipts in order. A run recorded before #84 has no receipt: it
+replays exactly as it did then (handle path) and writes no `ChannelAccess` row
+(see `docs/features/reproject.md`).
 
 ## Edge cases handled
 
@@ -73,9 +121,16 @@ per-run cap) — no collector or gateway method calls Telethon directly.
 
 ## Known limitations (v1 core scope)
 
-- `resolve()` only implements `contacts.resolveUsername` — invite-hash and
-  bare numeric-id targets parse (`Target.is_channel_like`) but aren't
-  resolvable yet; only `@name`/`t.me/name` targets work end to end.
+- Invite-hash targets parse (`Target.is_channel_like`) but aren't
+  resolvable yet. An id target is only reachable when this account has
+  already been shown the channel (a saved key, a referencing message, or a
+  known handle; Step A route 4 otherwise).
+- `fetch-media` (#68) reaches every list channel through this same Step A
+  (id target, standard `channel` collector); a route-4 channel's rows are
+  `no_access` there (`docs/features/fetch-media.md`).
+- When Step A finds no route (route 4) no `ChannelAccess` receipt is written,
+  so that run has no target for `reproject`, which logs its existing "no
+  resolve records" warning and drops it.
 - A backfill resumed after an interruption only marks the *resumed* span
   `[1, cursor_at_interruption]` as a verified `sync_range` — the portion
   collected *before* the interruption isn't retroactively gap-probed by that
@@ -373,3 +428,125 @@ directly, not the full `collect_channel` recipe. A live confirmation of
 finding #1 (`paperboy collect <a private/no-admin channel> --unsafe` no
 longer crashing) is recommended as a follow-up by whoever next has
 interactive keychain access — see the DoD report for the exact command.
+
+## Collect-by-id smoke (#84)
+
+Offline evidence (all green on this branch): `pytest` 949 passed, `ruff check`
+clean, `pyright` 0 errors; the parity golden diff is only the added
+`ChannelAccess` raw row and the raw-id shifts it causes (no projected-table
+content change); id-target routes 1-4, replay of the receipt (output-store
+`peers` deliberately wrong, receipt still served) and `--exclude-target`
+by id are pinned by tests in `tests/test_collector_channel.py` and
+`tests/test_profile_split.py`.
+
+Offline smoke on a scratch `.backup` of the store (redacted; the real data
+dir is read-only). Output is verbatim apart from `<id>` substitutions; the
+rejection is a clean one-line message with exit 1 and no traceback (an earlier
+revision of this doc showed only the tail of a Rich traceback; fixed in
+`_parse_target_or_exit`, pinned by `test_negative_non_channel_id_is_rejected_without_a_traceback`):
+
+```
+$ paperboy status --profile default -- <id>          # bare id
+  messages 8400 / revisions 8400 / tombstones 304
+$ paperboy status --profile default -- -100<id>      # marked form, same channel
+  paperboy status —
+    -100<id>
+┏━━━━━━━━━━━━┳━━━━━━━┓
+┃ metric     ┃ count ┃
+┡━━━━━━━━━━━━╇━━━━━━━┩
+│ messages   │ 8400  │
+│ revisions  │ 8400  │
+│ tombstones │ 304   │
+└────────────┴───────┘
+$ paperboy status --profile default -- -123
+'-123' is a basic group or user id (channel ids look like -100<id>); collecting 
+non-channel peers is out of scope
+exit=1
+$ paperboy collect --profile default --phases channel -- -123
+'-123' is a basic group or user id (channel ids look like -100<id>); collecting 
+non-channel peers is out of scope
+exit=1
+$ paperboy status --profile default -- 999
+No local data for '999' yet — run `collect` first.
+exit=1
+```
+
+Reproject of the post-live scratch store (offline, a fresh `.backup` copy,
+`--phases channel`). Source `ChannelAccess` rows by `via`: `from_message` 1,
+`handle` 1, `saved_key` 2 (the four live runs; nothing earlier carries a
+receipt). `--exclude-target -100<minid>` (the min channel):
+
+```
+$ paperboy reproject --profile default --phases channel --exclude-target -100<minid>
+reproject: run=<run1> target=<fullid> channel_id=<fullid> decision=included       # live 1, saved_key
+reproject: run=<run2> target=<minid> channel_id=<minid> decision=excluded         # live 2, from_message
+reproject: run=<run3> target=<minid> channel_id=<minid> decision=excluded         # live 3, saved_key
+reproject: run=<run4> target=@<fullhandle> channel_id=<fullid> decision=included  # live 4, handle
+(whole store: 62 runs included, 2 excluded)
+output ChannelAccess rows by via: handle 1, saved_key 1
+```
+
+The two id-started runs of the min channel are excluded by its id; the id run
+of the full-key channel and the handle run are kept. (Re-run after the legacy
+fix: the 60 pre-feature handle runs in the store have no receipt, so they replay
+as before and write none; the two output rows are the live `saved_key` run and
+the live `handle` run. An earlier revision of this doc showed `handle 60` because
+replay minted a receipt for every legacy run, which spec 2.6 forbids.)
+`--include-target <minid>` instead keeps exactly those two runs and
+reproduces the `from_message` receipt:
+
+```
+$ paperboy reproject --profile default --phases channel --include-target <minid>
+reproject: run=<run2> target=<minid> channel_id=<minid> decision=included
+reproject: run=<run3> target=<minid> channel_id=<minid> decision=included
+channel access: id=<minid> via=from_message granted=True
+channel access: id=<minid> via=saved_key granted=True
+output ChannelAccess rows: from_message 1 (input_channel carries from_msg with msg_id)
+```
+
+Live smoke (`--phases channel`, scratch `.backup` data dir, VPN egress,
+`--max-rpc 20 --max-flood-sleep 60`, no `--media`/`--join`/`--unsafe`/
+`--profiles`): **4 of 5 live calls used, all exit 0, no FLOOD_WAIT, no stop
+condition.** Before every call: no stop flag, live-call counter below 5, and
+the VPN route check
+
+```
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+```
+
+Redacted log lines (`<id>`/`@<channel>`; unredacted transcripts are kept in
+the scratch dir as `live-1.txt` .. `live-4.txt`):
+
+```
+1. paperboy collect <id>          (full key, previously collected)
+   INFO channel access: id=<id> via=saved_key granted=True
+   channel | {'channels': 1, 'peers': 1}
+2. paperboy collect <id>          (min peer, seen via a message in a full-key chat)
+   INFO channel access: id=<id> via=from_message granted=True
+   channel | {'channels': 1, 'peers': 1}
+3. paperboy collect <id>          (same id again)
+   INFO channel access: id=<id> via=saved_key granted=True
+   channel | {'channels': 1, 'peers': 1}
+4. paperboy collect @<channel>    (handle of the call-1 channel)
+   INFO channel access: id=<id> via=handle granted=True
+   channel | {'channels': 1, 'peers': 1}
+```
+
+SQL on the scratch store afterwards (run ids elided, ids redacted):
+
+```
+ChannelAccess rows, newest first:  handle | saved_key | from_message | saved_key
+call 1: ChannelAccess(saved_key) then ChatFull; no ResolvedPeer in that run
+call 2: ChannelAccess(from_message) then ChatFull; no ResolvedPeer in that run
+        receipt input_channel = {"channel_id": <id>, "from_msg": {"access_hash": <n>, "channel_id": <n>, "msg_id": <id>}}
+        peers row for the min channel afterwards:  is_min=0 | access_hash present
+call 3: ChannelAccess(saved_key) then ChatFull; no ResolvedPeer
+call 4: ResolvedPeer, then ChannelAccess(handle), then ChatFull
+```
+
+So every route behaved as specified: route 1 and route 2 make no `resolve`
+call, the `getFullChannel` answer upgrades the `min` row to a full key (so
+the repeat is route 1), and the handle path is unchanged apart from the
+added receipt. No `CHANNEL_PRIVATE` refusal occurred, so the spare fifth call
+was not used.

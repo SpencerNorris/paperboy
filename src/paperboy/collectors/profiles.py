@@ -37,9 +37,9 @@ from datetime import datetime
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.posture import record_privacy_posture
-from paperboy.config import profile_dir
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import channel_uri, namespaced_kind, user_uri
+from paperboy.media_keys import media_key, resolve_media_key
 from paperboy.store.db import dumps
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
@@ -602,7 +602,6 @@ class ProfilesCollector:
             "SELECT restriction_json FROM users WHERE uri=?", (uri,)
         ).fetchone()
         restricted = bool(row and row["restriction_json"])
-        media_root = profile_dir(ctx.settings, ctx.profile) / "media"
         for photo in photos.get("photos") or []:
             if (photo.get("_") or "").lower() != "photo":
                 counts["photos_empty"] += 1  # `photoEmpty`: counted, never a row
@@ -616,7 +615,7 @@ class ProfilesCollector:
                 continue
             if user_photo_sha(ctx.store, uri, photo["id"]) is not None:
                 continue  # content-addressed and already on disk: never re-fetched
-            await self._download_avatar(ctx, uri, user_id, photo, media_root, counts)
+            await self._download_avatar(ctx, uri, user_id, photo, counts)
 
     async def _download_avatar(
         self,
@@ -624,7 +623,6 @@ class ProfilesCollector:
         uri: str,
         user_id: int,
         photo: dict,
-        media_root,
         counts: dict[str, int],
     ) -> None:
         try:
@@ -645,12 +643,13 @@ class ProfilesCollector:
             counts["unavailable"] += 1
             return
         sha = hashlib.sha256(data).hexdigest()
-        path = media_root / sha[:2] / f"{sha}.jpg"  # Telegram re-encodes avatars as JPEG
+        key = media_key(sha, ".jpg")  # Telegram re-encodes avatars as JPEG
+        path = resolve_media_key(ctx.settings, ctx.profile, key)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         raw_payload = {
-            "sha256": sha, "path": str(path), "size": len(data),
+            "sha256": sha, "path": key, "size": len(data),
             "user_uri": uri, "photo_id": photo["id"],
         }
         downloaded_at = ctx.clock.for_payload(raw_payload)
@@ -659,12 +658,12 @@ class ProfilesCollector:
             "attributes_json, path, downloaded_at) "
             "VALUES (?, NULL, 'avatar', 'image/jpeg', ?, NULL, NULL, ?, ?) "
             "ON CONFLICT(sha256) DO NOTHING",
-            (sha, len(data), str(path), downloaded_at),
+            (sha, len(data), key, downloaded_at),
         )
         ctx.store.conn.execute(
             "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri) "
             "VALUES (?, ?, ?, NULL)",
-            (str(path), sha, downloaded_at),
+            (key, sha, downloaded_at),
         )
         ctx.store.add_raw(
             "AvatarDownload", raw_payload, ctx.tier,

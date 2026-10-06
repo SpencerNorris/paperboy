@@ -1,0 +1,8 @@
+uri,priority,kind,size_mb,note
+tg:msg:10/1,P1,photo,0.1,synthetic row
+tg:msg:20/11,P1,photo,0.1,synthetic row
+tg:msg:10/2,P2,photo,0.1,synthetic row
+tg:msg:10/3,P2,photo,0.1,synthetic row
+tg:msg:20/12,P2,photo,0.1,synthetic row
+tg:msg:10/999,P3,photo,0.1,not in the store
+tg:msg:10/1,P3,photo,0.1,duplicate of the first row

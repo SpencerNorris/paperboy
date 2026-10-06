@@ -4,25 +4,30 @@ involved."""
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from paperboy import replay
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
+from paperboy.media_sink import MediaSink
 from paperboy.replay import RawReplayGateway, ReplaySource, ReprojectSourceError
 from paperboy.store.db import Store
 
 CID = 100
 IC = {"channel_id": CID, "access_hash": 7}
+# The receipt's sha must be the stored bytes' real sha: replay verifies it (#70).
+FILE_SHA = hashlib.sha256(b"file contents").hexdigest()
 
 
 def _seed(tmp_path):
     """A minimal raw log: self, resolve, full, three messages (one edited),
     a probe MessageEmpty, one diff, one recommendation set, one MediaDownload."""
     db = tmp_path / "src.sqlite"
-    media_root = tmp_path / "media"
+    profile_root = tmp_path
     with Store.open(db) as st:
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None,
                    observed_at="2026-01-01T00:00:00+00:00")
@@ -57,22 +62,22 @@ def _seed(tmp_path):
                              "chats": [{"_": "Channel", "id": 200, "access_hash": 9}]},
                    "stranger", {"channel_id": CID},
                    observed_at="2026-01-01T00:05:00+00:00")
-        sha = "ab" + "0" * 62
-        path = media_root / sha[:2] / f"{sha}.txt"
+        sha = FILE_SHA
+        path = profile_root / "media" / sha[:2] / f"{sha}.txt"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"file contents")
         st.add_raw("MediaDownload",
                    {"sha256": sha, "kind": "document", "size": 13,
                     "mime_type": "text/plain", "file_name": "a.txt",
-                    "path": str(path), "message_uri": f"tg:msg:{CID}/2"},
+                    "path": f"media/{sha[:2]}/{sha}.txt", "message_uri": f"tg:msg:{CID}/2"},
                    "stranger", {"channel_id": CID, "msg_id": 2},
                    observed_at="2026-01-01T00:06:00+00:00")
-    return db, media_root
+    return db, profile_root
 
 
 def _gateway(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     clock = ReplayClock()
     # The seeded fixtures are single-run (no begin_run/run_id involved), so
     # this is the source's one (legacy-labeled) run — behavior is unchanged
@@ -94,6 +99,25 @@ async def test_resolve_unknown_target_skips(tmp_path):
     gw, _ = _gateway(tmp_path)
     with pytest.raises(SkipAndRecord):
         await gw.resolve("someone_else")
+
+
+@pytest.mark.asyncio
+async def test_channel_access_receipt_serves_the_run_receipt_and_stamps_clock(tmp_path):
+    db, profile_root = _seed(tmp_path)
+    receipt = {
+        "_": "ChannelAccess", "channel_id": CID, "requested": "100", "via": "saved_key",
+        "granted": True, "input_channel": IC, "key_source_raw_id": 2,
+    }
+    with Store.open(db) as st:
+        st.add_raw("ChannelAccess", receipt, "stranger", {"target": "100", "channel_id": CID},
+                   observed_at="2026-01-01T00:00:01+00:00")
+    src = ReplaySource.open(db, profile_root)
+    clock = ReplayClock()
+    gw = RawReplayGateway(src, clock, src.runs()[0])
+    served = await gw.channel_access_receipt("100")
+    assert served is not None and served == receipt
+    assert clock.for_payload(served) == "2026-01-01T00:00:01+00:00"
+    assert await gw.channel_access_receipt("101") is None
 
 
 @pytest.mark.asyncio
@@ -160,9 +184,31 @@ async def test_sponsored_reconstructs_envelope_or_empty(tmp_path):
 async def test_download_media_reads_content_addressed_file(tmp_path):
     gw, clock = _gateway(tmp_path)
     del clock
-    data = await gw.download_media(IC, {"id": 2})
-    assert data == b"file contents"
-    assert await gw.download_media(IC, {"id": 3}) is None  # no record -> unavailable
+    with MediaSink(tmp_path / "t.part") as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
+    assert (tmp_path / "t.part").read_bytes() == b"file contents"
+    with MediaSink(tmp_path / "u.part") as sink2:
+        # no record -> unavailable
+        assert await gw.download_media(IC, {"id": 3}, sink2) is False
+    assert sink2.size == 0
+
+
+@pytest.mark.asyncio
+async def test_download_media_streams_in_chunks(tmp_path, monkeypatch):
+    gw, _ = _gateway(tmp_path)
+    monkeypatch.setattr(replay, "_CHUNK", 4)
+    writes: list[int] = []
+
+    class Recording(MediaSink):
+        def write(self, chunk: bytes) -> int:
+            writes.append(len(chunk))
+            return super().write(chunk)
+
+    with Recording(tmp_path / "t.part") as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert len(writes) == 4  # 13 bytes in 4-byte reads
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
 
 
 @pytest.mark.asyncio
@@ -180,8 +226,8 @@ async def test_doctor_methods_are_not_replayable(tmp_path):
 
 
 def test_source_helpers(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     run = src.runs()[0]
     assert src.resolve_targets(run) == ["@durov"]
     assert src.linked_group_ids(run) == {555}
@@ -189,8 +235,8 @@ def test_source_helpers(tmp_path):
 
 
 def test_source_is_read_only(tmp_path):
-    db, media_root = _seed(tmp_path)
-    src = ReplaySource.open(db, media_root)
+    db, profile_root = _seed(tmp_path)
+    src = ReplaySource.open(db, profile_root)
     with pytest.raises(sqlite3.OperationalError):
         src.conn.execute("DELETE FROM raw_records")
 
@@ -208,7 +254,7 @@ def test_runs_groups_by_run_id_in_capture_order(tmp_path):
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
         st.begin_run("bbb")
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     runs = src.runs()
     assert [(r.run_id, r.lo, r.hi) for r in runs] == [("aaa", 1, 2), ("bbb", 3, 3)]
 
@@ -220,7 +266,7 @@ def test_runs_segments_legacy_rows_at_self_markers(tmp_path):
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 2), ("legacy-0002", 3, 4),
     ]
@@ -250,7 +296,7 @@ def test_runs_handles_a_source_predating_the_run_id_column(tmp_path):
     conn.commit()
     conn.close()
 
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     runs = src.runs()
     assert [(r.run_id, r.lo, r.hi) for r in runs] == [("legacy-0001", 1, 2)]
 
@@ -274,7 +320,7 @@ def test_runs_absorbs_leading_rows_written_before_the_first_self_marker(tmp_path
         # A genuinely new pass: its own self marker cuts a real boundary.
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
     ]
@@ -300,7 +346,7 @@ def test_runs_absorbs_resolve_before_self_at_every_boundary(tmp_path):
         st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 8),
     ]
@@ -341,7 +387,7 @@ def test_runs_does_not_split_a_run_on_a_foreign_single_row_intrusion(tmp_path):
                    {"channel_id": 5, "msg_id": 2})
         st.add_raw("MediaDownload", {"sha256": "c" * 64}, "stranger",
                    {"channel_id": 5, "msg_id": 3})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [("legacy-0001", 1, 7)]
 
 
@@ -360,7 +406,7 @@ def test_runs_still_cuts_a_genuine_boundary_after_a_foreign_intrusion(tmp_path):
         # A genuine second pass: its own self marker cuts a real boundary.
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 3}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 4), ("legacy-0002", 5, 6),
     ]
@@ -379,7 +425,7 @@ def test_runs_raises_on_a_genuinely_interleaved_stamped_run_id(tmp_path):
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.begin_run("aaa")
         st.add_raw("Message", {"_": "message", "id": 1}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     with pytest.raises(ReprojectSourceError, match="aaa"):
         src.runs()
 
@@ -399,7 +445,7 @@ def test_runs_splits_consecutive_all_opening_passes(tmp_path):
             st.add_raw("ResolvedPeer", {"_": "contacts.resolvedPeer"}, "stranger",
                        {"target": "@x"})
             st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 3), ("legacy-0002", 4, 6), ("legacy-0003", 7, 9),
     ]
@@ -417,7 +463,7 @@ def test_runs_splits_consecutive_resolve_full_self_passes(tmp_path):
                        {"target": "@x"})
             st.add_raw("ChatFull", {"_": "messages.chatFull"}, "stranger", {"channel_id": 5})
             st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 3), ("legacy-0002", 4, 6),
     ]
@@ -432,7 +478,106 @@ def test_runs_mixed_legacy_then_stamped(tmp_path):
         st.begin_run("ccc")
         st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None)
         st.add_raw("Message", {"_": "message", "id": 2}, "stranger", {"channel_id": 5})
-    src = ReplaySource.open(db, tmp_path / "media")
+    src = ReplaySource.open(db, tmp_path)
     assert [(r.run_id, r.lo, r.hi) for r in src.runs()] == [
         ("legacy-0001", 1, 2), ("ccc", 3, 4),
     ]
+
+
+def _set_payload_path(db, kind, value):
+    """Rewrite the seeded payload's stored location (simulates a pre-#62 archive)."""
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.path', ?) "
+            "WHERE kind = ?",
+            (value, kind),
+        )
+
+
+@pytest.mark.asyncio
+async def test_download_media_normalises_legacy_absolute_payload_path(tmp_path):
+    db, _ = _seed(tmp_path)
+    sha = FILE_SHA
+    gone =tmp_path / "gone" / "data" / "default" / "media" / sha[:2] / f"{sha}.txt"
+    _set_payload_path(db, "MediaDownload", str(gone))  # the directory is never created
+    src = ReplaySource.open(db, tmp_path)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with MediaSink(tmp_path / "t.part") as sink:
+        assert await gw.download_media({"channel_id": CID}, {"id": 2}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"file contents").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_download_media_payload_without_sha_is_a_skip(tmp_path):
+    db, _ = _seed(tmp_path)
+    _set_payload_path(db, "MediaDownload", "bogus.bin")
+    src = ReplaySource.open(db, tmp_path)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with MediaSink(tmp_path / "t.part") as sink, pytest.raises(SkipAndRecord):
+        await gw.download_media({"channel_id": CID}, {"id": 2}, sink)
+
+
+@pytest.mark.asyncio
+async def test_download_media_rejects_a_file_whose_sha_differs_from_the_receipt(tmp_path):
+    db, root = _seed(tmp_path)
+    (root / "media" / FILE_SHA[:2] / f"{FILE_SHA}.txt").write_bytes(b"file c0ntents")  # bit rot
+    src = ReplaySource.open(db, root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with MediaSink(None) as sink, pytest.raises(SkipAndRecord, match="does not match"):
+        await gw.download_media(IC, {"id": 2}, sink)
+
+
+def test_resolve_catalogue_maps_targets_to_channel_ids(tmp_path):
+    from tests.test_profile_split import seed_two_target_source
+
+    db = seed_two_target_source(tmp_path)
+    run1, run2 = ReplaySource.open(db, tmp_path / "default").runs()[:2]
+    with Store.open(db) as st:
+        # A foreign resolve that landed on a USER (ADR-0005 "stray intrusion"):
+        # in run 2's rowid window, so no channel id, no username.
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer", "peer": {"_": "PeerUser", "user_id": 9},
+                    "chats": [], "users": []},
+                   "stranger", {"target": "@stray"}, observed_at="2026-01-01T00:00:00+00:00")
+    src = ReplaySource.open(db, tmp_path / "default")
+    records = src.resolve_catalogue()
+    assert [(r.run_id, r.raw_target, r.channel_id, r.username) for r in records] == [
+        (run1.run_id, "@alpha", 5, "alpha"),
+        (run2.run_id, "@beta", 6, "beta"),
+        (run2.run_id, "@stray", None, None),
+    ]
+    assert src.linked_group_map() == {6: 77}
+
+
+def test_resolve_catalogue_private_channel_has_no_username(tmp_path):
+    db = tmp_path / "src.sqlite"
+    with Store.open(db) as st:
+        st.add_raw("User", {"_": "user", "id": 1, "self": True}, "self", None,
+                   observed_at="2026-01-01T00:00:00+00:00")
+        st.add_raw("ResolvedPeer",
+                   {"_": "contacts.ResolvedPeer",
+                    "peer": {"_": "PeerChannel", "channel_id": 8},
+                    "chats": [{"_": "Channel", "id": 8, "access_hash": 7}]},
+                   "stranger", {"target": "t.me/+abcdef"},
+                   observed_at="2026-01-01T00:00:01+00:00")
+    [rec] = ReplaySource.open(db, tmp_path).resolve_catalogue()
+    assert (rec.channel_id, rec.username) == (8, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_matches_the_handle_an_id_target_was_resolved_through(tmp_path):
+    db, profile_root = _seed(tmp_path)
+    with Store.open(db) as st:
+        st.add_raw(
+            "ResolvedPeer",
+            {"_": "contacts.ResolvedPeer",
+             "peer": {"_": "PeerChannel", "channel_id": 5},
+             "chats": [{"_": "Channel", "id": 5, "access_hash": 9}]},
+            "stranger", {"target": "5", "handle": "viahandle"},
+            observed_at="2026-01-01T00:00:09+00:00",
+        )
+    src = ReplaySource.open(db, profile_root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    assert (await gw.resolve("viahandle"))["peer"]["channel_id"] == 5
+    # The legacy spelling still matches its own record.
+    assert (await gw.resolve("durov"))["peer"]["channel_id"] == CID

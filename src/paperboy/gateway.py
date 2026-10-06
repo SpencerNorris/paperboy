@@ -10,20 +10,20 @@ call routed through `Budget.call`).
 from __future__ import annotations
 
 import base64
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from telethon import TelegramClient
     from telethon.tl.types import (
-        InputChannel,
-        InputPeerChannel,
         TypeChannelParticipantsFilter,
+        TypeInputChannel,
         TypeInputPeer,
         TypeInputUser,
     )
 
     from paperboy.budget import Budget
+    from paperboy.media_sink import MediaSink
 
 
 class Gateway(Protocol):
@@ -31,8 +31,18 @@ class Gateway(Protocol):
         """`contacts.resolveUsername` — returns `{"chats": [...], "users": [...]}`."""
         ...
 
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        """Replay-only: live gateways return None; Step A is computed from the
+        store and recorded. `RawReplayGateway` serves the run's recorded
+        `ChannelAccess` receipt for `target_raw` (#84, ADR-0001 amendment)."""
+        ...
+
     async def get_full_channel(self, input_channel: dict) -> dict:
-        """`channels.getFullChannel` — `{"full_chat": {...}, "chats": [...], "users": [...]}`."""
+        """`channels.getFullChannel` — `{"full_chat": {...}, "chats": [...], "users": [...]}`.
+
+        `input_channel` is either `{"channel_id", "access_hash"}` or the
+        from-message form `{"channel_id", "from_msg": {"channel_id",
+        "access_hash", "msg_id"}}` (every channel-taking method accepts both)."""
         ...
 
     def iter_history(
@@ -66,12 +76,17 @@ class Gateway(Protocol):
         """`account.getPrivacy` for one key (`phone`/`lastseen`/`photo`) — `{"rules": [...]}`."""
         ...
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
-        """Download one message's media (`upload.getFile`, via Telethon's own
-        `download_media` helper) as raw bytes — `None` if the media is gone/
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
+        """Stream one message's media (`upload.getFile`, via Telethon's own
+        `download_media` helper) into `sink` — `False` if the media is gone/
         unavailable server-side. `message` need only carry enough to
         re-resolve the live message (its `id`); read-only, never mutates
-        anything on Telegram's side."""
+        anything on Telegram's side. May raise `SkipAndRecord` or
+        `MediaSizeExceeded` (the sink's declared-size limit). Every attempt
+        begins with `sink.reset()`, so a retried download never appends to a
+        partial one (#64)."""
         ...
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
@@ -144,7 +159,8 @@ class Gateway(Protocol):
     async def download_user_photo(self, photo: dict) -> bytes | None:
         """Download one `Photo` from `get_user_photos` (largest size) as raw
         bytes via `upload.getFile`; `None` if gone. Raises `SkipAndRecord`
-        when its `file_reference` has expired. Read-only."""
+        when its `file_reference` has expired. Read-only. Still returns bytes:
+        avatars are < ~1 MB, so streaming them is out of scope (#64)."""
         ...
 
     async def get_message_reactions_list(
@@ -165,7 +181,10 @@ class FakeGateway:
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
     `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`;
     missing key → `SkipAndRecord`, was `KeyError`),
-    `media` (a `{msg_id: bytes}` lookup for `download_media`).
+    `media` (a `{msg_id: bytes | Callable[[], Iterable[bytes]] | None |
+    BaseException}` lookup for `download_media`: bytes are streamed into the
+    sink in three slices, a callable supplies the chunks lazily so a large
+    stream never sits in memory, `None`/missing → unavailable).
     `channel_recommendations`, `sponsored_messages`, `chat_invite` (a
     `{hash: dict}` lookup). Any of these three graph-collector fixture
     values may instead be a `BaseException` instance (e.g. a `SkipAndRecord`)
@@ -219,18 +238,51 @@ class FakeGateway:
         self.user_photos_calls: list[int] = []
         self.avatar_calls: list[int] = []
         self.reactions_calls: list[tuple[int, int, str | None]] = []
+        # Every `input_channel` `get_full_channel` was called with, so a test
+        # can tell the saved-key form from the from-message form (#84).
+        self.full_channel_inputs: list[dict] = []
+        self._receipts_served = 0
 
     async def resolve(self, target_value: str) -> dict:
         self.calls.append("resolve")
         del target_value
-        return self._fx["resolve"]
+        value = self._fx["resolve"]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    @property
+    def replay(self) -> bool:
+        """A `channel_access` fixture (even `None`: a run with no receipt) makes
+        this fake a replay, as `RawReplayGateway` is."""
+        return "channel_access" in self._fx
+
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        # Not an RPC (so not in `calls`): the fixture (a receipt, or a list of
+        # them served in order) lets a test prove a recorded receipt beats the
+        # store, as replay does.
+        del target_raw
+        fx = self._fx.get("channel_access")
+        if fx is None:
+            return None
+        receipts = fx if isinstance(fx, list) else [fx]
+        index = self._receipts_served
+        self._receipts_served += 1
+        return receipts[index] if index < len(receipts) else None
 
     async def get_full_channel(self, input_channel: dict) -> dict:
         self.calls.append("get_full_channel")
+        self.full_channel_inputs.append(dict(input_channel))
         # `full_channel_by_id` lets a test answer the LINKED GROUP's ChatFull
         # (participants preflight) differently from the target's.
         by_id: dict[int, object] = self._fx.get("full_channel_by_id", {})
         value = by_id.get(input_channel["channel_id"], self._fx.get("full_channel"))
+        # `full_channel_sequence` answers the Nth call (0-based) of a run
+        # differently — e.g. a rejected first route then an accepted second
+        # (#84 route fallback); calls past its end use the fixtures above.
+        sequence: list[object] = self._fx.get("full_channel_sequence", [])
+        if len(self.full_channel_inputs) <= len(sequence):
+            value = sequence[len(self.full_channel_inputs) - 1]
         if isinstance(value, BaseException):
             raise value
         if value is None:
@@ -299,14 +351,27 @@ class FakeGateway:
         if isinstance(value, BaseException):
             raise value
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
         self.calls.append("download_media")
         del input_channel
         self.download_media_calls.append(message["id"])
         value = self._fx.get("media", {}).get(message["id"])
+        if value is None:
+            return False
         if isinstance(value, BaseException):
             raise value
-        return value
+        sink.reset()
+        if callable(value):
+            chunks = cast("Iterable[bytes]", value())
+            for chunk in chunks:
+                sink.write(chunk)
+        else:
+            step = max(1, len(value) // 3)
+            for i in range(0, len(value), step):
+                sink.write(value[i : i + step])
+        return True
 
     async def get_channel_recommendations(self, input_channel: dict) -> dict:
         self.calls.append("get_channel_recommendations")
@@ -446,17 +511,36 @@ class FakeGateway:
         return value
 
 
-def _input_channel(input_channel: dict) -> InputChannel:
+def _input_channel(input_channel: dict) -> TypeInputChannel:
+    """`{"channel_id", "access_hash"}` → `InputChannel`; the from-message form
+    (`from_msg`: a chat whose own key is known + a message in it that showed
+    the channel) → `InputChannelFromMessage`. Mirrors `_input_user` (#84)."""
     from telethon.tl.types import InputChannel as _InputChannel
+    from telethon.tl.types import InputChannelFromMessage
 
+    from_msg = input_channel.get("from_msg")
+    if from_msg is not None:
+        return InputChannelFromMessage(
+            peer=_input_peer_channel(from_msg),
+            msg_id=from_msg["msg_id"],
+            channel_id=input_channel["channel_id"],
+        )
     return _InputChannel(
         channel_id=input_channel["channel_id"], access_hash=input_channel["access_hash"]
     )
 
 
-def _input_peer_channel(input_channel: dict) -> InputPeerChannel:
+def _input_peer_channel(input_channel: dict) -> TypeInputPeer:
     from telethon.tl.types import InputPeerChannel as _InputPeerChannel
+    from telethon.tl.types import InputPeerChannelFromMessage
 
+    from_msg = input_channel.get("from_msg")
+    if from_msg is not None:
+        return InputPeerChannelFromMessage(
+            peer=_input_peer_channel(from_msg),
+            msg_id=from_msg["msg_id"],
+            channel_id=input_channel["channel_id"],
+        )
     return _InputPeerChannel(
         channel_id=input_channel["channel_id"], access_hash=input_channel["access_hash"]
     )
@@ -572,18 +656,33 @@ class TelethonGateway:
         )
         return result.to_dict()
 
+    async def channel_access_receipt(self, target_raw: str) -> dict | None:
+        # Live: Step A is computed from the store by the collector and recorded.
+        del target_raw
+        return None
+
     async def get_full_channel(self, input_channel: dict) -> dict:
+        from telethon.errors import ChannelInvalidError
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.types.messages import ChatFull
 
+        from paperboy.budget import SkipAndRecord
+
         channel = _input_channel(input_channel)
-        result = cast(
-            ChatFull,
-            await self.budget.call(
-                "channels.getFullChannel",
-                lambda: self.client(GetFullChannelRequest(channel=channel)),
-            ),
-        )
+        try:
+            result = cast(
+                ChatFull,
+                await self.budget.call(
+                    "channels.getFullChannel",
+                    lambda: self.client(GetFullChannelRequest(channel=channel)),
+                ),
+            )
+        except ChannelInvalidError as exc:
+            # A stale saved key or from-message reference (message deleted, hash
+            # rotated) answers CHANNEL_INVALID: an access refusal the channel
+            # collector answers by trying its next route (#84, spec §2.2) — scoped
+            # here, not in `classify`, for the reason errors.py gives.
+            raise SkipAndRecord(str(exc)) from exc
         return result.to_dict()
 
     async def iter_history(
@@ -723,16 +822,25 @@ class TelethonGateway:
         )
         return result.to_dict()
 
-    async def download_media(self, input_channel: dict, message: dict) -> bytes | None:
-        """Re-fetch the live message (`channels.getMessages`) and download its
-        media in-memory (`file=bytes` tells Telethon to return bytes instead
-        of writing to disk). A fresh fetch carries a fresh `file_reference`;
-        if the download still races an expiry (`FileReferenceExpiredError`
-        isn't in `errors.classify`'s tables, so `Budget.call` re-raises it
-        verbatim rather than converting it), re-fetch once more and retry
-        exactly once. A second consecutive expiry is converted to
-        `SkipAndRecord` here — skip this one file, spec §8's "no exception
-        is swallowed" honored by recording *why*, not by crashing the run.
+    async def download_media(
+        self, input_channel: dict, message: dict, sink: MediaSink
+    ) -> bool:
+        """Re-fetch the live message (`channels.getMessages`) and stream its
+        media into `sink` (`file=sink`: Telethon writes each chunk to any
+        object with `write`, so memory stays at one chunk however large the
+        file). A fresh fetch carries a fresh `file_reference`; if the download
+        still races an expiry (`FileReferenceExpiredError` isn't in
+        `errors.classify`'s tables, so `Budget.call` re-raises it verbatim
+        rather than converting it), re-fetch once more and retry exactly
+        once. A second consecutive expiry is converted to `SkipAndRecord`
+        here — skip this one file, spec §8's "no exception is swallowed"
+        honored by recording *why*, not by crashing the run.
+
+        Every attempt starts with `sink.reset()`: `Budget.call` re-invokes the
+        factory after a RETRY-class error (budget.py), and the file-reference
+        retry re-enters it too, so a retried download must never append to a
+        partial one or hash garbage. `MediaSizeExceeded` (raised by the sink)
+        is not an `OSError`, so `Budget` re-raises it without retrying.
         """
         from telethon.errors import FileReferenceExpiredError
         from telethon.tl.functions.channels import GetMessagesRequest
@@ -762,28 +870,26 @@ class TelethonGateway:
             # runtime behavior change.
             return cast(Message, result.messages[0]) if result.messages else None
 
-        async def _download(tl_message: Message) -> bytes | None:
-            # `file=bytes` is Telethon's own documented idiom for "download
-            # in-memory and return it as a bytestring" — untyped in its
-            # stubs (`hints.FileLike` has no meta-type case for it), so the
-            # `Any` cast is a stub gap, not a real type mismatch.
-            return cast(
-                bytes | None,
-                await self.budget.call(
-                    "upload.getFile",
-                    lambda: self.client.download_media(tl_message, file=cast(Any, bytes)),
-                ),
-            )
+        async def _download(tl_message: Message) -> bool:
+            def _attempt() -> Awaitable[object]:
+                sink.reset()  # every Budget attempt starts clean (budget.py)
+                # `hints.FileLike` has no protocol case for a duck-typed
+                # writer, so the `Any` cast is a stub gap, not a real type
+                # mismatch. Telethon returns `None` when there is nothing to
+                # download (non-Photo/Document, empty size).
+                return self.client.download_media(tl_message, file=cast(Any, sink))
+
+            return await self.budget.call("upload.getFile", _attempt) is not None
 
         tl_message = await _fetch_message()
         if tl_message is None:
-            return None
+            return False
         try:
             return await _download(tl_message)
         except FileReferenceExpiredError:
             tl_message = await _fetch_message()
             if tl_message is None:
-                return None
+                return False
             try:
                 return await _download(tl_message)
             except FileReferenceExpiredError as exc:

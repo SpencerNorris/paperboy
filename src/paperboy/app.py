@@ -6,6 +6,7 @@ every real object gets built here so tests can monkeypatch one seam
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,11 +16,13 @@ from paperboy.budget import Budget
 from paperboy.config import profile_dir
 from paperboy.gateway import TelethonGateway
 from paperboy.logging_setup import register_secret
-from paperboy.replay import ReplaySource
+from paperboy.replay import ReplaySource, ReplaySourceError
 from paperboy.secrets import SERVICE, KeyringSecrets
 from paperboy.store.db import Store
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from telethon import TelegramClient
 
     from paperboy.config import Settings
@@ -131,6 +134,9 @@ async def build_gateway(
     """
     client = build_client(settings, secrets, profile)
     budget = Budget(settings, store, method_intervals=profile_method_intervals(settings))
+    logging.getLogger("paperboy.app").info(
+        "pacing: %s; flood ceiling=%ds", budget.describe_pacing(), settings.flood_sleep_threshold
+    )
     await client.connect()
     return TelethonGateway(client, budget)
 
@@ -140,20 +146,44 @@ def build_store(settings: Settings, profile: str) -> Store:
     return Store.open(path)
 
 
+def open_replay_source(settings: Settings, profile: str) -> ReplaySource:
+    """Open `profile`'s DB strictly read-only as a replay source."""
+    source_db = profile_dir(settings, profile) / "paperboy.sqlite"
+    if not source_db.exists():
+        raise ConfigError(f"no source DB for profile {profile!r} at {source_db}")
+    try:
+        return ReplaySource.open(source_db, profile_dir(settings, profile))
+    except ReplaySourceError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def build_reproject(
-    settings: Settings, profile: str, out_path: Path
+    settings: Settings,
+    profile: str,
+    out_path: Path,
+    *,
+    check: Callable[[ReplaySource], None] | None = None,
 ) -> tuple[ReplaySource, Store]:
     """Wire the replay pair's source + a fresh target `Store`. Deliberately
     the ONLY composition path for `reproject`: no client, no gateway, no
     `Budget`, no secrets — a reproject is incapable of touching Telegram,
     the web, or the keychain (spec §2, §8).
+
+    `check(source)` runs after the source is open and BEFORE the output exists
+    (`Store.open` creates its directory), so a rejected `--include/--exclude-
+    target` (#70) leaves nothing on disk. It may raise `ReprojectError`; the
+    source is closed first.
     """
-    source_db = profile_dir(settings, profile) / "paperboy.sqlite"
-    if not source_db.exists():
-        raise ConfigError(f"no source DB for profile {profile!r} at {source_db}")
-    if out_path.exists():
-        raise ConfigError(
-            f"refusing to overwrite existing {out_path} — move it aside or pass a fresh --out"
-        )
-    media_root = profile_dir(settings, profile) / "media"
-    return ReplaySource.open(source_db, media_root), Store.open(out_path)
+    source = open_replay_source(settings, profile)
+    try:
+        if check is not None:
+            check(source)
+        if out_path.exists():
+            raise ConfigError(
+                f"refusing to overwrite existing {out_path} — move it aside or pass a "
+                "fresh --out"
+            )
+        return source, Store.open(out_path)
+    except BaseException:
+        source.close()
+        raise

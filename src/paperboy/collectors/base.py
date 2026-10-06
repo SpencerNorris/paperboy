@@ -49,6 +49,26 @@ class CollectResult:
     name: str
     counts: dict[str, int] = field(default_factory=dict)
     stopped: str | None = None
+    # The exception behind a `stopped` result (recipes.py sets it), so a caller
+    # can tell a `DiskFloorStop` from a flood `PhaseStop`; `stopped` alone
+    # collapses them. `None` for a phase that completed.
+    stop_exc: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class ChannelContext:
+    """A channel already resolved earlier in the SAME process (#68).
+
+    Lets `collect_channel` skip the flood-limited `contacts.resolveUsername`
+    when `fetch-media` runs several segments against one channel. Never
+    persisted (access hashes rotate); `source_run_id` names the run whose
+    `channel` phase established it, for the replay marker.
+    """
+
+    input_channel: dict
+    channel_id: int
+    tier: str
+    source_run_id: str
 
 
 class Collector(Protocol):

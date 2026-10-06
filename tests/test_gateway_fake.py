@@ -1,7 +1,10 @@
+import hashlib
+
 import pytest
 
 from paperboy.budget import SkipAndRecord
 from paperboy.gateway import FILTER_RECENT
+from paperboy.media_sink import MediaSink
 from tests.fakes import FakeGateway
 
 
@@ -62,11 +65,47 @@ async def test_fake_channel_difference():
 
 
 @pytest.mark.asyncio
-async def test_fake_download_media_returns_fixture_bytes_by_msg_id():
+async def test_fake_download_media_streams_fixture_bytes_by_msg_id(tmp_path):
     gw = FakeGateway({"media": {7: b"file bytes"}})
-    assert await gw.download_media({"channel_id": 5}, {"id": 7}) == b"file bytes"
-    assert await gw.download_media({"channel_id": 5}, {"id": 8}) is None
+    with MediaSink(tmp_path / "a.part") as sink:
+        assert await gw.download_media({"channel_id": 5}, {"id": 7}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"file bytes").hexdigest()
+    assert (tmp_path / "a.part").read_bytes() == b"file bytes"
+    with MediaSink(tmp_path / "b.part") as sink2:
+        assert await gw.download_media({"channel_id": 5}, {"id": 8}, sink2) is False
+    assert sink2.size == 0
     assert gw.download_media_calls == [7, 8]
+
+
+@pytest.mark.asyncio
+async def test_fake_download_media_raises_exception_fixture(tmp_path):
+    gw = FakeGateway({"media": {7: RuntimeError("boom")}})
+    with MediaSink(tmp_path / "a.part") as sink, pytest.raises(RuntimeError):
+        await gw.download_media({"channel_id": 5}, {"id": 7}, sink)
+
+
+@pytest.mark.asyncio
+async def test_fake_download_media_writes_in_several_chunks(tmp_path):
+    writes: list[int] = []
+
+    class Recording(MediaSink):
+        def write(self, chunk: bytes) -> int:
+            writes.append(len(chunk))
+            return super().write(chunk)
+
+    gw = FakeGateway({"media": {7: b"x" * 30}})
+    with Recording(tmp_path / "a.part") as sink:
+        await gw.download_media({"channel_id": 5}, {"id": 7}, sink)
+    assert len(writes) >= 3
+    assert sum(writes) == 30
+
+
+@pytest.mark.asyncio
+async def test_fake_download_media_accepts_chunk_factory(tmp_path):
+    gw = FakeGateway({"media": {7: lambda: iter([b"a", b"b"])}})
+    with MediaSink(tmp_path / "a.part") as sink:
+        assert await gw.download_media({"channel_id": 5}, {"id": 7}, sink) is True
+    assert sink.sha256 == hashlib.sha256(b"ab").hexdigest()
 
 async def test_fake_channel_recommendations():
     fx = {"channel_recommendations": {"_": "messages.ChatsSlice", "count": 5, "chats": []}}
@@ -96,7 +135,7 @@ async def test_fake_sponsored_messages():
 
 
 @pytest.mark.asyncio
-async def test_calls_log_records_every_protocol_method():
+async def test_calls_log_records_every_protocol_method(tmp_path):
     """Every zero-RPC / read-only-RPC assertion elsewhere in the suite
     (`test_the_backfill_issues_no_gateway_calls`,
     `test_discussion_run_issues_only_read_rpcs`) depends on `FakeGateway.calls`
@@ -134,7 +173,8 @@ async def test_calls_log_records_every_protocol_method():
     await gw.get_authorizations()
     await gw.get_password_state()
     await gw.get_privacy("phone")
-    await gw.download_media(ic, {"id": 1})
+    with MediaSink(tmp_path / "c.part") as sink:
+        await gw.download_media(ic, {"id": 1}, sink)
     await gw.get_channel_recommendations(ic)
     await gw.check_chat_invite("abc")
     await gw.get_sponsored_messages(ic)
@@ -276,3 +316,29 @@ async def test_fake_exception_fixtures_raise_for_walls_and_batches():
     assert (await gw.get_full_channel(ic))["full_chat"]["id"] == 77
     other_full = await gw.get_full_channel({"channel_id": 5, "access_hash": 1})
     assert other_full["full_chat"]["id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_fake_get_full_channel_records_the_input_form():
+    gw = FakeGateway({"full_channel": {"_": "ChatFull", "full_chat": {"id": 5}}})
+    from_msg = {"channel_id": 5, "from_msg": {"channel_id": 7, "access_hash": 11, "msg_id": 3}}
+    plain = {"channel_id": 5, "access_hash": 99}
+    assert (await gw.get_full_channel(from_msg))["_"] == "ChatFull"
+    await gw.get_full_channel(plain)
+    assert gw.full_channel_inputs == [from_msg, plain]
+
+
+@pytest.mark.asyncio
+async def test_fake_channel_access_receipt_is_a_fixture_not_an_rpc():
+    assert await FakeGateway({}).channel_access_receipt("123") is None
+    receipt = {"_": "ChannelAccess", "channel_id": 123, "via": "saved_key"}
+    gw = FakeGateway({"channel_access": receipt})
+    assert await gw.channel_access_receipt("123") == receipt
+    assert gw.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fake_resolve_raises_an_exception_fixture():
+    gw = FakeGateway({"resolve": SkipAndRecord("nope")})
+    with pytest.raises(SkipAndRecord):
+        await gw.resolve("x")

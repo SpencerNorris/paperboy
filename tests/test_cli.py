@@ -39,7 +39,7 @@ def _fixtures():
 def test_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup"):
+    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup", "fetch-media"):
         assert cmd in result.stdout
 
 
@@ -394,7 +394,8 @@ def test_collect_media_since_rejects_bad_value(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("flag", "value"), [("--media-msgs", "abc"), ("--media-max-mb", "0")]
+    ("flag", "value"),
+    [("--media-msgs", "abc"), ("--media-max-mb", "0"), ("--media-min-free-gb", "-1")],
 )
 def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     result = runner.invoke(
@@ -404,6 +405,25 @@ def test_collect_media_selectors_reject_bad_values(tmp_path, flag, value):
     )
     assert result.exit_code != 0
     assert flag.lstrip("-") in _plain_output(result)
+
+
+def test_collect_media_min_free_gb_reaches_settings(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del secrets, profile, store
+        seen["settings"] = settings
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "clitest_floor", "--media",
+         "--media-min-free-gb", "0.5", "--unsafe"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert seen["settings"].media_min_free_gb == 0.5
 
 
 def test_collect_exits_nonzero_when_the_target_itself_cannot_be_used(tmp_path, monkeypatch):
@@ -486,3 +506,55 @@ def test_collect_reports_other_phases_when_the_channel_phase_is_skipped(tmp_path
     # An all-zero phase saved nothing and is not listed as having collected.
     assert "participants {" not in out
     assert "Traceback" not in out
+
+
+def test_status_and_export_accept_channel_id_forms(tmp_path, monkeypatch):
+    # #84: after a collect, a channel is addressable offline by its id in any
+    # of the accepted forms, not only by username.
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    env = {"PAPERBOY_DATA_DIR": str(tmp_path)}
+    collected = runner.invoke(
+        app, ["collect", "@x", "--profile", "cliid", "--phases", "channel", "--unsafe"], env=env
+    )
+    assert collected.exit_code == 0, collected.stdout
+    # The marked form starts with `-`, so the shell needs `--` before it.
+    for args in (["5"], ["--", "-1005"], ["t.me/c/5/9"]):
+        status = runner.invoke(app, ["status", "--profile", "cliid", *args], env=env)
+        assert status.exit_code == 0, (args, status.stdout)
+    out = tmp_path / "export-out"
+    exported = runner.invoke(
+        app, ["export", "5", "--profile", "cliid", "--out", str(out)], env=env
+    )
+    assert exported.exit_code == 0, exported.stdout
+    unknown = runner.invoke(app, ["status", "6", "--profile", "cliid"], env=env)
+    assert unknown.exit_code == 1
+    assert "No local data" in unknown.stdout
+
+
+@pytest.mark.parametrize("cmd", ["status", "collect", "export"])
+def test_negative_non_channel_id_is_rejected_without_a_traceback(tmp_path, cmd):
+    result = runner.invoke(
+        app,
+        [cmd, "--profile", "clitest_badid", "--", "-123"],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 1
+    assert "basic group or user id" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
+@pytest.mark.parametrize("cmd", ["status", "collect", "export"])
+@pytest.mark.parametrize("target", ["99999999999999999999", "-10099999999999999999999"])
+def test_out_of_range_id_is_rejected_without_a_traceback(tmp_path, cmd, target):
+    result = runner.invoke(
+        app,
+        [cmd, "--profile", "clitest_bigid", "--", target],
+        env={"PAPERBOY_DATA_DIR": str(tmp_path)},
+    )
+    assert result.exit_code == 1
+    assert "64-bit" in result.stdout
+    assert "Traceback" not in result.stdout

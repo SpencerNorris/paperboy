@@ -16,11 +16,23 @@ handed to one implementing agent on its own.
 | 1 | [`…-pacing-safety-factor-design.md`](2026-09-28-pacing-safety-factor-design.md) | #69 | Conservative pacing first, so every later live smoke runs under it |
 | 2 | [`…-media-relative-paths-design.md`](2026-09-28-media-relative-paths-design.md) | #62 | Portable media keys — prerequisite for streaming, the split, the VM and GCS |
 | 3 | [`…-media-streaming-design.md`](2026-09-28-media-streaming-design.md) | #64 (+#53) | 2.4 GB files must not sit in RAM; the disk must not fill silently |
+| 3b | [`2026-09-29-replay-lookup-performance-design.md`](2026-09-29-replay-lookup-performance-design.md) | #75 | Added 2026-09-29: replay lookups scan the whole run (~13 s each, days for a full media replay); the #70 split is two full replays |
 | 4 | [`…-profile-split-design.md`](2026-09-28-profile-split-design.md) | #70 | Get the unrelated investigation out of `default` before adding 146 GB to it |
 | 5 | [`…-media-list-fetch-design.md`](2026-09-28-media-list-fetch-design.md) | #68 | The pull is driven by a cross-channel CSV |
 | — | [`…-media-gcs-backend-design.md`](2026-09-28-media-gcs-backend-design.md) | #63 | Daytime: needs IAM, a VM proxy and a VM smoke with the operator |
 
 ## Run order — strictly sequential
+
+**Status 2026-09-29:** #69 and #62 merged into `dev/media-storage`. #64
+escalated after three review rounds. Its spec was then amended (§2.3: replay
+leaves the source untouched; §4.1: small-fixture replay smoke), and it
+resumes from its escalated branch. #75 was added to the chain after #64
+(operator decision, 2026-09-29). Order: **#64 → #75 → #70 → #68**.
+
+**Docs are part of every feature's DoD:** the feature doc under
+`docs/features/`, the README (commands, flags, config table, documentation
+list), `CLAUDE.md` (commands and status), `docs/data-model.md` for any schema
+change, and `docs/how-it-works.md` wherever a concept it explains changes.
 
 Features 1–5 run **one at a time, in the order above**, each as a
 `single-feature-run` whose branch is cut from `dev/media-storage` *after*
