@@ -222,8 +222,12 @@ def _bytes_downloaded(store: Store, results: list[RowResult]) -> int:
     total = 0
     for r in results:
         if r.outcome == "downloaded":
+            # Via custody, not `media.message_uri`: a file first stored by an earlier
+            # run (another store, #63) has no `media` row of its own for this message.
             row = store.conn.execute(
-                "SELECT size FROM media WHERE message_uri = ?", (r.classified.uri,)
+                "SELECT m.size FROM custody_log c JOIN media m ON m.sha256 = c.sha256 "
+                "WHERE c.source_message_uri = ? ORDER BY c.id DESC LIMIT 1",
+                (r.classified.uri,),
             ).fetchone()
             total += row["size"] if row and row["size"] else 0
     return total

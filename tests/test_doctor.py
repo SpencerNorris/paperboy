@@ -101,3 +101,97 @@ async def test_non_minimal_profile_warns_but_does_not_block():
 
 def test_doctor_blocks_is_false_for_no_checks():
     assert doctor_blocks([]) is False
+
+
+# --- GCS media store preflight (#63) -----------------------------------------
+
+
+def _store_settings(**over):
+    return load_settings(
+        "default",
+        {"media_store": "gs://bkt/p/x", "media_store_buckets": "bkt", **over},
+    )
+
+
+def _by_name(checks):
+    return {c.name: c for c in checks}
+
+
+def test_media_store_checks_pass_warn_and_fail():
+    from google.api_core.exceptions import Forbidden
+    from google.auth.exceptions import DefaultCredentialsError
+
+    from paperboy.doctor import media_store_checks
+    from tests.fake_gcs import FakeGcsClient
+
+    client = FakeGcsClient()
+    bucket = client.bucket("bkt")
+    settings = _store_settings()
+
+    # Least privilege: create+get only -> everything ok, retention is reported.
+    checks = _by_name(media_store_checks(settings, lambda: client))
+    assert set(checks) == {
+        "media_store_credentials", "media_store_permissions",
+        "media_store_least_privilege", "media_store_retention",
+    }
+    assert all(c.ok for c in checks.values())
+    assert "8035200" in checks["media_store_retention"].detail
+    assert "93" in checks["media_store_retention"].detail  # days
+    assert "versioning on" in checks["media_store_retention"].detail
+
+    # delete granted (the operator's Mac): a warning, never a block.
+    bucket.granted.add("storage.objects.delete")
+    out = media_store_checks(settings, lambda: client)
+    assert not _by_name(out)["media_store_least_privilege"].ok
+    assert _by_name(out)["media_store_least_privilege"].severity == "warn"
+    assert not doctor_blocks(out)
+
+    # create missing -> fail, and it blocks.
+    bucket.granted.discard("storage.objects.create")
+    out = media_store_checks(settings, lambda: client)
+    perms = _by_name(out)["media_store_permissions"]
+    assert not perms.ok and perms.severity == "fail" and "storage.objects.create" in perms.detail
+    assert doctor_blocks(out)
+
+    # no ADC -> a single failing credentials check, nothing else is attempted.
+    def no_adc():
+        raise DefaultCredentialsError("no ADC")
+
+    out = media_store_checks(settings, no_adc)
+    assert [c.name for c in out] == ["media_store_credentials"]
+    assert not out[0].ok and out[0].severity == "fail" and doctor_blocks(out)
+
+    # storage.buckets.get not granted (a VM service account): a warning naming it.
+    bucket.granted.add("storage.objects.create")
+    bucket.reload_error = Forbidden("no")
+    out = media_store_checks(settings, lambda: client)
+    retention = _by_name(out)["media_store_retention"]
+    assert not retention.ok and retention.severity == "warn"
+    assert "storage.buckets.get" in retention.detail
+    assert not doctor_blocks(out)
+
+
+@pytest.mark.asyncio
+async def test_run_doctor_adds_store_checks_only_when_a_store_is_configured(monkeypatch):
+    from tests.fake_gcs import FakeGcsClient
+
+    fx, proxy_ok = _fixtures()
+    plain = await run_doctor(FakeGateway(fx), _settings(proxy_ok))
+    assert not any(c.name.startswith("media_store") for c in plain)  # also: test_doctor_without_...
+
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    with_store = await run_doctor(
+        FakeGateway(fx), _settings(proxy_ok, media_store="gs://bkt/p", media_store_buckets="bkt")
+    )
+    assert len(with_store) == len(plain) + 4
+
+
+@pytest.mark.asyncio
+async def test_doctor_without_media_store_builds_no_gcs_client(monkeypatch):
+    def boom():
+        raise AssertionError("no store configured: no GCS client")
+
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", boom)
+    fx, proxy_ok = _fixtures()
+    await run_doctor(FakeGateway(fx), _settings(proxy_ok))

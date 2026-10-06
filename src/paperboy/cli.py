@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Annotated, Any, cast
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -42,6 +43,7 @@ from paperboy.media_list import (
     parse_media_list,
     plan_segments,
 )
+from paperboy.media_store import MediaStoreError, build_media_store
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
@@ -69,15 +71,32 @@ _PACING_HELP = (
     "Multiply every request interval we assume by this (default 2.0, min 1.0). "
     "Never applied to server-mandated FLOOD_WAITs."
 )
+_MEDIA_STORE_HELP = (
+    "Where this run's media goes: gs://<bucket>/<prefix> (the bucket must be in "
+    "PAPERBOY_MEDIA_STORE_BUCKETS; no local copy is kept). Default: the local profile folder."
+)
 _FLOOD_HELP = (
     "Longest single FLOOD_WAIT (seconds, margin included) to sleep through before "
     "stopping the phase (default 3600)."
 )
 
 
+def _load_settings_or_exit(profile: str, overrides: dict[str, object]) -> Settings:
+    """`load_settings`, but an invalid setting (e.g. a media store whose bucket is not
+    in `media_store_buckets`) is a clean one-line CLI error (exit 1), not a traceback.
+    Only the field and message are printed, never the offending value."""
+    try:
+        return load_settings(profile, overrides)
+    except ValidationError as exc:
+        for err in exc.errors():
+            where = ".".join(str(part) for part in err["loc"]) or "settings"
+            console.print(f"[red]invalid setting {escape(where)}: {escape(err['msg'])}[/]")
+        raise typer.Exit(code=1) from None
+
+
 def _settings_with_overrides(profile: str, **overrides: object) -> Settings:
     clean = {k: v for k, v in overrides.items() if v is not None}
-    return load_settings(profile, clean)
+    return _load_settings_or_exit(profile, clean)
 
 
 def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
@@ -229,6 +248,7 @@ def collect(
         help="With --media: stop the media phase when free disk on the media volume, minus "
              "the next file's declared size, would fall below this many GB (default 5).",
     ),
+    media_store: str = typer.Option(None, "--media-store", help=_MEDIA_STORE_HELP),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -270,9 +290,11 @@ def collect(
         overrides["media_max_mb"] = media_max_mb
     if media_min_free_gb is not None:
         overrides["media_min_free_gb"] = media_min_free_gb
+    if media_store is not None:
+        overrides["media_store"] = media_store
     if unsafe:
         overrides["unsafe"] = True
-    settings = load_settings(profile, overrides)
+    settings = _load_settings_or_exit(profile, overrides)
     if settings.enrich_profiles:
         console.print(
             "[yellow]--profiles enabled: full profile enrichment (getFullUser, photo history, "
@@ -489,6 +511,7 @@ def fetch_media_cmd(
         False, "--dry-run",
         help="Classify offline and print the plan; no keychain, no network, no report.",
     ),
+    media_store: str = typer.Option(None, "--media-store", help=_MEDIA_STORE_HELP),
     max_rpc: int = typer.Option(None, "--max-rpc"),
     unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
     pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
@@ -513,9 +536,11 @@ def fetch_media_cmd(
         overrides["pacing_factor"] = pacing_factor
     if max_flood_sleep is not None:
         overrides["flood_sleep_threshold"] = max_flood_sleep
+    if media_store is not None:
+        overrides["media_store"] = media_store
     if unsafe:
         overrides["unsafe"] = True
-    settings = load_settings(profile, overrides)
+    settings = _load_settings_or_exit(profile, overrides)
 
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
@@ -528,7 +553,15 @@ def fetch_media_cmd(
         if excluded_ids:
             log.info("fetch-media: excluding %d channel id(s): %s",
                      len(excluded_ids), sorted(excluded_ids))
-        classified = classify_rows(store, rows, excluded_ids=excluded_ids)
+        try:
+            classified = classify_rows(
+                store, rows, media_store=build_media_store(settings, profile),
+                excluded_ids=excluded_ids,
+            )
+        except MediaStoreError as exc:
+            # A bucket dry run asks GCS whether it holds each candidate (metadata only).
+            console.print(f"[red]cannot reach the media store: {escape(str(exc))}[/]")
+            raise typer.Exit(code=1) from None
         segments = plan_segments(classified)
         _print_plan(classified, segments)
         if dry_run:

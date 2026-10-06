@@ -15,6 +15,7 @@ from paperboy.media_list import (
     parse_media_list,
     plan_segments,
 )
+from paperboy.media_store import LocalMediaStore
 from paperboy.store.channels import upsert_channel
 from paperboy.store.db import Store
 from paperboy.store.edges import add_edge
@@ -143,11 +144,21 @@ def seed_msg(st, channel_id, msg_id, *, doc_id=None, photo_id=None, text_only=Fa
     return upsert_message(st, channel_id, msg, raw, utc_now_iso(), "stranger")
 
 
-def record_media(st, message_uri, sha):
+def record_media(st, message_uri, sha, store="local"):
     st.conn.execute(
         "INSERT INTO media (sha256, message_uri, kind, size, path, downloaded_at) "
         "VALUES (?, ?, 'document', 1, ?, ?)",
         (sha, message_uri, f"media/{sha[:2]}/{sha}", utc_now_iso()),
+    )
+    # A real download always leaves a custody row too (it names the store).
+    record_media_custody(st, message_uri, sha, store)
+
+
+def record_media_custody(st, message_uri, sha, store):
+    st.conn.execute(
+        "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri, store) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (f"media/{sha[:2]}/{sha}", sha, utc_now_iso(), message_uri, store),
     )
 
 
@@ -179,7 +190,7 @@ def test_classify_covers_every_offline_outcome(tmp_path):
             "t.me/nobody/1\n"        # username not in store
             "tg:msg:10/1\n",         # duplicate_row at parse time
         )
-        out = classify_rows(st, parse_media_list(path))
+        out = classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
         assert [c.outcome for c in out] == [
             "pending", "already_stored", "no_media", "deleted", "pending",
             "already_stored", "not_in_store", "pending", "duplicate_row",
@@ -203,7 +214,8 @@ def test_segments_group_by_priority_then_channel_in_first_appearance_order(tmp_p
             "tg:msg:10/1,P1\n"   # P1 chan_a again -> same segment as the first
             "tg:msg:20/2,P2\n",  # P2 chan_b
         )
-        segs = plan_segments(classify_rows(st, parse_media_list(path)))
+        store = LocalMediaStore(tmp_path)
+        segs = plan_segments(classify_rows(st, parse_media_list(path), media_store=store))
         assert [(s.priority, s.channel_id, s.msg_ids) for s in segs] == [
             ("P1", 10, [1, 2]),
             ("P1", 20, [1]),
@@ -240,7 +252,8 @@ def test_exclude_target_marks_rows_excluded_offline(tmp_path):
             "tg:msg:20/7\n",
         )
         out = classify_rows(
-            st, parse_media_list(path), excluded_ids=frozenset({10})
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path),
+            excluded_ids=frozenset({10}),
         )
     assert [c.outcome for c in out] == [
         "excluded", "excluded", "excluded", "excluded", "pending",
@@ -268,3 +281,39 @@ def test_excluded_channel_ids_rejects_unknown_or_non_channel_specs(tmp_path, spe
         with pytest.raises(MediaListError) as exc:
             excluded_channel_ids(st, [spec])
     assert spec in str(exc.value)
+
+
+def test_already_stored_is_per_store(tmp_path):
+    """A file the DB holds from a LOCAL run is `pending` for a bucket run until the
+    bucket holds it (by custody row, offline, or by one existence check)."""
+    from paperboy.media_store import GcsMediaStore
+    from tests.fake_gcs import FakeGcsClient
+
+    client = FakeGcsClient()
+    bucket_store = GcsMediaStore("bkt", "p/x", client_factory=lambda: client)
+    sha = "a" * 64
+    key = f"media/{sha[:2]}/{sha}"
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_msg(st, 10, 1, doc_id=1001)
+        record_media(st, "tg:msg:10/1", sha)  # a local run's row: custody store 'local'
+        path = _write(tmp_path, "l.txt", "tg:msg:10/1\n")
+        rows = parse_media_list(path)
+
+        local = classify_rows(st, rows, media_store=LocalMediaStore(tmp_path))
+        assert [c.outcome for c in local] == ["already_stored"]  # custody says local: no stat
+
+        pending = classify_rows(st, rows, media_store=bucket_store)
+        assert [c.outcome for c in pending] == ["pending"]
+        assert client.bucket("bkt").calls["exists"] == 1  # one metadata check, no custody row
+
+        client.bucket("bkt").objects[f"p/x/{key}"] = b"x"  # the object is there by hand
+        held = classify_rows(st, rows, media_store=bucket_store)
+        assert [c.outcome for c in held] == ["already_stored"]
+
+        calls_before = client.bucket("bkt").calls["exists"]
+        record_media_custody(st, "tg:msg:10/1", sha, "gs://bkt/p/x")
+        client.bucket("bkt").objects.clear()
+        fast = classify_rows(st, rows, media_store=bucket_store)
+        assert [c.outcome for c in fast] == ["already_stored"]  # a custody row names the bucket
+        assert client.bucket("bkt").calls["exists"] == calls_before  # zero HEADs

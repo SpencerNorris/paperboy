@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from paperboy.collectors.media import DOWNLOADABLE_KINDS, content_key, recorded_size
 from paperboy.ids import msg_uri, parse_uri
+from paperboy.media_store import MediaStore, stored_in
 from paperboy.store.channels import find_channel_id
 from paperboy.targets import TargetKind, UnsupportedTarget, parse_target
 
@@ -230,13 +232,46 @@ def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
     return frozenset(ids)
 
 
+def _known_files(
+    store: Store, uri: str, content: tuple[str, str] | None
+) -> list[tuple[str, str]]:
+    """Every `(sha256, key)` the database associates with this message: the file
+    its content id resolves to, its own `media` row, and its custody sightings."""
+    found: list[tuple[str, str]] = [] if content is None else [content]
+    for r in store.conn.execute(
+        "SELECT sha256, path FROM media WHERE message_uri = ? "
+        "UNION SELECT sha256, path FROM custody_log WHERE source_message_uri = ?",
+        (uri, uri),
+    ):
+        pair = (r["sha256"], r["path"])
+        if pair not in found:
+            found.append(pair)
+    return found
+
+
+def _held_by_store(
+    conn: sqlite3.Connection, media_store: MediaStore, files: list[tuple[str, str]]
+) -> bool:
+    """Whether the run's store already holds one of `files`. A custody row naming
+    the store answers offline; otherwise one existence check per file (a bucket
+    dry run therefore touches GCS - metadata GETs - but never Telegram)."""
+    if any(stored_in(conn, sha, media_store.store_id) for sha, _ in files):
+        return True
+    return any(media_store.exists(key) for _, key in files)
+
+
 def classify_rows(
-    store: Store, rows: Iterable[ListRow], *, excluded_ids: frozenset[int] = frozenset()
+    store: Store,
+    rows: Iterable[ListRow],
+    *,
+    media_store: MediaStore,
+    excluded_ids: frozenset[int] = frozenset(),
 ) -> list[ClassifiedRow]:
     """Offline outcome for every row, first match wins:
     `duplicate_row`, `excluded` (its channel is in `excluded_ids`; a username
     row is resolved first), `not_in_store`, `deleted`, `no_media`,
-    `already_stored`, else `pending`. No network, no gateway."""
+    `already_stored` (THIS run's `media_store` holds the file, #63), else
+    `pending`. No Telegram, no gateway; a bucket store is asked for metadata."""
     index, stored_uris = _global_indexes(store)
     usernames = {
         r["username"].lower(): r["id"]
@@ -278,13 +313,14 @@ def classify_rows(
             out.append(ClassifiedRow(row, "no_media", uri, channel_id, declared))
             continue
         key = content_key(media)
-        if uri in stored_uris or (key is not None and key in index):
-            out.append(ClassifiedRow(
-                row, "already_stored", uri, channel_id, declared,
-                index.get(key) if key is not None else None,
-            ))
-            continue
-        out.append(ClassifiedRow(row, "pending", uri, channel_id, declared))
+        hint = index.get(key) if key is not None else None
+        if uri in stored_uris or hint is not None:
+            files = _known_files(store, uri, hint)
+            if _held_by_store(store.conn, media_store, files):
+                out.append(ClassifiedRow(row, "already_stored", uri, channel_id, declared, hint))
+                continue
+            # The database knows the file but this run's store does not.
+        out.append(ClassifiedRow(row, "pending", uri, channel_id, declared, hint))
     return out
 
 

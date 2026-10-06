@@ -10,9 +10,13 @@ the current run the way a missing proxy or a fresh session is.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+from paperboy import media_store as _media_store
+from paperboy.config import parse_media_store_url
 
 if TYPE_CHECKING:
     from paperboy.config import Settings
@@ -103,7 +107,84 @@ def _check_minimal_profile(self_user: dict) -> Check:
     return Check("minimal_profile", True, "self profile is minimal", "warn")
 
 
-async def run_doctor(gateway: Gateway, settings: Settings) -> list[Check]:
+_STORE_PERMISSIONS = (
+    "storage.objects.create", "storage.objects.get", "storage.objects.delete",
+)
+
+
+def media_store_checks(settings: Settings, client_factory: Callable[[], Any]) -> list[Check]:
+    """Preflight for a GCS media store (#63, ADR-0008): credentials, the
+    permissions the run needs, a least-privilege warning, and the bucket's
+    retention. Nothing here writes to the bucket or is recorded in raw.
+
+    `delete` being granted only warns (the operator's Mac is a project owner):
+    paperboy never deletes whether or not it is allowed to.
+    """
+    assert settings.media_store is not None
+    bucket_name, _ = parse_media_store_url(settings.media_store)
+    try:
+        bucket = client_factory().bucket(bucket_name)
+    except Exception as exc:  # noqa: BLE001 - any credential failure blocks; class name only
+        return [Check(
+            "media_store_credentials", False,
+            f"Application Default Credentials unavailable ({type(exc).__name__}); "
+            "run `gcloud auth application-default login`",
+            "fail",
+        )]
+    checks = [
+        Check("media_store_credentials", True, "Application Default Credentials found", "fail")
+    ]
+    try:
+        granted = set(bucket.test_iam_permissions(list(_STORE_PERMISSIONS)))
+    except Exception as exc:  # noqa: BLE001 - network/auth failure; class name only
+        checks.append(Check(
+            "media_store_permissions", False,
+            f"cannot check bucket permissions ({type(exc).__name__})", "fail",
+        ))
+        return checks
+    missing = [p for p in _STORE_PERMISSIONS[:2] if p not in granted]
+    if missing:
+        checks.append(Check(
+            "media_store_permissions", False, f"missing {', '.join(missing)}", "fail"
+        ))
+    else:
+        checks.append(Check(
+            "media_store_permissions", True, "storage.objects.create and get granted", "fail"
+        ))
+    if "storage.objects.delete" in granted:
+        checks.append(Check(
+            "media_store_least_privilege", False,
+            "storage.objects.delete is granted; paperboy never deletes, but a "
+            "create-only role (roles/storage.objectCreator) is safer",
+            "warn",
+        ))
+    else:
+        checks.append(Check("media_store_least_privilege", True, "no delete permission", "warn"))
+    try:
+        bucket.reload()
+    except Exception as exc:  # noqa: BLE001 - typically 403 on storage.buckets.get
+        checks.append(Check(
+            "media_store_retention", False,
+            f"not readable (needs storage.buckets.get; {type(exc).__name__})", "warn",
+        ))
+    else:
+        period = bucket.retention_period
+        retention = (
+            f"retention {period} s ({period / 86400:.0f} days)" if period else "no retention"
+        )
+        versioning = "on" if bucket.versioning_enabled else "off"
+        checks.append(Check(
+            "media_store_retention", True, f"{retention}, versioning {versioning}", "warn"
+        ))
+    return checks
+
+
+async def run_doctor(
+    gateway: Gateway,
+    settings: Settings,
+    *,
+    client_factory: Callable[[], Any] | None = None,
+) -> list[Check]:
     self_user = await gateway.get_self()
     authorizations = await gateway.get_authorizations()
     password_state = await gateway.get_password_state()
@@ -117,6 +198,9 @@ async def run_doctor(gateway: Gateway, settings: Settings) -> list[Check]:
         rules = await gateway.get_privacy(key)
         checks.append(_check_privacy(key, rules))
     checks.append(_check_minimal_profile(self_user))
+    if settings.media_store is not None:
+        factory = client_factory or (lambda: _media_store.default_client_factory())
+        checks.extend(media_store_checks(settings, factory))
     return checks
 
 
