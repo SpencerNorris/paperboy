@@ -482,7 +482,9 @@ def _print_summary(summary: FetchSummary) -> None:
     console.print(table)
 
 
-async def _run_fetch(settings, profile, store, classified, log, report_path, with_media):
+async def _run_fetch(
+    settings, profile, store, classified, log, report_path, with_media, excluded_ids
+):
     try:
         secrets = composition.build_secrets(profile)
         gateway = await composition.build_gateway(settings, secrets, profile, store)
@@ -501,7 +503,7 @@ async def _run_fetch(settings, profile, store, classified, log, report_path, wit
         raise typer.Exit(code=1)
     return await fetch_from_list(
         gateway, store, settings, classified, log, profile=profile, report_path=report_path,
-        with_media=with_media,
+        with_media=with_media, excluded_ids=excluded_ids,
     )
 
 
@@ -616,6 +618,7 @@ def fetch_from_list_cmd(
             summary = _run_async_or_exit(
                 _run_fetch(
                     settings, profile, store, classified, log, report_path, not no_media,
+                    excluded_ids,
                 )
             )
         else:

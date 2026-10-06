@@ -7,8 +7,10 @@ answers is appended to the raw log first (context
 `{"channel_id", "method": "channels.getMessages"}`) and then goes through the
 shared `observe_message` projection, so a new post gets its message row, author
 peer and forward edge, an edit appends a revision (and a counter change a
-metric row), and a `MessageEmpty` answer becomes a tombstone - never a blank
-row. The `method` tag is how `reproject` tells these receipts from history's
+metric row), a `MessageEmpty` answer becomes a tombstone - never a blank
+row - and a LIVE answer for a row an earlier run tombstoned clears its
+`deleted_at` (Telegram's answer decides; the tombstone history stays). The `method` tag is
+how `reproject` tells these receipts from history's
 (`replay.ReplaySource.fetched_post_ids`).
 
 Already-stored ids are fetched again on purpose: the point of the pass is that
@@ -21,6 +23,7 @@ from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.history import observe_message
 from paperboy.ids import msg_uri
+from paperboy.store.messages import clear_deleted
 from paperboy.targets import Target
 
 GET_MESSAGES_BATCH = 100  # channels.getMessages accepts at most 100 ids per call
@@ -90,6 +93,14 @@ class PostsCollector:
                 if kind not in _MESSAGE_KINDS:
                     continue
                 observe_message(ctx, channel_id, m, counts, context=context)
+                if kind != "messageempty" and clear_deleted(ctx.store, channel_id, m["id"]):
+                    # Telegram answers this message live although an earlier run
+                    # tombstoned it: the live answer wins, so the media phase
+                    # (which skips tombstoned rows) can select it again.
+                    ctx.log.warning(
+                        "posts: message %d was tombstoned but is live; tombstone cleared",
+                        m["id"],
+                    )
                 if self._outcomes is not None:
                     self._outcomes[msg_uri(channel_id, m["id"])] = (
                         "deleted_upstream" if kind == "messageempty" else "fetched"

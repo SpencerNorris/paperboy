@@ -151,7 +151,7 @@ richer row in `channels`.
 | `is_service` | INTEGER | 1 for service messages (joins, pins, title changes, …). |
 | `action_json` | TEXT | The service action object, when `is_service=1`. |
 | `content_hash` | TEXT | Hash of text+media; a change triggers a new `message_revisions` row. |
-| `deleted_at` | TEXT | Set when a deletion is observed via `update`/`empty` evidence (see `message_tombstones`); NULL otherwise. |
+| `deleted_at` | TEXT | Set when a deletion is observed via `update`/`empty` evidence (see `message_tombstones`); NULL otherwise. Cleared again when `fetch-from-list` (`posts`) gets a LIVE answer for the message; the `message_tombstones` rows stay. |
 | `source_raw_id` | INTEGER | Provenance. |
 | `first_seen` / `last_seen` | TEXT | Bounds of observation. |
 

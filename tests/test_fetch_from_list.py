@@ -623,3 +623,123 @@ async def test_handle_row_for_unseen_channel_is_resolved_live_by_handle(tmp_path
         ).fetchone()[0] == 1
     [row] = _report(report)
     assert (row["uri"], row["outcome"], row["post"]) == ("tg:msg:30/1", "downloaded", "fetched")
+
+
+# ── review fixes (#91): live-but-tombstoned, alias handles, exclusion ─────
+
+
+@pytest.mark.asyncio
+async def test_live_answer_for_a_tombstoned_row_is_a_live_post(tmp_path):
+    """Spec 2.3: Telegram's answer decides. A row an earlier run tombstoned but
+    Telegram now answers live is fetched, un-tombstoned and downloaded; the
+    tombstone history stays."""
+    from paperboy.store.messages import mark_deleted
+
+    gw = _gateway({1: b"a1"})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        mark_deleted(st, 10, 1, "update", "2026-01-01T00:00:00+00:00")
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=report,
+        )
+        assert summary.complete
+        row = st.conn.execute(
+            "select deleted_at from messages where uri='tg:msg:10/1'"
+        ).fetchone()
+        assert row["deleted_at"] is None
+        assert st.conn.execute(
+            "select count(*) from message_tombstones where message_uri='tg:msg:10/1'"
+        ).fetchone()[0] == 1  # history stays
+    [r] = _report(report)
+    assert (r["outcome"], r["post"], r["reason"]) == ("downloaded", "fetched", "")
+    assert gw.download_media_calls == [1]
+
+
+def _alias_gateway(media, **extra):
+    """`resolve` answers channel 30 whose PRIMARY username is `chan_primary`."""
+    fx = {
+        "resolve": _resolved(30, "chan_primary"),
+        "full_channel_by_id": {30: _full(30, "chan_primary"), 10: _full(10, "chan_a")},
+        "get_messages": {1: _photo_msg(1, 301)},
+    }
+    fx.update(extra)
+    return _gateway(media, **fx)
+
+
+@pytest.mark.asyncio
+async def test_handle_row_with_a_non_primary_handle_is_settled(tmp_path):
+    """The channel id comes from the resolved context, not a username lookup: a
+    list handle that is not the stored primary username still settles its row."""
+    gw = _alias_gateway({1: b"n1"})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path),
+            _classified(st, tmp_path, "https://t.me/chan_alias/1\n"), LOG,
+            profile="p", report_path=report,
+        )
+        assert summary.complete
+    [r] = _report(report)
+    assert (r["uri"], r["outcome"], r["post"]) == ("tg:msg:30/1", "downloaded", "fetched")
+
+
+@pytest.mark.asyncio
+async def test_excluded_channel_reached_by_an_unknown_handle_is_not_fetched(tmp_path):
+    """`--exclude-target` is re-checked against the id a handle resolves to: a
+    renamed or alias handle must not let an excluded channel through."""
+    gw = _gateway(
+        {}, resolve=_resolved(10, "chan_renamed"), get_messages={1: _photo_msg(1, 101)},
+        full_channel_by_id={10: _full(10, "chan_renamed")},
+    )
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        path = tmp_path / "list.csv"
+        path.write_text("https://t.me/chan_renamed/1\ntg:msg:10/2\n", encoding="utf-8")
+        excluded = frozenset({10})
+        classified = classify_rows(
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path / "p"),
+            excluded_ids=excluded,
+        )
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+            excluded_ids=excluded,
+        )
+        assert summary.complete
+        assert st.conn.execute("select count(*) from messages").fetchone()[0] == 0
+    assert [r["outcome"] for r in _report(report)] == ["excluded", "excluded"]
+    assert gw.download_media_calls == [] and "get_messages" not in gw.calls
+
+
+@pytest.mark.asyncio
+async def test_handle_and_id_rows_for_one_message_are_one_fetch(tmp_path):
+    gw = _alias_gateway({1: b"n1"})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path),
+            _classified(st, tmp_path, "https://t.me/chan_alias/1\ntg:msg:30/1\n"), LOG,
+            profile="p", report_path=report,
+        )
+        assert summary.complete
+    assert [r["outcome"] for r in _report(report)] == ["downloaded", "duplicate_row"]
+    assert gw.download_media_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_held_file_but_deleted_upstream_reports_deleted_upstream(tmp_path):
+    gw = _gateway({}, get_messages={})  # MessageEmpty for the id
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        classified = _classified(st, tmp_path, "tg:msg:10/1\n")
+        classified[0].media_held = True
+        await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+    [r] = _report(report)
+    assert (r["outcome"], r["post"]) == ("deleted_upstream", "deleted_upstream")

@@ -56,11 +56,19 @@ store has never seen cannot be addressed by id, so (orchestrator decision,
 2026-10-06, spec §2.3) its segment targets the **handle** and the channel is
 resolved live through #84's `handle` route: the standard `channel` phase calls
 `contacts.resolveUsername`, records a `ChannelAccess` receipt with `via: handle`,
-and the rows then carry the resolved `tg:msg:` uri. `--dry-run` cannot do that
-lookup (it is offline), so it reports these rows as `needs_resolve`. If two rows
-of one list name the same message once by handle and once by id of a channel the
-store has never seen, they cannot be matched offline: both are fetched (the post
-fetch is idempotent; the media phase would add one `duplicate` custody row).
+and the rows then carry the resolved `tg:msg:` uri. The channel id is taken
+from the run's resolved `ChannelContext`, never from a `username` lookup, so a
+list handle that is not the channel's stored primary username (an alias of a
+multi-username channel, a renamed handle) still settles its rows. The `channel`
+phase runs ALONE first for such a segment; `--exclude-target` is then re-checked
+against the resolved id (the id itself, or the linked group of an excluded
+parent) before any post is fetched, so an excluded channel reached through an
+unknown handle is `excluded`, not fetched (its metadata is stored by the
+resolving `channel` phase: the id is unknowable without it). `--dry-run` cannot
+do that lookup (it is offline), so it reports these rows as `needs_resolve`. If
+two rows of one list name the same message once by handle and once by id, they
+cannot be matched offline; once the handle resolves, the later row is marked
+`duplicate_row` and nothing is fetched twice.
 
 `--exclude-target T` (repeatable; the forms `reproject --exclude-target` takes:
 a handle, `123`, `-100123`, `t.me/c/123`) marks every row of that channel
@@ -103,7 +111,9 @@ store answers an existence check; a file the database holds from a LOCAL run is
 not held by a bucket run until the bucket has it) and `needs_resolve` (a handle
 row for a channel the store has never seen, above). A tombstoned row is
 pending too: Telegram's answer decides between `deleted_upstream` and a live
-post.
+post. A LIVE answer for a row the store had tombstoned clears its `deleted_at`
+(the `message_tombstones` history stays), so the media phase selects it like any
+live post; `reproject` replays the same.
 
 **Final outcomes** (the report's `outcome` column), per row, in this
 precedence:
@@ -119,10 +129,9 @@ precedence:
 | `not_attempted` | The command stopped first. |
 
 `excluded`, `no_media`, `no_access`, `too_large`, ... are final; only
-`not_attempted` makes the exit code 1. A live post that an earlier run
-tombstoned reports `skipped` with a reason (the media phase never selects
-tombstoned rows). A row both held and deleted upstream says `already_stored`;
-its `post` column says `deleted_upstream`, so both facts are in the report.
+`not_attempted` makes the exit code 1. A row whose file this store holds but
+whose post Telegram now answers `MessageEmpty` reports `deleted_upstream`
+(Telegram's current answer wins); the held file is untouched.
 
 There is no `unresolvable` and no `not_in_store`: a channel needs no stored
 username (a linked discussion group is fetched like any other channel, by id),
@@ -208,7 +217,7 @@ writing **before** any segment (an unwritable path fails immediately), rewritten
 at the end: `line_no,uri,outcome,post,sha256,key,reason` for every input row in
 list order. `post` is `fetched`, `deleted_upstream` or `skipped` (not reached, or
 the channel was refused). `reason` is empty except for `no_access` (why the
-channel could not be reached), `excluded` and the tombstoned `skipped`. `uri` is
+channel could not be reached), and `excluded`. `uri` is
 normalised to `tg:msg:<channel_id>/<msg_id>` once the channel is known.
 `sha256`/`key` (the profile-relative media key, ADR-0007) are filled for
 `downloaded`, `duplicate` and `already_stored` rows.
@@ -262,7 +271,11 @@ rows, exactly as live.
   outcome; the spec's §2.3 (which kept `unresolvable`-style handling out) is
   amended by this document. `--dry-run` reports them as `needs_resolve`.
 * The spec says "a post already in the store is re-fetched"; tombstoned-in-store
-  rows are included under the same rule (orchestrator decision 2).
+  rows are included under the same rule (orchestrator decision 2). If Telegram
+  answers such a row LIVE, `deleted_at` is cleared (new `clear_deleted`, called by
+  the `posts` collector) so the row is a live post and its media is downloaded,
+  as spec §2.3 says; tombstone history rows are kept. This is a new semantic for
+  `deleted_at` ("currently believed deleted"), limited to `posts`.
 * A failed `posts` phase withdraws the channel context so `media` cannot act
   after it (not in the plan; found by the posts-stop test: media ran after the
   stop and its first RPC would have slept the flood cooldown).

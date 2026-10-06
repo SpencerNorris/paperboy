@@ -130,6 +130,26 @@ async def build_source(
             "full_channel_by_id": {10: _full(10, "chan_a"), 20: _full(20, "chan_b")},
             "media": {1: b"a1", 2: b"a2", 3: b"a3", 11: b"b11", 12: b"b12", 21: b"c21"},
         })
+        if post_extras:
+            # An earlier fetch (Telegram answered MessageEmpty, so it left a real,
+            # raw-backed tombstone on 10/3) precedes the main one, which gets a
+            # LIVE answer for it: the fetch clears `deleted_at`, replay must too.
+            pre = tmp_path / "pre.csv"
+            pre.write_text("tg:msg:10/3\n", encoding="utf-8")
+            await fetch_from_list(
+                FakeGateway({
+                    "self": {"_": "user", "id": 1, "self": True}, "get_messages": {},
+                    "full_channel_by_id": {10: _full(10, "chan_a")}, "media": {},
+                }),
+                store, settings, classify_rows(
+                    store, parse_media_list(pre),
+                    media_store=LocalMediaStore(tmp_path / "default"),
+                ), LOG,
+                profile="default", report_path=tmp_path / "pre-report.csv", with_media=False,
+            )
+            assert store.conn.execute(
+                "SELECT deleted_at FROM messages WHERE uri = 'tg:msg:10/3'"
+            ).fetchone()[0] is not None
         listing = tmp_path / "list.csv"
         text = EXTENDED_LIST if extended else LIST
         if post_extras:
@@ -246,6 +266,12 @@ def test_reproject_replays_posts_runs_to_identical_messages_revisions_and_tombst
         ).fetchone()[0] == 2
         assert conn.execute(
             "SELECT count(*) FROM message_metrics WHERE message_uri = 'tg:msg:10/2'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT deleted_at FROM messages WHERE uri = 'tg:msg:10/3'"
+        ).fetchone()[0] is None
+        assert conn.execute(
+            "SELECT count(*) FROM message_tombstones WHERE message_uri = 'tg:msg:10/3'"
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT count(*) FROM messages WHERE uri = 'tg:msg:20/13'"
