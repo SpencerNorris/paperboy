@@ -1,6 +1,6 @@
 """Where a run's media bytes live: the profile folder or a GCS bucket (#63, ADR-0008).
 
-`MediaStore` is the only seam the collectors, replay and `fetch-media` use to
+`MediaStore` is the only seam the collectors, replay and `fetch-from-list` use to
 write or read media bytes. A run has exactly one store, never both. A file's
 full location is *store root + key* (`media_keys`, ADR-0007); the key never
 changes, only the root does.

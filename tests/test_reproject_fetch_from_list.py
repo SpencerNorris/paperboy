@@ -435,7 +435,7 @@ def test_legacy_msg_ids_only_selection_replays_unchanged(tmp_path, monkeypatch):
     assert_round_trip(db, out, skip_tables=frozenset({"raw_records"}))
 
 
-def test_no_fetch_media_only_collector_in_replay(tmp_path, monkeypatch):
+def test_no_fetch_from_list_only_collector_in_replay(tmp_path, monkeypatch):
     """Live and replay run the SAME collectors for a segment: only the standard
     classes from `paperboy.collectors`, among them the three the live driver uses."""
     from paperboy import reproject as rp
