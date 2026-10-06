@@ -28,7 +28,14 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 (migration `0004_people.sql`) and reproject-replay support. See
 `docs/features/person-layer.md` and `docs/adr/0006-person-layer-storage.md`.
 
-**In progress on `dev/media-storage` (2026-09-29, not yet on `main`):** #69
+**In progress on `dev/gcs-pull` (2026-10-06, not yet on `main`):** the
+`dev/media-storage` chain below has merged into it. #63 per-run media stores is on
+`feat/media-stores` (PR pending → `dev/gcs-pull`; ADR-0008,
+`docs/features/media-stores.md`): each run's media goes to the local profile folder
+or a write-once GCS bucket (`--media-store`, `PAPERBOY_MEDIA_STORE[_BUCKETS]`), no
+local copy, create-only uploads, no delete path, per-store dedup, `custody_log.store`
+(migration 0007), reproject reads bucket receipts read-only. #91 `fetch-from-list`
+is next and builds on `MediaStore`. Earlier in the chain: #69
 pacing (`--pacing-factor`, `--max-flood-sleep`; migration 0005) and #62
 profile-relative media keys (ADR-0007; migration 0006) have merged. #64 media streaming is on `feat/media-streaming`
 (PR pending; `docs/features/media-streaming.md`): streamed downloads,
@@ -82,6 +89,11 @@ rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media
   `AvatarDownload` payloads) are profile-relative keys
   `media/<sha[:2]>/<sha><ext>` (ADR-0007), never absolute or cwd-relative
   paths; construct with `media_keys.media_key`, resolve at read time.
+- A key lives under a **store root**: the profile folder (`local`) or a bucket
+  `gs://<bucket>/<prefix>` (ADR-0008). One store per run, selected by
+  `media_store`; `custody_log.store` and a bucket run's `"store"` receipt key say
+  which (a missing key means local). `paperboy.media_store.MediaStore` is the only
+  seam; bucket writes are create-only with **no delete or overwrite path**.
 - `min` peers are stored with `(seen_in_chat, seen_in_msg)` provenance and
   fetched via `inputUserFromMessage`; optional user fields are tri-state
   (present / not-set / hidden-from-you) — never record "no photo".
@@ -100,7 +112,9 @@ rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media
   phone lookup (`importContacts` → snapshot → `deleteContacts`), `--join`,
   private-invite joins (operator asserts authorisation).
 - Outbound HTTP only to an allow-list (`t.me`, `web.archive.org`), via the
-  configured proxy; never fetch URLs found inside collected content.
+  configured proxy; never fetch URLs found inside collected content. The one
+  addition (ADR-0003 amendment, #63): `storage.googleapis.com`, only for a
+  configured, allow-listed media bucket (ADC only, no proxy); reproject only reads.
 - Credentials (phone, `api_hash`, session, login codes) never in logs or the
   repo; logs reference targets by id. Exports scrub the collecting account.
 
@@ -108,15 +122,17 @@ rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media
 
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
-[--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S]`
-(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv] [--exclude-target T …]` (ordered cross-channel
-media pull, #68 — `docs/features/fetch-media.md`), `status [TARGET]`, `export TARGET
+[--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S] [--media-store gs://B/P]`
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv] [--exclude-target T …] [--media-store gs://B/P]` (ordered cross-channel
+media pull, #68 — `docs/features/fetch-media.md`; per-run stores, #63 — `docs/features/media-stores.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out
 PATH | --out-profile NAME] [--include-target T | --exclude-target T] [--phases a,b,c]`
-needs none of that — it never touches the network or the keychain, only a
-source `paperboy.sqlite`'s `raw_records` (the target flags split a mixed
+needs none of that — it never touches Telegram or the keychain, only a
+source `paperboy.sqlite`'s `raw_records` (plus, for a bucket run's receipts, read-only
+GETs to an allow-listed GCS bucket with ADC, #63; a local-only source does no network
+I/O at all) (the target flags split a mixed
 profile, #70; `scripts/unreferenced_media.py --profile P` lists orphaned media). `watch`/
 `lookup` exit 1 with a "Phase 2" message — not implemented yet. `TARGET` for
 `collect`/`status`/`export` is a handle or a channel id (`123`, `-100123` after

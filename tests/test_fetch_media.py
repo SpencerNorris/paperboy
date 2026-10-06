@@ -16,6 +16,7 @@ from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.config import load_settings
 from paperboy.fetch_media import fetch_media
 from paperboy.media_list import classify_rows, parse_media_list
+from paperboy.media_store import LocalMediaStore
 from paperboy.store.db import Store
 from tests.fakes import FakeGateway
 from tests.test_media_list import seed_channel, seed_msg
@@ -79,7 +80,9 @@ BYTES = {1: b"a1", 2: b"a2", 3: b"a3", 11: b"b11", 12: b"b12"}
 def _classified(st, tmp_path, text=LIST):
     path = tmp_path / "list.csv"
     path.write_text(text, encoding="utf-8")
-    return classify_rows(st, parse_media_list(path))
+    return classify_rows(
+        st, parse_media_list(path), media_store=LocalMediaStore(tmp_path / "p")
+    )
 
 
 def _report(path: Path):
@@ -381,7 +384,8 @@ async def test_excluded_rows_are_never_fetched_and_say_why(tmp_path):
         path = tmp_path / "list.csv"
         path.write_text(LIST, encoding="utf-8")
         classified = classify_rows(
-            st, parse_media_list(path), excluded_ids=frozenset({10})
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path / "p"),
+            excluded_ids=frozenset({10}),
         )
         summary = await fetch_media(
             gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
@@ -394,3 +398,40 @@ async def test_excluded_rows_are_never_fetched_and_say_why(tmp_path):
     assert rows[0]["reason"] == "channel excluded by --exclude-target"
     assert [i["channel_id"] for i in gw.full_channel_inputs] == [20]
     assert gw.download_media_calls == [11, 12]
+
+
+@pytest.mark.asyncio
+async def test_second_run_against_bucket_is_already_stored(tmp_path, monkeypatch):
+    from paperboy.media_store import build_media_store
+    from tests.fake_gcs import FakeGcsClient
+
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    settings = load_settings(
+        "default",
+        {
+            "data_dir": tmp_path, "media_min_free_gb": 0,
+            "media_store": "gs://bkt/p/x", "media_store_buckets": "bkt",
+        },
+    )
+    media_store = build_media_store(settings, "p")
+    path = tmp_path / "list.csv"
+    path.write_text(LIST, encoding="utf-8")
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        first = classify_rows(st, parse_media_list(path), media_store=media_store)
+        summary = await fetch_media(
+            _gateway(BYTES), st, settings, first, LOG, profile="p", report_path=tmp_path / "r1.csv"
+        )
+        assert summary.counts["downloaded"] == 5 and len(client.bucket("bkt").objects) == 5
+        assert summary.bytes_downloaded == sum(len(b) for b in BYTES.values())
+
+        heads = client.bucket("bkt").calls["exists"]
+        second = classify_rows(st, parse_media_list(path), media_store=media_store)
+        assert {c.outcome for c in second} == {"already_stored"}
+        assert client.bucket("bkt").calls["exists"] == heads  # custody rows answer offline
+        gw = _gateway({})
+        summary = await fetch_media(
+            gw, st, settings, second, LOG, profile="p", report_path=tmp_path / "r2.csv"
+        )
+        assert gw.download_media_calls == [] and summary.counts["already_stored"] == 5

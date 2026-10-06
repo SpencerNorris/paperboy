@@ -173,6 +173,7 @@ async def collect_channel_with_context(
         active = [c for c in active if c.name != "channel"]
     selected = set(phases) if phases is not None else {c.name for c in active}
     results: list[CollectResult] = []
+    store_marked = False
     progress = Progress(store, log)
     progress.begin()
     try:
@@ -199,6 +200,29 @@ async def collect_channel_with_context(
                 store.add_raw(
                     "MediaSelection", selection, ctx.tier, None,
                     observed_at=ctx.clock.for_payload(selection),
+                )
+            if (
+                collector.name in ("profiles", "media")
+                and settings.media_store is not None
+                and not store_marked
+            ):
+                # Raw-first (#63): a bucket run's custody rows name a store that a
+                # dedup-only run never records in a receipt, so the run says which
+                # store it used - before the FIRST collector that writes through it
+                # (profiles avatars as well as media), once per run. Local runs
+                # write nothing (their raw log is unchanged).
+                store_marked = True
+                store_marker: dict[str, object] = {"store": settings.media_store}
+                if not any(
+                    c.name == "media" and c.name in selected and c.applies_to(target)
+                    for c in active
+                ):
+                    # No media phase in this run (avatars only): replay must not
+                    # infer one from the marker. Media runs keep the {store} shape.
+                    store_marker["media"] = False
+                store.add_raw(
+                    "MediaStore", store_marker, ctx.tier, None,
+                    observed_at=ctx.clock.for_payload(store_marker),
                 )
             try:
                 result = await _run_one(collector, ctx)

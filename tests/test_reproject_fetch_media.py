@@ -16,6 +16,7 @@ from paperboy.cli import app
 from paperboy.config import load_settings
 from paperboy.fetch_media import fetch_media
 from paperboy.media_list import classify_rows, parse_media_list
+from paperboy.media_store import LocalMediaStore
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource
 from paperboy.reproject import detect_phases
@@ -110,7 +111,10 @@ async def build_source(tmp_path: Path, *, extended: bool = False) -> Path:
         listing = tmp_path / "list.csv"
         listing.write_text(EXTENDED_LIST if extended else LIST, encoding="utf-8")
         summary = await fetch_media(
-            gw, store, settings, classify_rows(store, parse_media_list(listing)), LOG,
+            gw, store, settings, classify_rows(
+                store, parse_media_list(listing),
+                media_store=LocalMediaStore(tmp_path / "default"),
+            ), LOG,
             profile="default", report_path=tmp_path / "report.csv",
         )
         assert summary.complete

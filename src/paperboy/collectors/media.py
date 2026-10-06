@@ -20,8 +20,11 @@ occurrence (by content-id or by hash) still gets its own `custody_log` row.
 
 Streaming (#64): each download is streamed through a `MediaSink` into
 `<media>/.incoming/<uuid>.part` (bounded memory, sha256 computed
-incrementally), then atomically renamed to its content-addressed name — a
-crash never leaves a partial file under a final name. Stale `.part` files
+incrementally, plus a crc32c), then committed to the run's `MediaStore`
+(#63, ADR-0008): atomically renamed into the profile folder, or uploaded
+create-only to a GCS bucket with no local copy. A crash never leaves a partial
+file under a final name. "Already have it" is per store: the DB knowing a sha
+does not mean this run's store has the bytes. Stale `.part` files
 (> 1 h) from a dead run are swept at phase start. Before each download a
 free-disk floor (`--media-min-free-gb`, #53) is checked against
 `free - declared size`; crossing it stops the phase cleanly.
@@ -36,7 +39,6 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
-import os
 import shutil
 import time
 import uuid
@@ -46,14 +48,18 @@ from typing import TYPE_CHECKING
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.config import profile_dir
-from paperboy.media_keys import (
-    find_existing_key,
-    is_valid_ext,
-    media_dir,
-    media_key,
-    resolve_media_key,
-)
+from paperboy.media_keys import is_valid_ext, media_dir, media_key
 from paperboy.media_sink import MediaSink, MediaSinkWriteError, MediaSizeExceeded
+from paperboy.media_store import (
+    LOCAL_STORE_ID,
+    LocalMediaStore,
+    MediaStore,
+    MediaStoreError,
+    MediaStoreIntegrityError,
+    build_media_store,
+    stored_in,
+    verify_existing,
+)
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
@@ -77,7 +83,7 @@ class DiskFloorStop(PhaseStop):
     the phase cleanly, and a distinct type so #68 can end the whole command."""
 
 
-def _prepare_media_root(root: Path) -> Path:
+def prepare_media_root(root: Path) -> Path:
     """Create `root` and `root/.incoming` (same filesystem as the final
     location, so the finishing rename is atomic); return the incoming dir."""
     incoming = root / _INCOMING_DIR
@@ -111,12 +117,6 @@ def _free_bytes(root: Path) -> int:
 def _unlink_quiet(path: Path) -> None:
     """Remove `path` if it is still there (it is gone after a successful rename)."""
     path.unlink(missing_ok=True)
-
-
-def _finalize(temp: Path, dest: Path) -> None:
-    """Atomically move the finished temp file to its content-addressed name."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(temp, dest)
 
 
 def content_key(media: dict) -> tuple[str, int] | None:
@@ -257,10 +257,23 @@ class MediaCollector:
         writes = not replay or self._copy_on_replay
         incoming: Path | None = None
         if writes:
-            incoming = _prepare_media_root(media_root)
+            incoming = prepare_media_root(media_root)
             swept, swept_bytes = _sweep_incoming(incoming, now=time.time())
             if swept:
                 ctx.log.info("media: swept %d stale part file(s), %d bytes", swept, swept_bytes)
+        store: MediaStore | None
+        if not replay:
+            store = build_media_store(ctx.settings, ctx.profile)
+        elif writes:
+            # Replay-with-copy writes into the LOCAL output profile, never a
+            # bucket, whatever the replayed run's store was (ADR-0008).
+            store = LocalMediaStore(profile_dir(ctx.settings, ctx.profile))
+        else:
+            store = None  # replay without copy: the gateway's bytes prove existence
+        store_id = store.store_id if store is not None else (
+            ctx.settings.media_store or LOCAL_STORE_ID
+        )
+        ctx.log.info("media: store %s", store_id)
         floor_bytes = int(ctx.settings.media_min_free_gb * 10**9)
 
         content_index = self._load_content_index(ctx, channel_id)
@@ -322,144 +335,262 @@ class MediaCollector:
             if ctx.settings.media_max_mb is not None else None
         )
 
-        for row in rows:
-            media = json.loads(row["media_json"]) if row["media_json"] else {}
-            kind = DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
-            if kind is None:
-                counts["skipped_kind"] += 1
-                self._note(row["uri"], "skipped")
-                continue
+        try:
+            for row in rows:
+                media = json.loads(row["media_json"]) if row["media_json"] else {}
+                kind = DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
+                if kind is None:
+                    counts["skipped_kind"] += 1
+                    self._note(row["uri"], "skipped")
+                    continue
 
-            key = content_key(media)
-            if key is not None and key in content_index:
-                sha, path = content_index[key]
-                # A dedup hit derives from the STORED message row, not a
-                # fresh download (D3) — its own `first_seen` is the
-                # observation, not "now".
-                self._record_custody(ctx, path, sha, row["uri"], row["first_seen"])
-                counts["duplicates"] += 1
-                self._note(row["uri"], "duplicate")
-                continue
-
-            size = recorded_size(media)
-            if max_bytes is not None and size is not None and size > max_bytes:
-                # `--media-max-mb` (issue #53): decided from the size Telegram
-                # recorded, before a single byte is fetched.
-                ctx.log.info(
-                    "media: skipping msg %s: %.1f MB exceeds --media-max-mb %d",
-                    row["msg_id"], size / 1e6, ctx.settings.media_max_mb,
+                # Replay: the live run's receipt (if any) records whether this
+                # message's bytes were fetched, and under which key (#63).
+                receipt_key = (
+                    self._receipt_key(ctx, channel_id, row["msg_id"]) if replay else None
                 )
-                counts["too_large"] += 1
-                self._note(row["uri"], "too_large")
-                continue
 
-            if floor_bytes and writes:
-                free = _free_bytes(media_root)
-                if free - (size or 0) < floor_bytes:
-                    raise DiskFloorStop(
-                        f"media: free disk {free / 1e9:.2f} GB minus declared "
-                        f"{(size or 0) / 1e6:.1f} MB is below the "
-                        f"{ctx.settings.media_min_free_gb:g} GB floor "
-                        "(--media-min-free-gb)",
-                        counts=counts,
+                key = content_key(media)
+                if key is not None and key in content_index:
+                    sha, path = content_index[key]
+                    if self._held(ctx, store, sha, path, replay, receipt_key):
+                        # A dedup hit derives from the STORED message row, not a
+                        # fresh download (D3) — its own `first_seen` is the
+                        # observation, not "now".
+                        self._record_custody(
+                            ctx, path, sha, row["uri"], row["first_seen"], store_id
+                        )
+                        counts["duplicates"] += 1
+                        self._note(row["uri"], "duplicate")
+                        continue
+                    # The DB knows this file but THIS run's store does not
+                    # (e.g. first stored locally, now a bucket run): download it.
+
+                size = recorded_size(media)
+                if max_bytes is not None and size is not None and size > max_bytes:
+                    # `--media-max-mb` (issue #53): decided from the size Telegram
+                    # recorded, before a single byte is fetched.
+                    ctx.log.info(
+                        "media: skipping msg %s: %.1f MB exceeds --media-max-mb %d",
+                        row["msg_id"], size / 1e6, ctx.settings.media_max_mb,
                     )
+                    counts["too_large"] += 1
+                    self._note(row["uri"], "too_large")
+                    continue
 
-            temp = incoming / f"{uuid.uuid4().hex}.part" if incoming is not None else None
-            try:
+                if floor_bytes and writes:
+                    free = _free_bytes(media_root)
+                    if free - (size or 0) < floor_bytes:
+                        raise DiskFloorStop(
+                            f"media: free disk {free / 1e9:.2f} GB minus declared "
+                            f"{(size or 0) / 1e6:.1f} MB is below the "
+                            f"{ctx.settings.media_min_free_gb:g} GB floor "
+                            "(--media-min-free-gb)",
+                            counts=counts,
+                        )
+
+                temp = incoming / f"{uuid.uuid4().hex}.part" if incoming is not None else None
                 try:
-                    outcome = await self._stream_one(
-                        ctx, row["msg_id"], media, kind, size, temp
-                    )
-                except MediaSinkWriteError as exc:
-                    # A full disk / EIO is not transient: stop the phase rather
-                    # than re-download (the sink error is deliberately not an OSError).
-                    raise PhaseStop(
-                        f"media: cannot write to the media directory: {exc}",
-                        counts=counts,
-                    ) from exc
-                if isinstance(outcome, str):
-                    counts[outcome] += 1
-                    self._note(row["uri"], outcome)
-                    continue
-                sha, received = outcome
-                existing = self._lookup_by_sha(ctx, sha)
-                if existing is not None:
-                    # Safety-net dedup: two distinct document/photo ids hashed to
-                    # the same bytes (or `key` was None, e.g. a malformed dict).
-                    # Same D3 rationale as the content_index hit above.
-                    self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
-                    counts["duplicates"] += 1
-                    self._note(row["uri"], "duplicate")
-                    if key is not None:
-                        content_index[key] = (sha, existing)
-                    continue
+                    try:
+                        outcome = await self._stream_one(
+                            ctx, row["msg_id"], media, kind, size, temp
+                        )
+                    except MediaSinkWriteError as exc:
+                        # A full disk / EIO is not transient: stop the phase rather
+                        # than re-download (the sink error is deliberately not an OSError).
+                        raise PhaseStop(
+                            f"media: cannot write to the media directory: {exc}",
+                            counts=counts,
+                        ) from exc
+                    if isinstance(outcome, str):
+                        counts[outcome] += 1
+                        self._note(row["uri"], outcome)
+                        continue
+                    sha, received, crc32c = outcome
 
-                mime_type: str | None
-                file_name: str | None
-                attributes: list | None
-                if kind == "photo":
-                    mime_type, file_name, attributes = "image/jpeg", None, None
-                else:
-                    mime_type, file_name, attributes = _document_attrs(media)
-                ext = _guess_ext(kind, mime_type, file_name)
-                loc = media_key(sha, ext)
-                path = resolve_media_key(ctx.settings, ctx.profile, loc)
-                # Content-addressed: an existing path is already the right bytes.
-                # Guards replay idempotency (spec §4 — reproject never re-writes a
-                # media file) and spares a live re-run a redundant write too.
-                if not path.exists():
-                    # The same bytes may already sit under a different extension -
-                    # a pre-#62 file whose legacy suffix this version would not
-                    # re-derive. Reuse that location instead of writing a second
-                    # copy (and keep the reprojected row faithful to the source).
-                    existing_key = find_existing_key(profile_dir(ctx.settings, ctx.profile), sha)
-                    if existing_key is not None:
-                        loc = existing_key
-                    elif temp is None:
-                        # Replay with the stored file absent under both names:
-                        # there are no bytes to place and the source must not be
-                        # written to. Skip (recorded), never fabricate a row.
+                    mime_type: str | None
+                    file_name: str | None
+                    attributes: list | None
+                    if kind == "photo":
+                        mime_type, file_name, attributes = "image/jpeg", None, None
+                    else:
+                        mime_type, file_name, attributes = _document_attrs(media)
+
+                    existing = self._lookup_by_sha(ctx, sha)
+                    if (
+                        existing is not None
+                        and not replay
+                        and self._held(ctx, store, sha, existing, replay, receipt_key, crc32c)
+                    ):
+                        # Safety-net dedup: two distinct document/photo ids hashed to
+                        # the same bytes (or `key` was None, e.g. a malformed dict),
+                        # and this store already has them. Same D3 rationale as the
+                        # content_index hit above.
+                        self._record_custody(
+                            ctx, existing, sha, row["uri"], row["first_seen"], store_id
+                        )
+                        counts["duplicates"] += 1
+                        self._note(row["uri"], "duplicate")
+                        if key is not None:
+                            content_index[key] = (sha, existing)
+                        continue
+
+                    # `media.sha256` is the PK: when the DB already has the sha, the
+                    # file goes into THIS store under that row's key and no second
+                    # `media` row is written.
+                    loc = existing or media_key(sha, _guess_ext(kind, mime_type, file_name))
+                    if replay and receipt_key is not None:
+                        loc = receipt_key  # faithful to what the live run stored
+                    lost_race = False
+                    if store is not None and temp is not None:
+                        loc, lost_race = self._place(
+                            ctx, store, temp, sha, loc, crc32c, reuse=existing is None
+                        )
+                    elif store is None and receipt_key is None:
+                        # Replay without a recorded key: nothing to place and the source
+                        # must not be written to. Skip (recorded), never fabricate a row.
                         ctx.log.warning(
-                            "media: replay skipping msg %s: stored file for sha %s not found",
+                            "media: replay skipping msg %s: no stored location for sha %s",
                             row["msg_id"], sha,
                         )
                         counts["skipped"] += 1
                         self._note(row["uri"], "skipped")
                         continue
-                    else:
-                        _finalize(temp, path)
-            finally:
-                # A no-op after a successful rename; otherwise discards the
-                # partial/duplicate temp so nothing lingers under `.incoming/`.
-                if temp is not None:
-                    _unlink_quiet(temp)
+                except MediaStoreIntegrityError as exc:
+                    # The object was created but its checksum differs from what we
+                    # streamed. It stays (no delete path); no rows; operator recovery
+                    # is in ADR-0008.
+                    ctx.log.error(
+                        "media: msg %s integrity failure, local crc32c %s remote crc32c %s; "
+                        "no rows written, object left in the store",
+                        row["msg_id"], exc.local_crc32c, exc.remote_crc32c,
+                    )
+                    counts["skipped"] += 1
+                    self._note(row["uri"], "skipped")
+                    continue
+                finally:
+                    # A no-op after a successful rename; otherwise discards the
+                    # partial/duplicate temp so nothing lingers under `.incoming/`.
+                    if temp is not None:
+                        _unlink_quiet(temp)
 
-            raw_payload = {
-                "sha256": sha, "kind": kind, "size": received, "mime_type": mime_type,
-                "file_name": file_name, "path": loc, "message_uri": row["uri"],
-            }
-            downloaded_at = ctx.clock.for_payload(raw_payload)
-            ctx.store.conn.execute(
-                "INSERT INTO media (sha256, message_uri, kind, mime_type, size, file_name, "
-                "attributes_json, path, downloaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    sha, row["uri"], kind, mime_type, received, file_name,
-                    dumps(attributes) if attributes is not None else None,
-                    loc, downloaded_at,
-                ),
-            )
-            self._record_custody(ctx, loc, sha, row["uri"], downloaded_at)
-            ctx.store.add_raw(
-                "MediaDownload", raw_payload, ctx.tier,
-                {"channel_id": channel_id, "msg_id": row["msg_id"]},
-                observed_at=downloaded_at,
-            )
-            counts["downloaded"] += 1
-            self._note(row["uri"], "downloaded")
-            if key is not None:
-                content_index[key] = (sha, loc)
+                raw_payload = {
+                    "sha256": sha, "kind": kind, "size": received, "mime_type": mime_type,
+                    "file_name": file_name, "path": loc, "message_uri": row["uri"],
+                }
+                if store_id != LOCAL_STORE_ID:
+                    # Absence of "store" means local (ADR-0008): local runs keep
+                    # byte-identical receipts.
+                    raw_payload["store"] = store_id
+                downloaded_at = ctx.clock.for_payload(raw_payload)
+                if existing is None:
+                    ctx.store.conn.execute(
+                        "INSERT INTO media (sha256, message_uri, kind, mime_type, size, "
+                        "file_name, attributes_json, path, downloaded_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            sha, row["uri"], kind, mime_type, received, file_name,
+                            dumps(attributes) if attributes is not None else None,
+                            loc, downloaded_at,
+                        ),
+                    )
+                self._record_custody(ctx, loc, sha, row["uri"], downloaded_at, store_id)
+                ctx.store.add_raw(
+                    "MediaDownload", raw_payload, ctx.tier,
+                    {"channel_id": channel_id, "msg_id": row["msg_id"]},
+                    observed_at=downloaded_at,
+                )
+                # Spec section 2 step 3: a lost create race is a duplicate (another
+                # writer's verified object is kept), never a download. The rows above
+                # are still written: this DB had no record of the bytes.
+                outcome_key = "duplicates" if lost_race else "downloaded"
+                counts[outcome_key] += 1
+                self._note(row["uri"], "duplicate" if lost_race else "downloaded")
+                if key is not None:
+                    content_index[key] = (sha, loc)
+        except MediaStoreError as exc:
+            # A bucket outage (or a bad credential) is not per-file: stop the phase
+            # instead of re-downloading every remaining file for nothing.
+            raise PhaseStop(
+                f"media: cannot write to the media store: {exc}", counts=counts
+            ) from exc
 
         return CollectResult(name=self.name, counts=counts)
+
+    @staticmethod
+    def _receipt_key(ctx: CollectContext, channel_id: int, msg_id: int) -> str | None:
+        """Replay only: the key the live run recorded in this message's
+        `MediaDownload` receipt, `None` when the live run fetched no bytes."""
+        lookup = getattr(ctx.gateway, "media_receipt_key", None)
+        return lookup(channel_id, msg_id) if lookup is not None else None
+
+    @staticmethod
+    def _held(
+        ctx: CollectContext,
+        store: MediaStore | None,
+        sha: str,
+        key: str,
+        replay: bool,
+        receipt_key: str | None,
+        crc32c: str | None = None,
+    ) -> bool:
+        """Whether THIS run's store already has the file, so only custody is due.
+
+        Live: a `custody_log` row naming the store (offline, no request), else
+        an existing object. An existing object is never trusted blindly: with
+        the streamed `crc32c` it is verified (mismatch raises
+        `MediaStoreIntegrityError`); with no stream (a pre-download dedup hit)
+        a verifiable store cannot vouch for it, so the file is re-fetched and
+        verified. Replay: the live run's receipt is the record - a receipt
+        means it downloaded the bytes, no receipt means it did not.
+        """
+        if replay:
+            return receipt_key is None
+        assert store is not None
+        if stored_in(ctx.store.conn, sha, store.store_id):
+            return True
+        if not store.exists(key):
+            return False
+        if crc32c is None:
+            return not store.verifiable
+        verify_existing(store, key, crc32c)
+        return True
+
+    @staticmethod
+    def _place(
+        ctx: CollectContext,
+        store: MediaStore,
+        temp: Path,
+        sha: str,
+        loc: str,
+        crc32c: str,
+        *,
+        reuse: bool,
+    ) -> tuple[str, bool]:
+        """Put the finished temp file into `store` under `loc`; return
+        `(key used, lost_race)`; `lost_race` is True when a concurrent writer
+        created the object first (counted as a duplicate by the caller).
+
+        `reuse` (a brand-new sha): the bytes may already sit under that exact
+        key or a legacy-suffixed one (a pre-#62 file) - reuse it rather than
+        write a second copy. Commit is create-only. Any object found instead of
+        written (reused, or won by a racing writer) is first checked against the
+        streamed `crc32c`, so a corrupt leftover is never adopted as evidence
+        (`MediaStoreIntegrityError`: no rows).
+        """
+        if reuse:
+            if store.exists(loc):
+                verify_existing(store, loc, crc32c)
+                return loc, False
+            found = store.find_key(sha)
+            if found is not None:
+                verify_existing(store, found, crc32c)
+                return found, False
+        if not store.commit(temp, loc, crc32c):
+            verify_existing(store, loc, crc32c)
+            ctx.log.info("media: %s already in the store; kept the existing object", sha[:12])
+            return loc, True
+        return loc, False
 
     async def _stream_one(
         self,
@@ -469,10 +600,10 @@ class MediaCollector:
         kind: str,
         declared: int | None,
         temp: Path | None,
-    ) -> str | tuple[str, int]:
+    ) -> str | tuple[str, int, str]:
         """Stream one message's media into `temp`. Returns the `counts` key of
         a non-download outcome (`skipped`/`unavailable`/`size_mismatch`), or
-        `(sha256, received bytes)` of a complete file. A `MediaSinkWriteError`
+        `(sha256, received bytes, crc32c)` of a complete file. A `MediaSinkWriteError`
         (local disk failure) propagates to the caller.
 
         `declared` caps the stream (a longer one raises `MediaSizeExceeded`
@@ -505,7 +636,7 @@ class MediaCollector:
                 msg_id, sink.size, declared,
             )
             return "size_mismatch"
-        return sink.sha256, sink.size
+        return sink.sha256, sink.size, sink.crc32c
 
     def _load_content_index(
         self, ctx: CollectContext, channel_id: int
@@ -535,10 +666,16 @@ class MediaCollector:
         return row["path"] if row else None
 
     def _record_custody(
-        self, ctx: CollectContext, key: str, sha: str, message_uri: str, recorded_at: str
+        self,
+        ctx: CollectContext,
+        key: str,
+        sha: str,
+        message_uri: str,
+        recorded_at: str,
+        store_id: str,
     ) -> None:
         ctx.store.conn.execute(
-            "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri) "
-            "VALUES (?, ?, ?, ?)",
-            (key, sha, recorded_at, message_uri),
+            "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri, store) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (key, sha, recorded_at, message_uri, store_id),
         )

@@ -70,6 +70,15 @@ segment that reused an already-established channel) and `MediaSelection`
 was allowed to walk, written just before the media phase). `reproject` reads them
 to replay those runs exactly.
 
+Per-run media stores (#63, ADR-0008) add one more and extend two receipts.
+`MediaStore` (`{store}`, the run's `gs://<bucket>/<prefix>`) is written once, just
+before the `media` phase of a **bucket** run only (local runs write none), so a
+custody row that merely records a duplicate still has its store derivable from
+raw. The `MediaDownload` and `AvatarDownload` payloads gain `"store"` (the same
+URL), **only when the run's store is not local: a missing `store` key means
+`local`**, which keeps legacy and local-run receipts byte-identical. `reproject`
+reads each file from the store its receipt names.
+
 ## Entities (current state)
 
 ### `channels` — the channel/supergroup itself
@@ -154,7 +163,7 @@ Content-addressed by SHA-256; deduped across messages.
 | `size` | INTEGER | Bytes received (streamed and counted; equals the declared size for documents, #64). |
 | `file_name` | TEXT | Original filename (documents). |
 | `attributes_json` | TEXT | Video/audio/sticker attributes. |
-| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
+| `path` | TEXT | Media key, relative to the store root: `media/<sha[:2]>/<sha><ext>` — store-neutral (the same key under the profile dir or under a bucket prefix); resolve locally with `media_keys.resolve_media_key` (ADR-0007). Which store holds the bytes is in `custody_log.store`. |
 | `downloaded_at` | TEXT | Download time. |
 | `exif_json` | TEXT | Extracted EXIF/metadata (documents). |
 
@@ -302,6 +311,7 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | `sha256` | TEXT | Hash at write time. |
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |
+| `store` | TEXT | Which media store this sighting's bytes are in (migration `0007_media_stores`, #63): `local` (the profile folder) or the full `gs://<bucket>/<prefix>` URL; never a filesystem path. NOT NULL, default `local` (every earlier row was written by a local run). One sha can have rows in several stores. |
 
 ## Web (Phase 2)
 

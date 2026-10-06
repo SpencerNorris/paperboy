@@ -209,3 +209,41 @@ def test_unknown_exclude_target_exits_1_before_anything_else(tmp_path, monkeypat
     )
     assert result.exit_code == 1
     assert "999" in result.stdout
+
+
+def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monkeypatch):
+    from tests.fake_gcs import FakeGcsClient
+
+    path = _prepare(tmp_path)
+    _forbid_network(monkeypatch)
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    # Make one list row look stored locally, so the bucket has to be asked about it.
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        from tests.test_media_list import record_media
+
+        record_media(st, "tg:msg:10/1", "a" * 64)
+    result = runner.invoke(
+        app,
+        [
+            "fetch-media", str(path), "--profile", "p", "--dry-run",
+            "--media-store", "gs://bkt/p/x",
+        ],
+        env={**_env(tmp_path), "PAPERBOY_MEDIA_STORE_BUCKETS": "bkt"},
+    )
+    assert result.exit_code == 0, result.stdout
+    assert client.bucket("bkt").calls["exists"] > 0  # a bucket dry run touches GCS...
+    assert client.bucket("bkt").calls["upload"] == 0  # ...read-only
+    assert "already_stored" in result.stdout and "pending" in result.stdout
+
+
+def test_dry_run_against_unlisted_bucket_is_a_config_error(tmp_path, monkeypatch):
+    path = _prepare(tmp_path)
+    _forbid_network(monkeypatch)
+    result = runner.invoke(
+        app,
+        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--media-store", "gs://bkt/p"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 1
+    assert "media_store_buckets" in result.stdout

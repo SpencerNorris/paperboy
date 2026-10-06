@@ -32,14 +32,28 @@ is only ever written through `upsert_peer` (never modified here).
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime
 
 from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
+from paperboy.collectors.media import prepare_media_root
 from paperboy.collectors.posture import record_privacy_posture
+from paperboy.config import profile_dir
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import channel_uri, namespaced_kind, user_uri
-from paperboy.media_keys import media_key, resolve_media_key
+from paperboy.media_keys import media_dir, media_key
+from paperboy.media_sink import MediaSink
+from paperboy.media_store import (
+    LOCAL_STORE_ID,
+    LocalMediaStore,
+    MediaStore,
+    MediaStoreError,
+    MediaStoreIntegrityError,
+    build_media_store,
+    stored_in,
+    verify_existing,
+)
 from paperboy.store.db import dumps
 from paperboy.store.events import record_run_event
 from paperboy.store.message_peers import backfill_message_referenced_peers
@@ -87,7 +101,53 @@ def _ref_key(ref: dict) -> str:
 
 
 class ProfilesCollector:
+    """`copy_on_replay` mirrors `MediaCollector`'s (#63): a plain reproject writes
+    no avatar bytes anywhere; `--out-profile` copies them into the local output
+    profile."""
+
     name = "profiles"
+
+    def __init__(self, *, copy_on_replay: bool = False) -> None:
+        self._copy_on_replay = copy_on_replay
+        # Built once per `collect` (a GCS store holds one authenticated client).
+        self._store: MediaStore | None = None
+        self._store_id = LOCAL_STORE_ID
+        self._replay = False
+
+    def _open_store(self, ctx: CollectContext) -> None:
+        """Pick this run's avatar store, as `MediaCollector` does for media."""
+        self._replay = getattr(ctx.gateway, "replay", False) is True
+        if not self._replay:
+            self._store = build_media_store(ctx.settings, ctx.profile)
+        elif self._copy_on_replay:
+            self._store = LocalMediaStore(profile_dir(ctx.settings, ctx.profile))
+        else:
+            self._store = None  # replay without copy: nothing is written anywhere
+        self._store_id = (
+            self._store.store_id
+            if self._store is not None
+            else (ctx.settings.media_store or LOCAL_STORE_ID)
+        )
+
+    def _avatar_held(self, ctx: CollectContext, sha: str, photo_id: int) -> bool:
+        """Whether THIS run's store already has the avatar, so nothing is due.
+
+        Replay: the live run's own record decides - an `AvatarDownload` receipt
+        for this photo means it fetched the bytes (and wrote a custody row and
+        receipt this replay must reproduce); no receipt means it skipped it.
+        Live: custody row first (offline), else one check.
+        """
+        if self._replay:
+            has_receipt = getattr(ctx.gateway, "has_avatar_receipt", None)
+            return has_receipt is None or not has_receipt(photo_id)
+        if self._store is None:
+            return True
+        if stored_in(ctx.store.conn, sha, self._store_id):
+            return True
+        # An object with no custody row is only trusted where it cannot be
+        # verified (local); a bucket object is re-fetched and CRC-checked.
+        key = media_key(sha, ".jpg")
+        return not self._store.verifiable and self._store.exists(key)
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
@@ -98,6 +158,7 @@ class ProfilesCollector:
                 "profiles skipped: channel context not established "
                 "(channel phase did not complete)"
             )
+        self._open_store(ctx)
         counts = {
             "backfilled_peers": 0, "gathered": 0, "unresolvable": 0, "dead_ref_skipped": 0,
             "self_skipped": 0, "triaged": 0, "empty": 0,
@@ -613,9 +674,42 @@ class ProfilesCollector:
                 # (spec §9): the history is recorded, the bytes are not fetched.
                 counts["restricted_skipped"] += 1
                 continue
-            if user_photo_sha(ctx.store, uri, photo["id"]) is not None:
-                continue  # content-addressed and already on disk: never re-fetched
+            known = user_photo_sha(ctx.store, uri, photo["id"])
+            if known is not None and self._avatar_held(ctx, known, photo["id"]):
+                continue  # content-addressed and already in this run's store
             await self._download_avatar(ctx, uri, user_id, photo, counts)
+
+    def _put_avatar(
+        self, ctx: CollectContext, sha: str, key: str, data: bytes, counts: dict[str, int]
+    ) -> bool:
+        """Commit the avatar bytes to this run's store (temp file, then create-only
+        commit, like media). `False` = integrity failure: counted, no rows."""
+        store = self._store
+        assert store is not None
+        incoming = prepare_media_root(media_dir(ctx.settings, ctx.profile))
+        temp = incoming / f"{uuid.uuid4().hex}.part"
+        try:
+            with MediaSink(temp) as sink:
+                sink.write(data)
+            if store.exists(key):
+                verify_existing(store, key, sink.crc32c)  # never adopt unchecked
+            elif not store.commit(temp, key, sink.crc32c):
+                verify_existing(store, key, sink.crc32c)
+        except MediaStoreIntegrityError as exc:
+            ctx.log.error(
+                "profiles: avatar integrity failure, local crc32c %s remote crc32c %s; "
+                "no rows written, object left in the store",
+                exc.local_crc32c, exc.remote_crc32c,
+            )
+            counts["skipped"] += 1
+            return False
+        except MediaStoreError as exc:
+            raise PhaseStop(
+                f"profiles: cannot write to the media store: {exc}", counts=counts
+            ) from exc
+        finally:
+            temp.unlink(missing_ok=True)
+        return True
 
     async def _download_avatar(
         self,
@@ -644,14 +738,14 @@ class ProfilesCollector:
             return
         sha = hashlib.sha256(data).hexdigest()
         key = media_key(sha, ".jpg")  # Telegram re-encodes avatars as JPEG
-        path = resolve_media_key(ctx.settings, ctx.profile, key)
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+        if self._store is not None and not self._put_avatar(ctx, sha, key, data, counts):
+            return
         raw_payload = {
             "sha256": sha, "path": key, "size": len(data),
             "user_uri": uri, "photo_id": photo["id"],
         }
+        if self._store_id != LOCAL_STORE_ID:
+            raw_payload["store"] = self._store_id  # absence means local (ADR-0008)
         downloaded_at = ctx.clock.for_payload(raw_payload)
         ctx.store.conn.execute(
             "INSERT INTO media (sha256, message_uri, kind, mime_type, size, file_name, "
@@ -661,9 +755,9 @@ class ProfilesCollector:
             (sha, len(data), key, downloaded_at),
         )
         ctx.store.conn.execute(
-            "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri) "
-            "VALUES (?, ?, ?, NULL)",
-            (key, sha, downloaded_at),
+            "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri, store) "
+            "VALUES (?, ?, ?, NULL, ?)",
+            (key, sha, downloaded_at, self._store_id),
         )
         ctx.store.add_raw(
             "AvatarDownload", raw_payload, ctx.tier,

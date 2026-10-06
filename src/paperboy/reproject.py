@@ -241,6 +241,12 @@ def _pin_selection(
         clock.pin_json(selection.observed_at, dumps(current))
 
 
+def _pin_store_marker(clock: ReplayClock, marker: RunMarker | None) -> None:
+    """Give the replayed `MediaStore` marker (#63) its recorded stamp."""
+    if marker is not None:
+        clock.pin_json(marker.observed_at, marker.payload_json)
+
+
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     """The phase set ONE historical run executed, inferred from the raw kinds
     it left behind (spec §3: a run that never did graph reprojects without
@@ -275,7 +281,10 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
     selection = source.media_selection(run)
+    store_marker = source.media_store(run)
     if source.has_kind(run, "mediadownload") or (
+        store_marker is not None and store_marker.payload.get("media", True)
+    ) or (
         selection is not None
         and source.channel_established(run, selection.payload.get("channel_id"))
     ):
@@ -389,6 +398,16 @@ async def reproject(
             replay_settings = replay_settings.model_copy(
                 update={"media_msgs": list(selection.payload.get("msg_ids") or [])}
             )
+        # A bucket run's `MediaStore` marker names the store its custody rows and
+        # receipts refer to (#63). A copy into another profile (`--out-profile`)
+        # lands in that LOCAL profile, so it replays as a local run; a plain
+        # reproject keeps the recorded store. The reproject's own env/CLI store is
+        # never used for replay.
+        store_marker = source.media_store(run)
+        replay_store = None
+        if store_marker is not None and out_profile is None:
+            replay_store = store_marker.payload.get("store")
+        replay_settings = replay_settings.model_copy(update={"media_store": replay_store})
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:
             if p not in phases_seen:
@@ -440,6 +459,8 @@ async def reproject(
             clock = ReplayClock()
             clock.pin_json(marker.observed_at, marker.payload_json)
             _pin_selection(clock, selection, channel_id)
+            if replay_store is not None:
+                _pin_store_marker(clock, store_marker)
             context = ChannelContext(
                 {"channel_id": channel_id, "access_hash": access_hash}, channel_id,
                 marker.tier, source_run_id,
@@ -472,6 +493,8 @@ async def reproject(
             clock = ReplayClock()
             established = source.established_channel_ids(run)
             _pin_selection(clock, selection, established[0] if established else None)
+            if replay_store is not None:
+                _pin_store_marker(clock, store_marker)
             results.setdefault(raw_target, []).extend(
                 await _replay_one(
                     source, out_store, replay_settings, media_profile, run, list(run_phases),
@@ -523,11 +546,13 @@ async def _replay_one(
     `channel_context` is set for a media-only fetch-media segment (#68): the
     recipe then skips `channel` and rewrites the run's marker.
     """
-    gateway = RawReplayGateway(source, clock, run)
+    gateway = RawReplayGateway(
+        source, clock, run, allowed_buckets=replay_settings.media_store_bucket_set
+    )
     web_client = RawReplayWebClient(source, clock, run)
     collectors = [
         ChannelCollector(), HistoryCollector(), DiscussionCollector(),
-        ParticipantsCollector(), ProfilesCollector(),
+        ParticipantsCollector(), ProfilesCollector(copy_on_replay=out_profile is not None),
         GraphCollector(),
         WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
         MediaCollector(copy_on_replay=out_profile is not None),
