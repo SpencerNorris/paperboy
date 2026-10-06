@@ -117,4 +117,149 @@ Gates (`uv run pytest -q --basetemp=…`, `uv run ruff check`, `uv run pyright`)
 and the smoke transcripts follow (redacted; unredacted transcripts stay in the
 operator's scratch directory, referenced by filename).
 
-DOD-PLACEHOLDER
+### Gates (pasted tool output)
+
+```
+$ uv run pytest -q --basetemp=<scratch>
+1073 passed in 87.63s (0:01:27)
+$ uv run ruff check
+All checks passed!
+$ uv run pyright
+0 errors, 0 warnings, 0 informations
+```
+
+Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`, before this
+DoD commit): `CLAUDE.md`, `README.md`, `docs/adr/0003-guardrails.md`,
+`docs/adr/0008-media-stores.md`, `docs/data-model.md`,
+`docs/features/{fetch-media,media-stores,media-streaming,reproject}.md`,
+`docs/how-it-works.md`, `docs/opsec.md`,
+`docs/superpowers/plans/2026-10-06-media-stores.md`, `pyproject.toml`,
+`uv.lock`, `src/paperboy/{cli,config,doctor,fetch_media,media_list,media_sink,media_store,recipes,replay,reproject}.py`,
+`src/paperboy/collectors/{media,profiles}.py`,
+`src/paperboy/store/migrations/0007_media_stores.sql`, and the matching tests
+(`tests/fake_gcs.py` is the in-memory GCS fake; `tests/conftest.py` asserts no
+test ever attempts a bucket delete; `tests/fixtures/reproject/parity_golden.json`
+gains only `"store": "local"` on each `custody_log` row).
+
+### Smoke test transcript
+
+Scratch data dir `<scratch>` (an `sqlite3 ".backup"` of the real store, never
+the real store itself), `PAPERBOY_REQUIRE_PROXY=false`, `--profile default`,
+`--max-rpc 60 --max-flood-sleep 60`, no `--unsafe`/`--join`/`--profiles`,
+`PAPERBOY_MEDIA_STORE=gs://<bucket>/paperboy/smoke-20261006`,
+`PAPERBOY_MEDIA_STORE_BUCKETS=<bucket>`. Target: two photos and one document
+(< 100 KB each, 322,422 bytes total) from one channel `@<channel>` already in
+the store, by id (`<id>`, `<id>`, `<id>`). Bucket writes only under the fresh
+smoke prefix. Unredacted transcripts in `<scratch>`: `L1-doctor-unredacted.txt`,
+`L2-collect-unredacted.txt`, `L3-collect-unredacted.txt`,
+`reproject-mini-unredacted.txt`, `bucket-describe-unredacted.txt`,
+`gcloud-ls-unredacted.txt`, `object-sha256-unredacted.txt`, `live-calls.log`.
+
+**Live Telegram invocations: 3 of 5** (L1 doctor, L2 collect, L3 collect). The
+live-call counter file holds 4 lines: the first line was written for an L1
+attempt that never started (`timeout: command not found`, no Telegram contact)
+and was kept rather than edited. STOP flag absent and the VPN check passed
+before each (both addresses routed via `utun*`). No flood waits, no stop
+condition.
+
+VPN check before L1, L2 and L3 (identical each time):
+```
+149.154.167.51 -> utun*
+91.108.56.130 -> utun*
+```
+
+Offline (1), the bucket (read-only describe, name redacted): `US-EAST4`,
+`public_access_prevention: enforced`, retention policy `retentionPeriod:
+'8035200'` effective 2026-09-28, soft delete `604800` s, uniform access.
+
+Offline (2), `fetch-media <list> --dry-run --media-store gs://<bucket>/paperboy/smoke-20261006`
+on the 3-row list, before the pull: `pending 3`, `already_stored 0`, no
+Telegram, no keychain. After the pull: `already_stored 3`, `pending 0`.
+
+L1, `paperboy doctor --profile default` with the store env (the four store rows):
+```
+media_store_credentials     ok    Application Default Credentials found
+media_store_permissions     ok    storage.objects.create and get granted
+media_store_least_privilege warn  storage.objects.delete is granted; paperboy never deletes, but a create-only role (roles/storage.objectCreator) is safer
+media_store_retention       ok    retention 8035200 s (93 days), versioning on
+```
+(the account rows above them were all `ok`; `PASS`.)
+
+L2, `paperboy collect <id> --phases channel,media --media-msgs <id>,<id>,<id>`:
+```
+channel {'channels': 1, 'peers': 1}
+media   {'downloaded': 3, 'duplicates': 0, 'unavailable': 0, 'skipped_kind': 0, 'skipped': 0, 'size_mismatch': 0, ... 'too_large': 0}
+media store: created media/<xx>/<sha>.jpg   (x3)
+```
+
+L3, the same command again (no upload):
+```
+media   {'downloaded': 0, 'duplicates': 3, 'unavailable': 0, 'skipped_kind': 0, 'skipped': 0, ...}
+```
+
+After the pull (offline):
+```
+$ gcloud storage ls -l "gs://<bucket>/paperboy/smoke-20261006/media/**"
+    102265  2026-10-06T18:20:38Z  gs://<bucket>/paperboy/smoke-20261006/media/53/53954a4b71af....jpg
+     92767  2026-10-06T18:20:40Z  gs://<bucket>/paperboy/smoke-20261006/media/60/602d9b566fb4....jpg
+    127390  2026-10-06T18:20:36Z  gs://<bucket>/paperboy/smoke-20261006/media/cc/ccabee3cb6df....jpg
+TOTAL: 3 objects, 322422 bytes (314.87kiB)
+$ sqlite3 ... "SELECT substr(path,1,12), substr(sha256,1,12), store FROM custody_log ORDER BY id DESC LIMIT 6"
+media/60/602...|602d9b566fb4|gs://<bucket>/paperboy/smoke-20261006      (x2 each of 3 files: L2 and L3)
+media/53/539...|53954a4b71af|gs://<bucket>/paperboy/smoke-20261006
+media/cc/cca...|ccabee3cb6df|gs://<bucket>/paperboy/smoke-20261006
+$ find <scratch>/default/media -type f | wc -l          -> 0
+$ ls -A <scratch>/default/media/.incoming | wc -l       -> 0
+raw MediaStore markers (2 runs): {"store": "gs://<bucket>/paperboy/smoke-20261006"}
+```
+Integrity: `gcloud storage cat` of each object piped to `shasum -a 256` equals
+`media.sha256` for all three (full 64-hex digests in `object-sha256-unredacted.txt`).
+(`gcloud storage hash` reports md5/crc32c, not sha256, so the sha was recomputed
+from the downloaded bytes.) The local `media/` is unchanged: zero files, empty
+`.incoming/`.
+
+Read-back, offline reproject (reads the 3 objects, no Telegram). A full reproject
+of the whole scratch store was impractical in the time available (the machine was
+I/O-contended and background jobs are throttled), so it ran on a reduced copy of
+the scratch store: the same file with `raw_records` cut to the channel's history
+run plus the two smoke runs, `--phases channel,history,media`, source profile
+`mini`:
+```
+$ paperboy reproject --profile mini --phases channel,history,media --out <scratch>/reprojected-mini.sqlite
+media: store local                       (the historical run)
+media: store gs://<bucket>/paperboy/smoke-20261006
+  media  downloaded=3 duplicates=0 ... not_selected=7790       (L2 replayed: 3 objects read back, sha re-verified)
+media: store gs://<bucket>/paperboy/smoke-20261006
+  media  downloaded=0 duplicates=3 ... not_selected=7790       (L3 replayed)
+row counts - source vs reprojected (source = the unreduced backup's projections)
+  raw_records 8751 -> 8723 (phases limited)   media 307 -> 3   custody_log 1841 -> 6
+  messages 53554 -> 8400 (this channel only)
+custody_log by store in the output:  gs://<bucket>/paperboy/smoke-20261006 | 6
+raw MediaStore markers in the output: 2
+```
+Grep of the reproject console log and `.log` for `TelethonGateway`, `Budget`
+or `rpc `: 0 matches. `gcloud storage ls` after the reproject: still 3 objects
+(zero bucket writes).
+
+Not covered by a live smoke: a CRC mismatch, a lost create race and bucket
+outages (covered by `tests/test_media_store.py` and
+`tests/test_collector_media_stores.py` with the in-memory fake); a VM run with a
+create-only service account (ops, spec section 7).
+
+### Docs updated
+
+`docs/features/media-stores.md` (new), `docs/features/media-streaming.md`,
+`docs/features/reproject.md`, `docs/features/fetch-media.md`, `README.md`,
+`CLAUDE.md`, `docs/data-model.md`, `docs/how-it-works.md`, `docs/opsec.md`,
+`docs/adr/0008-media-stores.md` (new), `docs/adr/0003-guardrails.md`
+(amendment), `docs/superpowers/plans/2026-10-06-media-stores.md`.
+
+### Review notes
+
+- No delete or overwrite path to GCS exists: `media_store.py` has no delete call;
+  `commit` is `upload_from_filename(..., if_generation_match=0)`; the GCS fake
+  raises `AssertionError` on any delete and `tests/conftest.py` asserts none was
+  attempted over the whole suite.
+- Tests never touch the network: they patch
+  `paperboy.media_store.default_client_factory` or pass a fake factory.
+- Logs carry exception class names only, never tokens or credentials.
