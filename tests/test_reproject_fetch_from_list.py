@@ -1,4 +1,4 @@
-"""`reproject` replays `fetch-media` segment runs (#68): first segments (channel +
+"""`reproject` replays `fetch-from-list` segment runs (#68): first segments (channel +
 media) and later, media-only segments that reuse a resolved channel via the
 `ChannelContextReused` marker. Synthetic channels/messages only."""
 
@@ -10,11 +10,11 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from paperboy.fetch_media import fetch_media
 from typer.testing import CliRunner
 
 from paperboy.cli import app
 from paperboy.config import load_settings
+from paperboy.fetch_from_list import fetch_from_list
 from paperboy.media_list import classify_rows, parse_media_list
 from paperboy.media_store import LocalMediaStore
 from paperboy.recipes import collect_channel
@@ -23,7 +23,7 @@ from paperboy.reproject import detect_phases
 from paperboy.store.db import Store
 from paperboy.targets import parse_target
 from tests.fakes import FakeGateway
-from tests.test_fetch_media import _full, _resolved
+from tests.test_fetch_from_list import _full, _resolved
 from tests.test_reproject import assert_round_trip
 
 runner = CliRunner()
@@ -84,9 +84,18 @@ PHOTOS_C = {21: 301}
 EXTENDED_LIST = LIST + "tg:msg:10/4,P3\ntg:msg:30/21,P3\n"
 
 
-async def build_source(tmp_path: Path, *, extended: bool = False) -> Path:
-    """Runs 1-2 (extended: 1-3) collect the channels; the rest are the fetch-media
-    segments (four, or six extended)."""
+async def build_source(
+    tmp_path: Path, *, extended: bool = False, with_media: bool = True,
+    post_extras: bool = False,
+) -> Path:
+    """Runs 1-2 (extended: 1-3) collect the channels; the rest are the fetch-from-list
+    segments (four, or six extended).
+
+    `post_extras` adds, to channel 20's segment, an edited post (message 2 of
+    channel 10 gains text and a view counter), a new text post and a post Telegram
+    answers `MessageEmpty` for: the replay must reproduce a revision, a metric
+    row, a projected new post and a tombstone. `with_media=False` is
+    `--no-media`."""
     settings = load_settings("default", {"data_dir": tmp_path, "media_min_free_gb": 0})
     db = tmp_path / "default" / "paperboy.sqlite"
     with Store.open(db) as store:
@@ -98,24 +107,40 @@ async def build_source(tmp_path: Path, *, extended: bool = False) -> Path:
                 FakeGateway(_collect_fixtures(cid, username, photos, keyless=cid == 30)),
                 store, settings, parse_target(f"@{username}"), ["channel", "history"], LOG,
             )
+        posts = {
+            m["id"]: m for photos in (PHOTOS_A, PHOTOS_B, PHOTOS_C) for m in _history(photos)
+        }
+        if post_extras:
+            posts[2] = {**posts[2], "message": "edited", "views": 7}
+            posts[13] = {
+                "_": "message", "id": 13, "message": "new text post", "date": 1767322500,
+                "from_id": {"_": "PeerUser", "user_id": 42},
+                "fwd_from": {
+                    "_": "MessageFwdHeader", "from_id": {"_": "PeerChannel", "channel_id": 99},
+                },
+            }
         gw = FakeGateway({
             "self": {"_": "user", "id": 1, "self": True},
+            "get_messages": posts,  # id 14 is absent: Telegram answers MessageEmpty
             # Only the keyless channel's stored handle is ever looked up.
             "resolve": (
                 _resolved(6, "chan_c") if extended
-                else AssertionError("fetch-media addresses channels by id")
+                else AssertionError("fetch-from-list addresses channels by id")
             ),
             "full_channel_by_id": {10: _full(10, "chan_a"), 20: _full(20, "chan_b")},
             "media": {1: b"a1", 2: b"a2", 3: b"a3", 11: b"b11", 12: b"b12", 21: b"c21"},
         })
         listing = tmp_path / "list.csv"
-        listing.write_text(EXTENDED_LIST if extended else LIST, encoding="utf-8")
-        summary = await fetch_media(
+        text = EXTENDED_LIST if extended else LIST
+        if post_extras:
+            text += "tg:msg:20/13,P2\ntg:msg:20/14,P2\n"
+        listing.write_text(text, encoding="utf-8")
+        summary = await fetch_from_list(
             gw, store, settings, classify_rows(
                 store, parse_media_list(listing),
                 media_store=LocalMediaStore(tmp_path / "default"),
             ), LOG,
-            profile="default", report_path=tmp_path / "report.csv",
+            profile="default", report_path=tmp_path / "report.csv", with_media=with_media,
         )
         assert summary.complete
         if extended:
@@ -142,8 +167,8 @@ def test_detect_phases_media_requires_established_channel(tmp_path):
     runs = src.runs()
     phases = [detect_phases(src, run) for run in runs]
     # 3 collect runs, then P1(10) P1(20) P2(10)/marker P2(20)/marker P3(10)/marker P3(30).
-    assert phases[3] == ["channel", "media"] and phases[4] == ["channel", "media"]
-    assert phases[5] == ["media"] and phases[7] == ["media"]
+    assert phases[3] == ["channel", "posts", "media"] and phases[4] == phases[3]
+    assert phases[5] == ["posts", "media"] and phases[7] == ["posts", "media"]
     assert phases[8] == ["channel"], "refused channel: no media phase to replay"
     # A selection naming another channel than the run established: no media.
     with sqlite3.connect(db) as conn:
@@ -152,18 +177,95 @@ def test_detect_phases_media_requires_established_channel(tmp_path):
             "WHERE kind = 'MediaSelection' AND run_id = ?", (runs[3].run_id,),
         )
     src = ReplaySource.open(db, tmp_path / "default")
-    assert detect_phases(src, src.runs()[3]) == ["channel"]
+    assert detect_phases(src, src.runs()[3]) == ["channel", "posts"]
 
 
-def test_detect_phases_marker_run_is_media_only(tmp_path):
+def test_detect_phases_marker_run_is_posts_and_media(tmp_path):
     db = asyncio.run(build_source(tmp_path))
     src = ReplaySource.open(db, tmp_path / "default")
     phases = [detect_phases(src, run) for run in src.runs()]
-    # Two collect runs, two first segments (channel + media, no history: none
-    # ran), two marker (media-only) segments.
+    # Two collect runs, two first segments (channel + posts + media: the
+    # getMessages receipts are not history evidence), two marker segments.
     assert phases[:2] == [["channel", "history"]] * 2
+    assert phases[2] == ["channel", "posts", "media"] and phases[3] == phases[2]
+    assert phases[4] == ["posts", "media"] and phases[5] == ["posts", "media"]
+
+
+def test_marker_run_without_posts_evidence_is_media_only(tmp_path):
+    """A segment recorded before #91 has a MediaSelection and no getMessages
+    receipts: it replays exactly as it did (`media`, and `channel` + `media` for
+    a first segment)."""
+    db = asyncio.run(build_source(tmp_path))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "DELETE FROM raw_records WHERE json_extract(context_json, '$.method') = "
+            "'channels.getMessages'"
+        )
+    src = ReplaySource.open(db, tmp_path / "default")
+    phases = [detect_phases(src, run) for run in src.runs()]
     assert phases[2] == ["channel", "media"] and phases[3] == phases[2]
     assert phases[4] == ["media"] and phases[5] == ["media"]
+
+
+def test_history_evidence_ignores_getmessages_receipts(tmp_path):
+    db = asyncio.run(build_source(tmp_path))
+    src = ReplaySource.open(db, tmp_path / "default")
+    runs = src.runs()
+    assert src.has_history_evidence(runs[0])  # a history run
+    # A fetch-from-list segment holds messages, but only as getMessages receipts.
+    assert src.has_kind(runs[2], "message") and not src.has_history_evidence(runs[2])
+    assert not src.has_history_evidence(runs[4])
+
+
+def test_fetched_post_ids(tmp_path):
+    db = asyncio.run(build_source(tmp_path))
+    src = ReplaySource.open(db, tmp_path / "default")
+    runs = src.runs()
+    assert src.fetched_post_ids(runs[0]) == []  # history's records are not receipts
+    # Segments in list order: P1(10) [1], P1(20) [11], P2(10) [2, 3], P2(20) [12].
+    assert [src.fetched_post_ids(r) for r in runs[2:]] == [[1], [11], [2, 3], [12]]
+
+
+def test_no_media_run_detects_posts_only(tmp_path):
+    db = asyncio.run(build_source(tmp_path, with_media=False))
+    src = ReplaySource.open(db, tmp_path / "default")
+    phases = [detect_phases(src, run) for run in src.runs()]
+    assert phases[2] == ["channel", "posts"] and phases[3] == phases[2]
+    assert phases[4] == ["posts"] and phases[5] == ["posts"]
+    assert not any(src.media_selection(run) for run in src.runs())
+
+
+def test_reproject_replays_posts_runs_to_identical_messages_revisions_and_tombstones(
+    tmp_path, monkeypatch
+):
+    db = asyncio.run(build_source(tmp_path, post_extras=True))
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM message_revisions WHERE message_uri = 'tg:msg:10/2'"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT count(*) FROM message_metrics WHERE message_uri = 'tg:msg:10/2'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT count(*) FROM messages WHERE uri = 'tg:msg:20/13'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT message_uri, evidence FROM message_tombstones "
+            "WHERE message_uri = 'tg:msg:20/14'"
+        ).fetchall() == [("tg:msg:20/14", "empty")]
+    finally:
+        conn.close()
+    result = _reproject(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db, tmp_path / "default" / "paperboy.reprojected.sqlite")
+
+
+def test_reproject_replays_no_media_runs_identically(tmp_path, monkeypatch):
+    db = asyncio.run(build_source(tmp_path, with_media=False, post_extras=True))
+    result = _reproject(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db, tmp_path / "default" / "paperboy.reprojected.sqlite")
 
 
 def test_reproject_replays_marker_runs_to_identical_media_and_custody(
@@ -294,13 +396,13 @@ def test_reproject_matches_live_for_normal_refused_and_zero_download_segments(
             )
         ]
         refused = [a for a in receipts if a["channel_id"] == 30 and a["via"] == "handle"]
-        assert refused and not refused[-1]["granted"]  # the fetch-media attempt
+        assert refused and not refused[-1]["granted"]  # the fetch-from-list attempt
     finally:
         conn.close()
 
 
 def test_marker_replay_reads_the_hash_from_chatfull_not_a_resolve(tmp_path):
-    """No fetch-media run of the extended source holds a `ResolvedPeer` for its
+    """No fetch-from-list run of the extended source holds a `ResolvedPeer` for its
     channel except the refused one's (a different channel); the marker segments
     still replay because their context is rebuilt from the source run's `ChatFull`."""
     db = asyncio.run(build_source(tmp_path, extended=True))
@@ -335,10 +437,11 @@ def test_legacy_msg_ids_only_selection_replays_unchanged(tmp_path, monkeypatch):
 
 def test_no_fetch_media_only_collector_in_replay(tmp_path, monkeypatch):
     """Live and replay run the SAME collectors for a segment: only the standard
-    classes from `paperboy.collectors`, among them the two the live driver uses."""
+    classes from `paperboy.collectors`, among them the three the live driver uses."""
     from paperboy import reproject as rp
     from paperboy.collectors.channel import ChannelCollector
     from paperboy.collectors.media import MediaCollector
+    from paperboy.collectors.posts import PostsCollector
 
     asyncio.run(build_source(tmp_path))
     seen: list[list[type]] = []
@@ -353,5 +456,5 @@ def test_no_fetch_media_only_collector_in_replay(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert seen
     for collectors in seen:
-        assert {ChannelCollector, MediaCollector} <= set(collectors)
+        assert {ChannelCollector, PostsCollector, MediaCollector} <= set(collectors)
         assert all(c.__module__.startswith("paperboy.collectors.") for c in collectors)
