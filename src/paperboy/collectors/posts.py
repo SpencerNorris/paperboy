@@ -17,7 +17,7 @@ edits and counters are current as of this run.
 
 from __future__ import annotations
 
-from paperboy.budget import PhaseStop
+from paperboy.budget import PhaseStop, SkipAndRecord
 from paperboy.collectors.base import CollectContext, CollectResult
 from paperboy.collectors.history import observe_message
 from paperboy.ids import msg_uri
@@ -56,7 +56,21 @@ class PostsCollector:
                 "posts skipped: channel context not established "
                 "(channel phase did not complete)"
             )
-        channel_id = ctx.channel_id
+        try:
+            return await self._fetch(ctx, ctx.channel_id, ctx.input_channel)
+        except (PhaseStop, SkipAndRecord):
+            # Withdraw the channel context, exactly as if the `channel` phase had
+            # not completed: the `media` phase that follows in the same run then
+            # stops at its own guard, without an RPC. Otherwise it would act on a
+            # half-refreshed channel and its first call would sleep the very flood
+            # cooldown that stopped this phase (`Budget._pace`).
+            ctx.channel_id = None
+            ctx.input_channel = None
+            raise
+
+    async def _fetch(
+        self, ctx: CollectContext, channel_id: int, input_channel: dict
+    ) -> CollectResult:
         ids = sorted(set(ctx.settings.post_msgs or []))
         counts = {"messages": 0, "revisions": 0, "tombstones": 0, "edges": 0}
         context = {"channel_id": channel_id, "method": GET_MESSAGES_METHOD}
@@ -64,7 +78,7 @@ class PostsCollector:
         for start in range(0, len(ids), GET_MESSAGES_BATCH):
             batch = ids[start : start + GET_MESSAGES_BATCH]
             try:
-                answers = await ctx.gateway.get_messages(ctx.input_channel, batch)
+                answers = await ctx.gateway.get_messages(input_channel, batch)
             except PhaseStop as exc:
                 # A flood raised by `Budget.call` carries no counts of its own;
                 # attach the batches already projected so they are still reported.

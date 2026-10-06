@@ -1,4 +1,5 @@
-"""`fetch_media` driver: ordered cross-channel fetch, resume, stops, report (#68).
+"""`fetch_from_list` driver: ordered cross-channel fetch of posts then media, resume,
+stops, report (#68, #91).
 
 Synthetic channels/messages only.
 """
@@ -14,7 +15,7 @@ import pytest
 
 from paperboy.budget import HardStop, PhaseStop, SkipAndRecord
 from paperboy.config import load_settings
-from paperboy.fetch_media import fetch_media
+from paperboy.fetch_from_list import fetch_from_list
 from paperboy.media_list import classify_rows, parse_media_list
 from paperboy.media_store import LocalMediaStore
 from paperboy.store.db import Store
@@ -44,8 +45,22 @@ def _full(cid, username):
     }
 
 
+def _photo_msg(mid, photo_id):
+    return {
+        "_": "message", "id": mid, "message": "", "date": 1767322445,
+        "media": {"_": "MessageMediaPhoto", "photo": {"_": "Photo", "id": photo_id}},
+    }
+
+
+# What `channels.getMessages` answers for the seeded messages (ids are distinct
+# across the two channels, and the fake ignores the channel).
+POSTS = {mid: _photo_msg(mid, ch * 100 + mid) for ch, mid in
+         [(10, 1), (10, 2), (10, 3), (20, 11), (20, 12)]}
+
+
 def _gateway(media, **extra):
     fx = {
+        "get_messages": dict(POSTS),
         "self": {"_": "user", "id": 1, "self": True},
         "resolve": AssertionError("no handle lookup: list rows are fetched by id"),
         "full_channel_by_id": {10: _full(10, "chan_a"), 20: _full(20, "chan_b")},
@@ -96,7 +111,7 @@ async def test_end_to_end_two_channels_two_tiers(tmp_path):
     report = tmp_path / "r.csv"
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
@@ -131,22 +146,29 @@ async def test_end_to_end_two_channels_two_tiers(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_second_run_is_already_stored_with_no_gateway(tmp_path):
+async def test_already_stored_row_is_refetched_but_not_redownloaded(tmp_path):
     report1, report2 = tmp_path / "r1.csv", tmp_path / "r2.csv"
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        await fetch_media(
+        await fetch_from_list(
             _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report1,
         )
-        summary = await fetch_media(
-            None, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+        custody = st.conn.execute("select count(*) from custody_log").fetchone()[0]
+        gw = _gateway({})
+        second_rows = _classified(st, tmp_path)
+        assert all(c.media_held for c in second_rows)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), second_rows, LOG,
             profile="p", report_path=report2,
         )
         assert summary.complete
         assert summary.counts["already_stored"] == 5
+        assert gw.calls.count("get_messages") == 4  # one batch per segment: posts re-fetched
+        assert gw.download_media_calls == []
+        assert st.conn.execute("select count(*) from custody_log").fetchone()[0] == custody
         first, second = _report(report1), _report(report2)
-        assert [r["outcome"] for r in second] == ["already_stored"] * 5
+        assert [(r["outcome"], r["post"]) for r in second] == [("already_stored", "fetched")] * 5
         assert [(r["sha256"], r["key"]) for r in second] == [
             (r["sha256"], r["key"]) for r in first
         ]
@@ -158,7 +180,7 @@ async def test_hard_stop_marks_rest_not_attempted(tmp_path):
     report = tmp_path / "r.csv"
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
@@ -178,7 +200,7 @@ async def test_disk_floor_ends_the_command(tmp_path, monkeypatch):
     gw = _gateway(BYTES)
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, settings, _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
@@ -198,7 +220,7 @@ async def test_channel_phase_skip_continues_with_other_channels(tmp_path):
     report = tmp_path / "r.csv"
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
@@ -220,7 +242,7 @@ async def test_stored_handle_now_elsewhere_still_fetches_by_id(tmp_path):
     gw = _gateway(BYTES, resolve=_resolved(6, "chan_a"))
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
@@ -243,7 +265,7 @@ async def test_segment_without_any_route_is_no_access_and_the_run_continues(
         for ch, mid in [(10, 1), (10, 2), (10, 3), (20, 11), (20, 12)]:
             seed_msg(st, ch, mid, photo_id=ch * 100 + mid)
         with caplog.at_level(logging.WARNING):
-            summary = await fetch_media(
+            summary = await fetch_from_list(
                 gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
                 profile="p", report_path=report,
             )
@@ -264,10 +286,11 @@ async def test_segment_without_any_route_is_no_access_and_the_run_continues(
 
 @pytest.mark.asyncio
 async def test_live_collector_list_is_the_standard_one(tmp_path, monkeypatch):
-    """No fetch-media-only collector: the live run uses `channel` + `media`."""
-    from paperboy import fetch_media as fm
+    """No fetch-from-list-only collector: the live run uses `channel`, `posts`, `media`."""
+    from paperboy import fetch_from_list as fm
     from paperboy.collectors.channel import ChannelCollector
     from paperboy.collectors.media import MediaCollector
+    from paperboy.collectors.posts import PostsCollector
 
     seen = []
     real = fm.collect_channel_with_context
@@ -279,12 +302,13 @@ async def test_live_collector_list_is_the_standard_one(tmp_path, monkeypatch):
     monkeypatch.setattr(fm, "collect_channel_with_context", spy)
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        await fetch_media(
+        await fetch_from_list(
             _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
     assert seen and all(
-        [type(c) for c in cs] == [ChannelCollector, MediaCollector] for cs in seen
+        [type(c) for c in cs] == [ChannelCollector, PostsCollector, MediaCollector]
+        for cs in seen
     )
 
 
@@ -299,7 +323,7 @@ async def test_report_written_on_unexpected_error(tmp_path):
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
         with pytest.raises(Boom):
-            await fetch_media(
+            await fetch_from_list(
                 gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
                 profile="p", report_path=report,
             )
@@ -319,7 +343,7 @@ async def test_unexpected_error_mid_segment_keeps_earlier_rows_downloaded(tmp_pa
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
         with pytest.raises(Boom):
-            await fetch_media(
+            await fetch_from_list(
                 gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
                 profile="p", report_path=report,
             )
@@ -344,7 +368,7 @@ async def test_channel_phase_stop_ends_the_command(tmp_path):
     report = tmp_path / "r.csv"
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
@@ -367,7 +391,7 @@ async def test_inherited_media_since_does_not_filter_list_rows(tmp_path):
     gw = _gateway(BYTES)
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, settings, _classified(st, tmp_path), LOG,
             profile="p", report_path=report,
         )
@@ -387,7 +411,7 @@ async def test_excluded_rows_are_never_fetched_and_say_why(tmp_path):
             st, parse_media_list(path), media_store=LocalMediaStore(tmp_path / "p"),
             excluded_ids=frozenset({10}),
         )
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
         )
     assert summary.complete
@@ -420,7 +444,7 @@ async def test_second_run_against_bucket_is_already_stored(tmp_path, monkeypatch
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         _seed_store(st)
         first = classify_rows(st, parse_media_list(path), media_store=media_store)
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             _gateway(BYTES), st, settings, first, LOG, profile="p", report_path=tmp_path / "r1.csv"
         )
         assert summary.counts["downloaded"] == 5 and len(client.bucket("bkt").objects) == 5
@@ -428,10 +452,174 @@ async def test_second_run_against_bucket_is_already_stored(tmp_path, monkeypatch
 
         heads = client.bucket("bkt").calls["exists"]
         second = classify_rows(st, parse_media_list(path), media_store=media_store)
-        assert {c.outcome for c in second} == {"already_stored"}
+        assert {c.media_held for c in second} == {True}
         assert client.bucket("bkt").calls["exists"] == heads  # custody rows answer offline
         gw = _gateway({})
-        summary = await fetch_media(
+        summary = await fetch_from_list(
             gw, st, settings, second, LOG, profile="p", report_path=tmp_path / "r2.csv"
         )
         assert gw.download_media_calls == [] and summary.counts["already_stored"] == 5
+        assert gw.calls.count("get_messages") == 4
+
+
+# ── #91: posts before media ───────────────────────────────────────────────
+
+
+def _store_without_posts(st):
+    """Keys for both channels, but NO message rows: every listed post is new."""
+    seed_channel(st, 10, "chan_a", access_hash=100)
+    seed_channel(st, 20, "chan_b", access_hash=200)
+
+
+@pytest.mark.asyncio
+async def test_post_absent_from_store_is_fetched_projected_and_downloaded(tmp_path):
+    msg = {**_photo_msg(1, 101), "from_id": {"_": "PeerUser", "user_id": 42}}
+    gw = _gateway({1: b"a1"}, get_messages={1: msg})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        classified = _classified(st, tmp_path, "tg:msg:10/1\n")
+        assert [c.in_store for c in classified] == [False]
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+        assert summary.complete
+        assert st.conn.execute("select count(*) from messages").fetchone()[0] == 1
+        assert st.conn.execute("select count(*) from peers where id=42").fetchone()[0] == 1
+    [row] = _report(report)
+    assert (row["outcome"], row["post"]) == ("downloaded", "fetched")
+    assert gw.download_media_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_deleted_upstream_has_no_media_attempt(tmp_path):
+    gw = _gateway({}, get_messages={})  # every id answers MessageEmpty
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/5\n"), LOG,
+            profile="p", report_path=report,
+        )
+        assert summary.complete
+        tomb = st.conn.execute("select evidence from message_tombstones").fetchall()
+        assert [t["evidence"] for t in tomb] == ["empty"]
+    [row] = _report(report)
+    assert (row["outcome"], row["post"]) == ("deleted_upstream", "deleted_upstream")
+    assert gw.download_media_calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_media_flag_gives_post_only(tmp_path):
+    gw = _gateway(BYTES)
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=report, with_media=False,
+        )
+        assert summary.complete
+        assert st.conn.execute(
+            "select count(*) from raw_records where kind='MediaSelection'"
+        ).fetchone()[0] == 0
+        assert st.conn.execute(
+            "select count(*) from run_events where phase='media'"
+        ).fetchone()[0] == 0
+    assert {(r["outcome"], r["post"]) for r in _report(report)} == {("post_only", "fetched")}
+    assert gw.download_media_calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_media_outcome_for_text_post(tmp_path):
+    text_post = {"_": "message", "id": 4, "message": "hi", "date": 1767322445}
+    gw = _gateway({}, get_messages={4: text_post})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/4\n"), LOG,
+            profile="p", report_path=report,
+        )
+    [row] = _report(report)
+    assert (row["outcome"], row["post"]) == ("no_media", "fetched")
+
+
+@pytest.mark.asyncio
+async def test_posts_phase_stop_ends_the_command(tmp_path):
+    gw = _gateway(BYTES, get_messages_errors=[PhaseStop("flood wait 3600s")])
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=report,
+        )
+    assert not summary.complete
+    assert "posts phase_stop" in (summary.stop_reason or "")
+    assert gw.calls.count("get_messages") == 1  # channel B never attempted
+    assert {r["outcome"] for r in _report(report)} == {"not_attempted"}
+
+
+@pytest.mark.asyncio
+async def test_posts_skip_marks_channel_no_access(tmp_path):
+    gw = _gateway(BYTES, get_messages_errors=[SkipAndRecord("channel is private")])
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=report,
+        )
+    rows = _report(report)
+    assert [r["outcome"] for r in rows] == [
+        "no_access", "downloaded", "no_access", "downloaded", "no_access",
+    ]
+    assert rows[0]["reason"] == "channel is private"
+    assert summary.complete
+
+
+@pytest.mark.asyncio
+async def test_report_has_post_column(tmp_path):
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(
+            _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+            profile="p", report_path=report,
+        )
+    assert report.read_text(encoding="utf-8").splitlines()[0] == (
+        "line_no,uri,outcome,post,sha256,key,reason"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_row_for_unseen_channel_is_resolved_live_by_handle(tmp_path):
+    """Orchestrator decision (#91): an unseen handle is looked up through the #84
+    handle route (a `ChannelAccess` receipt says so), not a dead end."""
+    gw = _gateway(
+        {1: b"n1"},
+        resolve=_resolved(30, "chan_new"),
+        full_channel_by_id={30: _full(30, "chan_new")},
+        get_messages={1: _photo_msg(1, 301)},
+    )
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        classified = _classified(st, tmp_path, "https://t.me/Chan_New/1\n")
+        assert [c.needs_resolve for c in classified] == [True]
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+        assert summary.complete
+        access = [
+            json.loads(r["payload_json"]) for r in st.conn.execute(
+                "SELECT payload_json FROM raw_records WHERE kind='ChannelAccess'"
+            )
+        ]
+        assert [(a["channel_id"], a["via"]) for a in access] == [(30, "handle")]
+        assert st.conn.execute(
+            "select count(*) from messages where uri='tg:msg:30/1'"
+        ).fetchone()[0] == 1
+    [row] = _report(report)
+    assert (row["uri"], row["outcome"], row["post"]) == ("tg:msg:30/1", "downloaded", "fetched")

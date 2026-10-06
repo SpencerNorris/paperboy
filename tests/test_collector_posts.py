@@ -140,3 +140,16 @@ async def test_phase_stop_mid_batch_carries_counts(tmp_path):
         await PostsCollector(outcomes=outcomes).collect(_posts_ctx(st, gw, range(1, 201)))
     assert info.value.counts["messages"] == 100
     assert len(outcomes) == 100
+
+
+@pytest.mark.asyncio
+async def test_failed_posts_phase_withdraws_the_channel_context(tmp_path):
+    """So the `media` phase after it stops at its own guard instead of acting."""
+    from paperboy.budget import SkipAndRecord
+
+    gw = FakeGateway({"get_messages_errors": [SkipAndRecord("channel is private")]})
+    with Store.open(tmp_path / "p.sqlite") as st:
+        ctx = _posts_ctx(st, gw, [1])
+        with pytest.raises(SkipAndRecord):
+            await PostsCollector().collect(ctx)
+        assert ctx.channel_id is None and ctx.input_channel is None

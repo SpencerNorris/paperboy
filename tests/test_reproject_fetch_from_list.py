@@ -10,11 +10,11 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from paperboy.fetch_media import fetch_media
 from typer.testing import CliRunner
 
 from paperboy.cli import app
 from paperboy.config import load_settings
-from paperboy.fetch_media import fetch_media
 from paperboy.media_list import classify_rows, parse_media_list
 from paperboy.media_store import LocalMediaStore
 from paperboy.recipes import collect_channel
