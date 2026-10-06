@@ -12,25 +12,29 @@ executed (spec §3) — with the documented deviations D4.1–D4.4 in
 from __future__ import annotations
 
 import bisect
+import hashlib
 import heapq
 import json
 import logging
 import os
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Self
 
 import httpx
 
+from paperboy import media_store as _media_store
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
+from paperboy.config import parse_media_store_url
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import primary_username
 from paperboy.media_keys import normalize_legacy_location, resolve_key_under
 from paperboy.media_sink import MediaSink, stream_file_into
+from paperboy.media_store import LOCAL_STORE_ID, GcsMediaStore, MediaStoreError
 from paperboy.store.db import dumps
 from paperboy.targets import parse_target
 
@@ -705,6 +709,12 @@ class ReplaySource:
         found = self._markers(run, "mediaselection")
         return found[-1] if found else None
 
+    def media_store(self, run: ReplayRun) -> RunMarker | None:
+        """The run's `MediaStore` marker (#63, ADR-0008): written before the media
+        phase of a bucket run, payload `{store}`. Local runs write none."""
+        found = self._markers(run, "mediastore")
+        return found[-1] if found else None
+
     def _chatfull_entries(self, run: ReplayRun, channel_id: int | None) -> list[RawEntry]:
         """The run's `ChatFull` records for `channel_id` (any when `None`)."""
         entries = self.index(run).entries(("chatfull",))
@@ -786,10 +796,24 @@ class RawReplayGateway:
     # profile (e.g. the media collector uses file-less hashing sinks).
     replay = True
 
-    def __init__(self, source: ReplaySource, clock: ReplayClock, run: ReplayRun) -> None:
+    def __init__(
+        self,
+        source: ReplaySource,
+        clock: ReplayClock,
+        run: ReplayRun,
+        *,
+        allowed_buckets: frozenset[str] = frozenset(),
+        client_factory: Callable[[], Any] | None = None,
+    ) -> None:
         self._src = source
         self._clock = clock
         self._run = run
+        # Bucket reads (#63, ADR-0003 amendment): only buckets in this allow-list
+        # are ever fetched from, read-only. A local-only source builds no client.
+        self._allowed_buckets = allowed_buckets
+        self._client_factory = client_factory
+        self._stores: dict[str, GcsMediaStore] = {}
+        self._warned: set[str] = set()
         # get_channel_difference is inherently sequential (a pts catch-up
         # loop); a per-channel cursor over the stored pages models that.
         self._diff_cursor: dict[int, int] = {}
@@ -1004,16 +1028,83 @@ class RawReplayGateway:
             )
         return self._serve(entry)
 
-    def _resolve_payload_file(self, stored: str, sha: str) -> Path:
-        """Resolve a `MediaDownload`/`AvatarDownload` payload's location under the
-        source profile dir (ADR-0007). Payloads written before #62 hold absolute or
-        cwd-relative paths; they are normalised by their sha, never trusted as
-        paths. An unusable value is a recorded skip, not a reproject abort."""
+    @staticmethod
+    def _payload_key(stored: str, sha: str) -> str:
+        """The media key a `MediaDownload`/`AvatarDownload` payload names (ADR-0007).
+        Payloads written before #62 hold absolute or cwd-relative paths; they are
+        normalised by their sha, never trusted as paths. An unusable value is a
+        recorded skip, not a reproject abort."""
         try:
-            key = normalize_legacy_location(stored, sha)
+            return normalize_legacy_location(stored, sha)
         except ValueError as exc:
             raise SkipAndRecord(f"replay: unusable media location for sha {sha}") from exc
-        return resolve_key_under(self._src.profile_root, key)
+
+    def _resolve_payload_file(self, stored: str, sha: str) -> Path:
+        """`_payload_key`, resolved under the source profile dir (a local receipt)."""
+        return resolve_key_under(self._src.profile_root, self._payload_key(stored, sha))
+
+    def _warn_once(self, tag: str, message: str, *args: object) -> None:
+        if tag not in self._warned:
+            self._warned.add(tag)
+            log.warning(message, *args)
+
+    def _bucket_store(self, store_url: str) -> GcsMediaStore:
+        """The read-only store a bucket receipt names; `SkipAndRecord` unless its
+        bucket is in the allow-list (never fetched otherwise)."""
+        cached = self._stores.get(store_url)
+        if cached is not None:
+            return cached
+        try:
+            bucket, prefix = parse_media_store_url(store_url)
+        except ValueError as exc:
+            self._warn_once(store_url, "replay: receipt names an unusable media store; skipping")
+            raise SkipAndRecord("replay: unusable media store in receipt") from exc
+        if bucket not in self._allowed_buckets:
+            self._warn_once(
+                store_url,
+                "replay: a receipt names bucket %r which is not in the allow-list "
+                "(PAPERBOY_MEDIA_STORE_BUCKETS); its files are skipped, never fetched",
+                bucket,
+            )
+            raise SkipAndRecord("replay: receipt names a bucket outside the allow-list")
+        factory = self._client_factory or (lambda: _media_store.default_client_factory())
+        store = GcsMediaStore(bucket, prefix, factory)
+        self._stores[store_url] = store
+        return store
+
+    def _read_from_bucket(
+        self, store_url: str, key: str, sha: str, into: Callable[[bytes], Any]
+    ) -> None:
+        """Stream `key` out of the receipt's bucket into `into`; any failure is a
+        recorded per-file skip (a missing object, no ADC, an outage)."""
+        store = self._bucket_store(store_url)
+        try:
+            with store.open_read(key) as fh:
+                while chunk := fh.read(_CHUNK):
+                    into(chunk)
+        except FileNotFoundError as exc:
+            raise SkipAndRecord(f"replay: media object missing for sha {sha[:12]}") from exc
+        except MediaStoreError as exc:
+            self._warn_once(
+                f"err:{store_url}",
+                "replay: cannot read from the media store (Application Default Credentials "
+                "and network access are needed for a bucket source): %s",
+                exc,
+            )
+            raise SkipAndRecord("replay: media store unreadable") from exc
+
+    def media_receipt_key(self, channel_id: int, msg_id: int) -> str | None:
+        """The key this run's `MediaDownload` receipt for the message names, or
+        `None` when the live run fetched no bytes for it (#63): lets the media
+        collector tell "downloaded" from "deduplicated" without a store."""
+        entry = self._latest(("mediadownload",), ("channel_id", "msg_id"), (channel_id, msg_id))
+        if entry is None:
+            return None
+        payload = json.loads(self._row(entry)["payload_json"])
+        try:
+            return normalize_legacy_location(payload["path"], payload["sha256"])
+        except (KeyError, ValueError):
+            return None
 
     async def download_media(
         self, input_channel: dict, message: dict, sink: MediaSink
@@ -1027,13 +1118,19 @@ class RawReplayGateway:
         row = self._row(entry)
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
-        path = self._resolve_payload_file(payload["path"], sha)
-        # A small local disk stat/read on an offline, single-user CLI tool —
-        # not worth a trio/anyio dependency for.
-        if not path.exists():  # noqa: ASYNC240
-            raise SkipAndRecord(f"replay: media file missing for sha {sha}")
-        sink.reset()
-        stream_file_into(path, sink, chunk_size=_CHUNK)
+        store_url = payload.get("store", LOCAL_STORE_ID)  # absence means local (ADR-0008)
+        if store_url == LOCAL_STORE_ID:
+            path = self._resolve_payload_file(payload["path"], sha)
+            # A small local disk stat/read on an offline, single-user CLI tool —
+            # not worth a trio/anyio dependency for.
+            if not path.exists():  # noqa: ASYNC240
+                raise SkipAndRecord(f"replay: media file missing for sha {sha}")
+            sink.reset()
+            stream_file_into(path, sink, chunk_size=_CHUNK)
+        else:
+            sink.reset()
+            key = self._payload_key(payload["path"], sha)
+            self._read_from_bucket(store_url, key, sha, sink.write)
         # The collector trusts the streamed fingerprint (it names the row and,
         # when copying into another profile, the file): a rotted or swapped
         # file must be a recorded skip, never a row filed under the wrong sha.
@@ -1171,10 +1268,21 @@ class RawReplayGateway:
         row = self._row(entry)
         payload = json.loads(row["payload_json"])
         sha = payload["sha256"]
-        path = self._resolve_payload_file(payload["path"], sha)
-        if not path.exists():  # noqa: ASYNC240 — same rationale as download_media
-            raise SkipAndRecord(f"replay: avatar file missing for sha {sha}")
-        data = path.read_bytes()
+        store_url = payload.get("store", LOCAL_STORE_ID)
+        if store_url == LOCAL_STORE_ID:
+            path = self._resolve_payload_file(payload["path"], sha)
+            if not path.exists():  # noqa: ASYNC240 — same rationale as download_media
+                raise SkipAndRecord(f"replay: avatar file missing for sha {sha}")
+            data = path.read_bytes()
+        else:
+            parts: list[bytes] = []
+            key = self._payload_key(payload["path"], sha)
+            self._read_from_bucket(store_url, key, sha, parts.append)
+            data = b"".join(parts)
+            if hashlib.sha256(data).hexdigest() != sha:
+                raise SkipAndRecord(
+                    f"replay: avatar for sha {sha[:12]} does not match its receipt"
+                )
         self._clock.begin_batch()
         self._clock.serve_json(row["observed_at"], row["payload_json"])
         return data

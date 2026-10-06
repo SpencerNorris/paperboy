@@ -200,6 +200,15 @@ async def collect_channel_with_context(
                     "MediaSelection", selection, ctx.tier, None,
                     observed_at=ctx.clock.for_payload(selection),
                 )
+            if collector.name == "media" and settings.media_store is not None:
+                # Raw-first (#63): a bucket run's custody rows name a store that a
+                # dedup-only run never records in a receipt, so the run says which
+                # store it used. Local runs write nothing (their raw log is unchanged).
+                store_marker = {"store": settings.media_store}
+                store.add_raw(
+                    "MediaStore", store_marker, ctx.tier, None,
+                    observed_at=ctx.clock.for_payload(store_marker),
+                )
             try:
                 result = await _run_one(collector, ctx)
             except SkipAndRecord as exc:

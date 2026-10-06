@@ -1257,3 +1257,69 @@ async def test_collecting_account_in_triage_is_counted_so_the_books_balance(tmp_
         )
         assert res.counts["triaged"] == 1 and res.counts["self_skipped"] == 1
         assert _balanced(res.counts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_run", [True, False])
+async def test_avatar_goes_through_the_media_store(tmp_path, monkeypatch, bucket_run):
+    import hashlib
+
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"jpeg-1"
+    sha = hashlib.sha256(data).hexdigest()
+    key = f"media/{sha[:2]}/{sha}.jpg"
+    client = FakeGcsClient()
+    over = {"enrich_profiles": True}
+    if bucket_run:
+        monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+        over |= {"media_store": "gs://bkt/p/x", "media_store_buckets": "bkt"}
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        res = await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, **over)))
+        assert res.counts["avatars"] == 1
+        custody = st.conn.execute("select path, store from custody_log").fetchone()
+        payload = json.loads(
+            st.conn.execute(
+                "select payload_json from raw_records where kind='AvatarDownload'"
+            ).fetchone()[0]
+        )
+        files = [p for p in (tmp_path / "p" / "media").rglob("*") if p.is_file()]
+        if bucket_run:
+            assert client.bucket("bkt").objects == {f"p/x/{key}": data}
+            assert (custody["path"], custody["store"]) == (key, "gs://bkt/p/x")
+            assert payload["store"] == "gs://bkt/p/x"
+            assert files == []  # no local copy
+        else:
+            assert (custody["path"], custody["store"]) == (key, "local")
+            assert "store" not in payload
+            assert [p.read_bytes() for p in files] == [data]
+        # A known photo already held by this store is never fetched again.
+        again = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        await ProfilesCollector().collect(_ctx(st, again, _settings(tmp_path, **over)))
+        assert again.avatar_calls == []
+
+
+@pytest.mark.asyncio
+async def test_avatar_known_locally_is_fetched_into_a_new_bucket(tmp_path, monkeypatch):
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"jpeg-1"
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        local = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        local_settings = _settings(tmp_path, enrich_profiles=True)
+        await ProfilesCollector().collect(_ctx(st, local, local_settings))
+        bucket = _settings(
+            tmp_path, enrich_profiles=True, media_store="gs://bkt/p/x", media_store_buckets="bkt"
+        )
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        res = await ProfilesCollector().collect(_ctx(st, gw, bucket))
+        assert gw.avatar_calls == [701] and res.counts["avatars"] == 1
+        assert len(client.bucket("bkt").objects) == 1
+        assert st.conn.execute("select count(*) from media").fetchone()[0] == 1

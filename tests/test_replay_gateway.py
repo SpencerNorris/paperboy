@@ -581,3 +581,100 @@ async def test_resolve_matches_the_handle_an_id_target_was_resolved_through(tmp_
     assert (await gw.resolve("viahandle"))["peer"]["channel_id"] == 5
     # The legacy spelling still matches its own record.
     assert (await gw.resolve("durov"))["peer"]["channel_id"] == CID
+
+
+# --- bucket receipts (#63) ---------------------------------------------------
+
+
+def _bucket_gateway(tmp_path, monkeypatch, *, allowed=frozenset({"bkt"}), client=None):
+    """A gateway over a source whose receipt for msg 2 names `gs://bkt/p`, with the
+    bytes only in the fake bucket (there is no local file)."""
+    from tests.fake_gcs import FakeGcsClient
+
+    db, root = _seed(tmp_path)
+    (root / "media" / FILE_SHA[:2] / f"{FILE_SHA}.txt").unlink()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, '$.store', 'gs://bkt/p') "
+            "WHERE kind = 'MediaDownload'"
+        )
+    client = client or FakeGcsClient()
+    client.bucket("bkt").objects[f"p/media/{FILE_SHA[:2]}/{FILE_SHA}.txt"] = b"file contents"
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    src = ReplaySource.open(db, root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0], allowed_buckets=allowed)
+    return gw, client
+
+
+@pytest.mark.asyncio
+async def test_download_media_reads_bucket_receipt_through_open_read(tmp_path, monkeypatch):
+    gw, client = _bucket_gateway(tmp_path, monkeypatch)
+    with MediaSink(None) as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert sink.sha256 == FILE_SHA
+    calls = client.bucket("bkt").calls
+    assert calls["open"] == 1 and calls["upload"] == 0 and calls["delete"] == 0
+
+
+@pytest.mark.asyncio
+async def test_bucket_receipt_outside_allow_list_is_skipped_with_warning(
+    tmp_path, monkeypatch, caplog
+):
+    gw, client = _bucket_gateway(tmp_path, monkeypatch, allowed=frozenset({"other"}))
+    with MediaSink(None) as sink, caplog.at_level("WARNING"), pytest.raises(SkipAndRecord):
+        await gw.download_media(IC, {"id": 2}, sink)
+    assert any("allow-list" in r.getMessage() for r in caplog.records)
+    assert client.bucket("bkt").calls["open"] == 0  # never fetched
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipt_replays_local(tmp_path, monkeypatch):
+    def boom():
+        raise AssertionError("a local receipt must not build a GCS client")
+
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", boom)
+    db, root = _seed(tmp_path)
+    src = ReplaySource.open(db, root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0])
+    with MediaSink(None) as sink:
+        assert await gw.download_media(IC, {"id": 2}, sink) is True
+    assert sink.sha256 == FILE_SHA
+
+
+@pytest.mark.asyncio
+async def test_missing_bucket_object_is_a_skip(tmp_path, monkeypatch):
+    gw, client = _bucket_gateway(tmp_path, monkeypatch)
+    client.bucket("bkt").objects.clear()
+    with MediaSink(None) as sink, pytest.raises(SkipAndRecord, match="missing"):
+        await gw.download_media(IC, {"id": 2}, sink)
+
+
+@pytest.mark.asyncio
+async def test_missing_credentials_skip_the_file_and_warn_once(tmp_path, monkeypatch, caplog):
+    from google.auth.exceptions import DefaultCredentialsError
+
+    gw, _ = _bucket_gateway(tmp_path, monkeypatch)
+
+    def no_adc():
+        raise DefaultCredentialsError("no ADC")
+
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", no_adc)
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            with MediaSink(None) as sink, pytest.raises(SkipAndRecord):
+                await gw.download_media(IC, {"id": 2}, sink)
+    assert sum("Application Default Credentials" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_bucket_rot_is_caught_by_the_sha_check(tmp_path, monkeypatch):
+    gw, client = _bucket_gateway(tmp_path, monkeypatch)
+    client.bucket("bkt").objects[f"p/media/{FILE_SHA[:2]}/{FILE_SHA}.txt"] = b"file c0ntents"
+    with MediaSink(None) as sink, pytest.raises(SkipAndRecord, match="does not match"):
+        await gw.download_media(IC, {"id": 2}, sink)
+
+
+def test_media_receipt_key_names_the_recorded_key_or_none(tmp_path, monkeypatch):
+    gw, _ = _bucket_gateway(tmp_path, monkeypatch)
+    assert gw.media_receipt_key(CID, 2) == f"media/{FILE_SHA[:2]}/{FILE_SHA}.txt"
+    assert gw.media_receipt_key(CID, 3) is None
