@@ -165,6 +165,9 @@ class Settings(BaseSettings):
     media_since: datetime | None = None
     # `--media-msgs` (issue #55): download media only for these message ids.
     media_msgs: list[int] | None = None
+    # Set by `fetch-from-list` (#91): the message ids the `posts` phase fetches
+    # by `channels.getMessages`. None = the phase has nothing to do.
+    post_msgs: list[int] | None = None
     # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
     # stored message, exceeds this many MB (10^6 bytes). None = no cap.
     media_max_mb: int | None = Field(default=None, ge=1)
