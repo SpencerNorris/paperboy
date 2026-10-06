@@ -272,6 +272,79 @@ outages (covered by `tests/test_media_store.py` and
 `tests/test_collector_media_stores.py` with the in-memory fake); a VM run with a
 create-only service account (ops, spec section 7).
 
+### Override smoke at ce65395 (operator-approved 5th call)
+
+The original smoke ran at `fad48a2`, before the server-side crc32c upload,
+verify-before-adopt and replay changes. With the operator's one-off approval
+(2026-10-06) this single extra invocation re-ran the upload path at `ce65395`:
+live Telegram invocation 5 of 5, one photo (110,165 bytes, `<id>`, `@<channel>`)
+to a new prefix `gs://<bucket>/paperboy/smoke-20261006b`. Scratch data dir
+`<scratch>`, `PAPERBOY_REQUIRE_PROXY=false`, `--profile default`, `--max-rpc 20
+--max-flood-sleep 60`, `PAPERBOY_MEDIA_STORE_BUCKETS=<bucket>`. STOP flag absent,
+counter was 4 before the call, no flood wait. VPN check immediately before:
+```
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+```
+Unredacted transcripts in `<scratch>`: `L5-collect-unredacted.txt`,
+`gcloud-ls-b-unredacted.txt`, `object-describe-b-unredacted.txt`,
+`object-sha256-b-unredacted.txt`, `dryrun-b-unredacted.txt`,
+`reproject-mini-b-unredacted.txt`, `live-calls.log`.
+
+`paperboy collect <id> --phases channel,media --media-msgs <id>`:
+```
+media: store gs://<bucket>/paperboy/smoke-20261006b
+media store: exists(media/63/63c0897f96dc....jpg) -> False
+media store: created media/63/63c0897f96dc....jpg
+media {'downloaded': 1, 'duplicates': 0, 'unavailable': 0, 'skipped_kind': 0, 'skipped': 0, 'size_mismatch': 0, 'out_of_window': 0, 'not_selected': 7792, 'too_large': 0}
+```
+RPC count for the run: 10 (account/channel preamble 1-8, `channels.getMessages`, `upload.getFile`).
+
+Bucket, read-only:
+```
+$ gcloud storage ls -l "gs://<bucket>/paperboy/smoke-20261006b/**"
+    110165  2026-10-06T22:07:53Z  gs://<bucket>/paperboy/smoke-20261006b/media/63/63c0897f96dc....jpg
+TOTAL: 1 objects, 110165 bytes (107.58kiB)
+$ gcloud storage objects describe <that object>      (relevant fields)
+crc32c_hash: ROouXw==
+size: 110165
+retention_expiration: 2027-01-07T22:07:53+0000
+content_type: application/octet-stream
+(no custom metadata fields; the crc32c is the server-validated integrity value)
+$ gcloud storage cp <object> <scratch>/dl-b/ ; shasum -a 256 <downloaded>
+63c0897f96dc....   (equals media.sha256 for the row: 1)
+$ gcloud storage hash <downloaded>      crc32c_hash: ROouXw==   (equals the object's)
+```
+Custody and receipt:
+```
+custody_log (newest): media/63/63c|63c0897f96dc|gs://<bucket>/paperboy/smoke-20261006b
+raw MediaDownload receipt store: gs://<bucket>/paperboy/smoke-20261006b
+raw MediaStore marker store:     gs://<bucket>/paperboy/smoke-20261006b
+$ ls -A <scratch>/default/media/.incoming | wc -l      -> 0
+$ find <scratch>/default/media -type f | wc -l         -> 0
+```
+`fetch-media <1-row list> --dry-run` with the same store env: `already_stored 1,
+pending 0, total 1`; grep of its output for `pacing:`, `rpc `, `Gateway`,
+`upload.getFile`: 0 matches (zero Telegram calls, no gateway built); the live-call
+log stayed at 5 lines.
+
+Offline `reproject` of a reduced copy (the scratch store's `raw_records` cut to
+the channel history run plus the three smoke runs, `--phases channel,history,media`),
+which read the object back from the bucket:
+```
+media: store gs://<bucket>/paperboy/smoke-20261006b
+  media  downloaded=1 duplicates=0 ... not_selected=7792     (L5 replayed: object read back, sha re-verified)
+table        source  reprojected   (source = the reduced copy's stale projections)
+raw_records  8757    8730          (phases limited)
+media        307     4             (3 earlier smoke files + this one; the full source has 308)
+custody_log  1841    7             (6 earlier + 1)
+custody_log by store in the output: <bucket>/paperboy/smoke-20261006 | 6 ; <bucket>/paperboy/smoke-20261006b | 1
+```
+Grep of the reproject console log and `.log` for `TelethonGateway`, `Budget` or
+`rpc `: 0 matches. `gcloud storage ls` of the prefix after the reproject: still 1
+object (zero bucket writes). The two prefixes hold 4 retained files in total, the
+operator-approved override of the 3-file cap.
+
 ### Docs updated
 
 `docs/features/media-stores.md` (new), `docs/features/media-streaming.md`,
