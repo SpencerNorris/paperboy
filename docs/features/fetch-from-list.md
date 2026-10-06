@@ -289,3 +289,178 @@ rows, exactly as live.
   swept next run; a re-run re-fetches posts and skips held media).
 * `--dry-run` tables are wide: in an 80-column terminal Rich truncates the
   per-channel column titles.
+
+## Definition of done
+
+Redaction: channels are `@<channel>`, ids `<id>`, the bucket `gs://<bucket>/<prefix>`,
+local paths `<scratch>`. Unredacted transcripts stay in `<scratch>/91/`
+(`live1..4.unredacted.txt`, `dryrun-*.unredacted.txt`, `compare.out`), referenced by
+filename only. The operator's list appears nowhere: the smoke list is a 3-row list
+built for this run from two channels already in the store.
+
+### Gates (pasted output)
+
+The full suite was run with `TERM=dumb` and `FORCE_COLOR` unset (the CLI tests
+assert on Rich output, which colour codes break).
+
+```
+$ uv run pytest -q
+1113 passed in 738.99s (0:12:18)
+$ uv run ruff check
+All checks passed!
+$ uv run pyright
+0 errors, 0 warnings, 0 informations
+```
+
+Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`, before this
+DoD commit): `CLAUDE.md`, `README.md`, `docs/adr/0005-run-structure.md`,
+`docs/adr/0008-media-stores.md`, `docs/data-model.md`,
+`docs/features/{collect-channel,fetch-from-list,fetch-media,media-stores,pacing,reproject}.md`,
+`docs/how-it-works.md`, `docs/superpowers/plans/2026-10-06-fetch-from-list.md`,
+`docs/superpowers/specs/2026-10-06-fetch-from-list-design.md`,
+`src/paperboy/{cli,config,fetch_from_list,fetch_media,gateway,media_list,media_store,progress,replay,reproject}.py`,
+`src/paperboy/collectors/{base,history,posts}.py`,
+`tests/{test_cli,test_cli_fetch_from_list,test_collector_posts,test_fetch_from_list,test_media_list,test_reproject_fetch_from_list}.py`
+(`fetch-media.md` and `fetch_media.py` appear as the deleted halves of the renames).
+
+Reviewer checks, with output:
+
+```
+$ git diff --stat origin/dev/gcs-pull -- tests/test_collector_history.py tests/test_history_catchup.py tests/test_collector_discussion.py
+(empty: history's and discussion's tests are unchanged, and pass)
+```
+
+`fetch-media` no longer appears outside historical plans and specs, the
+`media-stores.md` transcripts (annotated), and the "named `fetch-media` until #91"
+notes.
+
+### Offline smokes
+
+* `tests/test_reproject_fetch_from_list.py` (16 tests) is the parity gate: a
+  source built from `collect` runs plus `fetch-from-list` segments, including an
+  edited post (a revision and a metric row), a new text post with author peer and
+  forward edge, a `MessageEmpty` tombstone, a refused channel, a zero-download
+  segment, a legacy selection and a `--no-media` run, reprojects to identical
+  tables (`assert_round_trip`).
+* `--dry-run` of the 3-row list on a `sqlite3 .backup` copy (no Telegram, no keychain):
+  `pending 3`, `needs_resolve 0`; per channel `@<channel A>`: pending 2 / in_store 2 /
+  not_yet_collected 0 / media_stored 0, `@<channel B>`: pending 1 / in_store 0 /
+  not_yet_collected 1; segment plan 2 segments, `posts calls` 1 each.
+  Bucket dry run of rows 1-2 (read-only metadata GET, `exists(...) -> False`):
+  `pending 2`, `media_stored 0`.
+
+### Smoke test transcript
+
+Scratch store: `sqlite3 .backup` of the real profile (never `cp`), run with
+`PAPERBOY_DATA_DIR=<scratch>`, `PAPERBOY_REQUIRE_PROXY=false`, `--profile default`,
+`--max-rpc 60 --max-flood-sleep 60`, never `--unsafe`/`--join`/`--profiles`. Before
+every invocation: `STOP-LIVE` absent, the live-call counter below the cap, and
+
+```
+149.154.167.51 -> utun4
+91.108.56.130 -> utun4
+```
+
+List (`<scratch>/91/list3.txt`): row 1 `tg:msg:<A>/<id>` (stored text-less post), row 2
+`tg:msg:<A>/<id>` (stored photo, 54 KB, never downloaded), row 3
+`tg:msg:<B>/<id>` (the id after channel B's newest stored post, 13 days old).
+Every live call used `--media-max-mb 1` (invocations 1-3).
+
+**Invocation 1, local store** (3-row list; exit 0; 14 RPCs of the 60 cap, no
+FLOOD_WAIT; `rpc channels.getMessages` once per segment plus the media phase's own
+reference refresh):
+
+```
+line_no,uri,outcome,post,sha256,key,reason
+1,tg:msg:<A>/<id>,no_media,fetched,,,
+2,tg:msg:<A>/<id>,downloaded,fetched,47748138...45a1,media/47/47748138....jpg,
+3,tg:msg:<B>/<id>,deleted_upstream,deleted_upstream,,,
+INFO fetch-from-list: {'no_media': 1, 'downloaded': 1, 'deleted_upstream': 1}; 54313 bytes downloaded
+```
+
+Row 3 is the honest result of the "id after the newest stored post" pick:
+Telegram answered `MessageEmpty` (no newer post existed), so it was projected as
+a tombstone (evidence `empty`) and no media was attempted. Checked in the store:
+`shasum -a 256` of the file under `<scratch>/91/default/media/` equals
+`media.sha256`; `ls .incoming` is empty; `run_events` shows `channel`, `posts`,
+`media` per segment (`posts` counts: segment A `messages=2 revisions=1`, segment B
+`tombstones=1`); `message_metrics` gained a row for both stored posts (the
+counters were refreshed); the one revision is the photo post's `media_json`
+(Telegram rotates `file_reference`), not a text edit; raw records
+`Message` with context `method: channels.getMessages` (2) and `MessageEmpty` (1).
+
+**Invocation 2, bucket store** (rows 1-2 only, `--media-store
+gs://<bucket>/<prefix>` with a fresh `paperboy/smoke-<date>-91` prefix that
+`gcloud storage ls` showed empty first; exit 0; 11 RPCs): row 2 `downloaded` again
+(per store: the local copy does not count for the bucket), row 1 `no_media`. The
+custody rows for row 2 now name both `local` and `gs://<bucket>/<prefix>`; the
+`MediaStore` marker `{"store": "gs://<bucket>/<prefix>"}` is in the run; the
+object exists under `media/47/` and `gcloud storage cat | shasum -a 256` equals
+`media.sha256` (`47748138...45a1`). The bucket was written only under that prefix,
+with one create-only upload; no delete, overwrite, retention or IAM command was run.
+
+**Invocation 3, re-run of the local 3-row list** (exit 0; 12 RPCs):
+
+```
+1,tg:msg:<A>/<id>,no_media,fetched,,,
+2,tg:msg:<A>/<id>,already_stored,fetched,47748138...45a1,media/47/47748138....jpg,
+3,tg:msg:<B>/<id>,deleted_upstream,deleted_upstream,,,
+INFO fetch-from-list: {'already_stored': 1, 'deleted_upstream': 1, 'no_media': 1}; 0 bytes downloaded
+```
+
+`channels.getMessages` was called again (once per segment), `upload.getFile`
+never, `custody_log` stayed at the same count (1837 before and after), and
+`message_metrics` grew by 2.
+
+**Invocation 4 (documented extra), `--no-media`, one row**: the row-3 pick above
+did not exercise a post that was really absent from the store, so one more call
+fetched the id after the newest stored post of the busiest stored channel
+`@<C>` (a different channel; no media requested):
+
+```
+1,tg:msg:<C>/<id>,post_only,fetched,,,
+```
+
+A new `messages` row exists, `run_events` has `channel` and `posts` only, no
+`MediaSelection` and no `media` event for the run. 9 RPCs.
+
+Totals: 4 of 4 permitted live invocations (counter file `<scratch>/91/live-calls.log`),
+2 media files (one local, one bucket; 54 KB each), 0.1 MB. No STOP condition was
+hit; `STOP-LIVE` was never created. The smokes ran on commit `d6e96c7`;
+later commits change only documentation.
+
+**Reproject** (offline; `PAPERBOY_DATA_DIR=<scratch>`, the bucket in
+`PAPERBOY_MEDIA_STORE_BUCKETS`, `reproject --profile default --include-target <A>
+--include-target <B> --include-target <C> --out <scratch>/91/reprojected.sqlite`),
+source vs output, restricted to the three channels (`compare.out`):
+
+```
+messages                       source   31241 reprojected   31241 equal
+message_revisions              source   31244 reprojected   31244 equal
+message_metrics                source   31213 reprojected   31213 equal
+message_tombstones             source    2339 reprojected    2339 equal
+media(smoke msg)               source       1 reprojected       1 equal
+custody(smoke msg)             source       2 reprojected       2 equal
+new post <C>/<id>              source       1 reprojected       1 equal
+tombstone <B>/<id>             source       2 reprojected       2 equal
+source run_events      [('channel', 13), ('graph', 3), ('history', 3), ('media', 9), ('participants', 6), ('posts', 6), ('profiles', 9)]
+reprojected run_events [('channel', 13), ('graph', 3), ('history', 3), ('media', 9), ('participants', 6), ('posts', 6), ('profiles', 9)]
+```
+
+`posts` was replayed for all six fetch runs. The bucket object was read back
+read-only for the custody row.
+
+### Docs updated
+
+`docs/features/fetch-from-list.md` (renamed from `fetch-media.md`, rewritten),
+`README.md` (commands row, documentation list, report filename, config table),
+`CLAUDE.md` (commands and the "In progress on `dev/gcs-pull`" status),
+`docs/how-it-works.md` §6, `docs/features/reproject.md` ("Replaying
+`fetch-from-list` runs"), `docs/features/media-stores.md`,
+`docs/features/collect-channel.md`, `docs/features/pacing.md`,
+`docs/data-model.md` (the `getMessages` receipts' context; no schema change),
+`docs/adr/0005-run-structure.md` and `docs/adr/0008-media-stores.md` (rename only;
+no new ADR, per the spec), `docs/superpowers/specs/2026-10-06-fetch-from-list-design.md`
+(§2.3 amendment for handle rows), `docs/superpowers/plans/2026-10-06-fetch-from-list.md`.
+The PR body carries the code-atlas note: the standard collector list gained `posts`
+(run by `fetch-from-list` and by `reproject`'s replay list, never by `collect`).
