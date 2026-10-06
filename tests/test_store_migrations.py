@@ -152,3 +152,18 @@ def test_run_id_property_reflects_begin_run(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         assert st.run_id is None
         assert st.begin_run("r1") == "r1" and st.run_id == "r1"
+
+
+def test_0007_custody_log_store_column(tmp_path):
+    with Store.open(tmp_path / "p.sqlite") as st:
+        applied = {r["name"] for r in st.conn.execute("select name from schema_migrations")}
+        assert "0007_media_stores" in applied
+        cols = {r["name"]: r for r in st.conn.execute("pragma table_info(custody_log)")}
+        assert cols["store"]["notnull"] == 1
+        assert cols["store"]["dflt_value"] == "'local'"
+        # A row inserted the pre-0007 way (no store) reads back as local.
+        st.conn.execute(
+            "insert into custody_log(path, sha256, recorded_at) values ('media/ab/x', 'ab', 'now')"
+        )
+        row = st.conn.execute("select store from custody_log").fetchone()
+        assert row["store"] == "local"
