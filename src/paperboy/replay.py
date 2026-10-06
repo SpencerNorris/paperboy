@@ -1107,6 +1107,12 @@ class RawReplayGateway:
         except (KeyError, ValueError):
             return None
 
+    def has_avatar_receipt(self, photo_id: int) -> bool:
+        """Whether this run's live collection fetched the avatar's bytes (it left
+        an `AvatarDownload` receipt): lets the profiles collector tell "fetched"
+        from "already held" without a store (#63)."""
+        return self._latest(("avatardownload",), ("photo_id",), (photo_id,)) is not None
+
     async def download_media(
         self, input_channel: dict, message: dict, sink: MediaSink
     ) -> bool:

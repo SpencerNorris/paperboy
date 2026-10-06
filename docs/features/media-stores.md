@@ -69,7 +69,10 @@ store. Mac first, using the operator's own Application Default Credentials.
   `MediaStore` marker `{store}` before the first phase that writes through the
   store (`profiles` avatars or `media`; `"media": false` when the run has no
   media phase; local runs write none) so a dedup-only run's custody rows still have a store in raw.
-  `media.path` stays the store-neutral key.
+  `media.path` stays the store-neutral key. Replay decides whether an avatar was
+  fetched from the run's own `AvatarDownload` receipt (not from the projection),
+  so an avatar re-fetched into a new store is reproduced, and a store outage while
+  writing avatars stops the profiles phase (`PhaseStop`) like media.
 - **Errors.** CRC mismatch (server rejection, or a stored object whose crc32c
   differs): `MediaStoreIntegrityError`; both digests at ERROR, no `media`/custody/receipt
   rows, the file is counted `skipped`, the object is left in place, the run

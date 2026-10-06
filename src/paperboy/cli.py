@@ -509,7 +509,10 @@ def fetch_media_cmd(
     ] = None,
     dry_run: bool = typer.Option(
         False, "--dry-run",
-        help="Classify offline and print the plan; no keychain, no network, no report.",
+        help=(
+            "Classify and print the plan; no Telegram, no keychain, no report. "
+            "With a bucket store: read-only metadata GETs (needs ADC)."
+        ),
     ),
     media_store: str = typer.Option(None, "--media-store", help=_MEDIA_STORE_HELP),
     max_rpc: int = typer.Option(None, "--max-rpc"),
@@ -736,7 +739,8 @@ def reproject(
     ),
 ) -> None:
     """Rebuild all projections from raw_records into a fresh DB — offline,
-    no network, no credentials. See docs/features/reproject.md."""
+    no Telegram, no keychain; a bucket receipt is read back read-only (needs ADC,
+    allow-listed buckets only). See docs/features/reproject.md."""
     settings = _settings_with_overrides(profile)
     phase_list = phases.split(",") if phases else None
     include_target, exclude_target = include_target or [], exclude_target or []

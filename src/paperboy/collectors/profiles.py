@@ -129,10 +129,18 @@ class ProfilesCollector:
             else (ctx.settings.media_store or LOCAL_STORE_ID)
         )
 
-    def _avatar_held(self, ctx: CollectContext, sha: str) -> bool:
-        """Whether THIS run's store already has the avatar (a replay trusts the
-        projection, as before): custody row first (offline), else one check."""
-        if self._store is None or self._replay:
+    def _avatar_held(self, ctx: CollectContext, sha: str, photo_id: int) -> bool:
+        """Whether THIS run's store already has the avatar, so nothing is due.
+
+        Replay: the live run's own record decides - an `AvatarDownload` receipt
+        for this photo means it fetched the bytes (and wrote a custody row and
+        receipt this replay must reproduce); no receipt means it skipped it.
+        Live: custody row first (offline), else one check.
+        """
+        if self._replay:
+            has_receipt = getattr(ctx.gateway, "has_avatar_receipt", None)
+            return has_receipt is None or not has_receipt(photo_id)
+        if self._store is None:
             return True
         if stored_in(ctx.store.conn, sha, self._store_id):
             return True
@@ -667,7 +675,7 @@ class ProfilesCollector:
                 counts["restricted_skipped"] += 1
                 continue
             known = user_photo_sha(ctx.store, uri, photo["id"])
-            if known is not None and self._avatar_held(ctx, known):
+            if known is not None and self._avatar_held(ctx, known, photo["id"]):
                 continue  # content-addressed and already in this run's store
             await self._download_avatar(ctx, uri, user_id, photo, counts)
 

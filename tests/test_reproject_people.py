@@ -159,7 +159,12 @@ def people_fixtures() -> dict:
 
 
 async def run_people_collect(
-    data_dir: Path, *, enrich: bool = True, mutate=None, settings_over: dict | None = None
+    data_dir: Path,
+    *,
+    enrich: bool = True,
+    mutate=None,
+    settings_over: dict | None = None,
+    with_media: bool = False,
 ) -> Path:
     settings = load_settings(
         "default",
@@ -173,9 +178,14 @@ async def run_people_collect(
         ChannelCollector(), HistoryCollector(), DiscussionCollector(),
         ParticipantsCollector(), ProfilesCollector(), GraphCollector(),
     ]
+    if with_media:
+        from paperboy.collectors.media import MediaCollector
+
+        collectors.append(MediaCollector())
     with Store.open(db) as store:
         await collect_channel(
-            FakeGateway(fixtures), store, settings, parse_target("@c"), phases=PHASES,
+            FakeGateway(fixtures), store, settings, parse_target("@c"),
+            phases=PHASES + (["media"] if with_media else []),
             log=logging.getLogger("people"), collectors=collectors,
         )
     return db

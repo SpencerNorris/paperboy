@@ -33,6 +33,8 @@ class FakeBlob:
 
     def exists(self) -> bool:
         self._bucket.calls["exists"] += 1
+        if self._bucket.exists_error is not None:
+            raise self._bucket.exists_error
         return self.name in self._bucket.objects
 
     def upload_from_filename(
@@ -82,6 +84,7 @@ class FakeBucket:
         # Fault injection for tests:
         self.corrupt_crc: str | None = None  # server-side crc32c to report after upload
         self.upload_error: Exception | None = None
+        self.exists_error: Exception | None = None  # e.g. ServiceUnavailable on any exists()
         self.race_once = False
         self.race_data: bytes | None = None  # what the racing writer stored (default: same bytes)
         self.stored_crc: dict[str, str] = {}  # per-object crc32c override (corrupt leftovers)

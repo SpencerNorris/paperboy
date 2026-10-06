@@ -1347,3 +1347,31 @@ async def test_avatar_wrong_object_in_bucket_is_not_adopted(tmp_path, monkeypatc
         assert res.counts["avatars"] == 0 and res.counts["skipped"] == 1
         for table in ("media", "custody_log"):
             assert st.conn.execute(f"select count(*) from {table}").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [False, True])
+async def test_avatar_store_outage_is_a_phase_stop_not_a_crash(tmp_path, monkeypatch, known):
+    from google.api_core.exceptions import ServiceUnavailable
+
+    from paperboy.budget import PhaseStop
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"jpeg-1"
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    settings = _settings(
+        tmp_path, enrich_profiles=True, media_store="gs://bkt/p/x", media_store_buckets="bkt"
+    )
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        if known:  # the photo is already known from an earlier local run
+            local = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+            await ProfilesCollector().collect(
+                _ctx(st, local, _settings(tmp_path, enrich_profiles=True))
+            )
+        client.bucket("bkt").exists_error = ServiceUnavailable("down")
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        with pytest.raises(PhaseStop, match="media store"):
+            await ProfilesCollector().collect(_ctx(st, gw, settings))
