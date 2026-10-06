@@ -39,11 +39,12 @@ untouched. #75 replay lookup performance is on
 (PR pending; `reproject --include-target/--exclude-target/--out-profile`,
 `scripts/unreferenced_media.py`, replay now verifies each media sha; no
 migration — `docs/features/reproject.md` "Splitting a mixed profile"). #84 collect
-by id is on `feat/collect-by-id` (PR pending; `collect`/`status`/`export` accept
-channel ids, Step A gets access by saved key, from-message or verified handle and
-records a `ChannelAccess` receipt, replay serves it; no migration —
-`docs/features/collect-channel.md`). Next: #68 `fetch-media --list`. Order and protocol:
-`docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+by id is merged (PR #86; `docs/features/collect-channel.md`). #68
+`fetch-media LIST` is on `feat/fetch-media-by-id` (PR pending →
+`dev/media-storage`; `docs/features/fetch-media.md`): ordered cross-channel media
+pull, each channel reached by id through the standard `channel` phase,
+`--exclude-target`, `MediaSelection` names the channel so reproject walks the same
+rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
 
@@ -108,7 +109,8 @@ records a `ChannelAccess` receipt, replay serves it; no migration —
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
 [--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S]`
-(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `status [TARGET]`, `export TARGET
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv] [--exclude-target T …]` (ordered cross-channel
+media pull, #68 — `docs/features/fetch-media.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out

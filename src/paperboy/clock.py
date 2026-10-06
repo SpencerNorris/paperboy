@@ -62,6 +62,7 @@ class ReplayClock:
     def __init__(self) -> None:
         self._current: str | None = None
         self._by_payload: dict[str, str] = {}
+        self._pinned: dict[str, str] = {}
 
     def begin_batch(self) -> None:
         self._by_payload.clear()
@@ -76,8 +77,21 @@ class ReplayClock:
         self._current = observed_at
         self._by_payload[payload_json] = observed_at
 
+    def pin_json(self, observed_at: str, payload_json: str) -> None:
+        """Register a PAPERBOY-AUTHORED record (a `ChannelContextReused` marker, a
+        `MediaSelection`) by its stored canonical JSON, surviving `begin_batch`.
+
+        Such a record is not a gateway response, and the recipe may write it
+        between gateway calls (a `MediaSelection` goes in after the `channel`
+        phase). Every served response re-batches the clock, so a `serve_json`
+        stamp would be gone by then and the replayed record would inherit the
+        wrong time. A pin is consulted first and never cleared; it does not move
+        `now()`."""
+        self._pinned[payload_json] = observed_at
+
     def for_payload(self, payload: dict) -> str:
-        stamp = self._by_payload.get(dumps(payload), self._current)
+        key = dumps(payload)
+        stamp = self._pinned.get(key) or self._by_payload.get(key, self._current)
         if stamp is None:
             raise ReplayClockError(
                 "ReplayClock.for_payload before any record was served"

@@ -63,6 +63,13 @@ access_hash, msg_id}}`), `key_source_raw_id` (a live-store raw id,
 informational, not a cross-store foreign key) and, for `handle`, `handle`.
 Context: `{target, channel_id}`. Only stamped runs carry it.
 
+Two more kinds are written by paperboy itself for `fetch-media` (#68, no schema
+change, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
+segment that reused an already-established channel) and `MediaSelection`
+(`{channel_id, msg_ids}`; legacy `{msg_ids}`; the message ids a scoped media phase
+was allowed to walk, written just before the media phase). `reproject` reads them
+to replay those runs exactly.
+
 ## Entities (current state)
 
 ### `channels` — the channel/supergroup itself

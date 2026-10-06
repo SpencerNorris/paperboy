@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 # case-insensitively like every other `_`-discriminator check in this repo
 # (see `channel.py`/`ids.py`). Every other media kind (webpage/geo/contact/
 # poll/venue/...) has nothing to download and is left alone.
-_DOWNLOADABLE_KINDS = {"messagemediaphoto": "photo", "messagemediadocument": "document"}
+DOWNLOADABLE_KINDS = {"messagemediaphoto": "photo", "messagemediadocument": "document"}
 
 
 _INCOMING_DIR = ".incoming"
@@ -119,7 +119,7 @@ def _finalize(temp: Path, dest: Path) -> None:
     os.replace(temp, dest)
 
 
-def _content_key(media: dict) -> tuple[str, int] | None:
+def content_key(media: dict) -> tuple[str, int] | None:
     """A pre-download proxy for file identity: Telegram's own document/photo
     `id`, stable across every message carrying the same underlying file.
     `None` for a non-downloadable media kind or a malformed/id-less dict.
@@ -136,7 +136,7 @@ def _content_key(media: dict) -> tuple[str, int] | None:
     return None
 
 
-def _recorded_size(media: dict) -> int | None:
+def recorded_size(media: dict) -> int | None:
     """The byte size Telegram recorded for this media, if the stored dict has
     one — `document.size`, or for a photo its largest size variant (the one
     `download_media` fetches): the max over each `PhotoSize.size`, each
@@ -214,8 +214,21 @@ class MediaCollector:
 
     name = "media"
 
-    def __init__(self, *, copy_on_replay: bool = False) -> None:
+    def __init__(
+        self, *, copy_on_replay: bool = False, outcomes: dict[str, str] | None = None
+    ) -> None:
         self._copy_on_replay = copy_on_replay
+        # `outcomes` (#68) is a caller-owned dict this collector fills, message
+        # uri -> `downloaded | duplicate | too_large | size_mismatch |
+        # unavailable | skipped`, for every row it considers. A live dict, not a
+        # field of `CollectResult`, because a `DiskFloorStop`/`HardStop`
+        # discards the result yet the caller still needs the rows finished
+        # before the stop.
+        self._outcomes = outcomes
+
+    def _note(self, uri: str, outcome: str) -> None:
+        if self._outcomes is not None:
+            self._outcomes[uri] = outcome
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
@@ -311,12 +324,13 @@ class MediaCollector:
 
         for row in rows:
             media = json.loads(row["media_json"]) if row["media_json"] else {}
-            kind = _DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
+            kind = DOWNLOADABLE_KINDS.get((row["media_kind"] or "").lower())
             if kind is None:
                 counts["skipped_kind"] += 1
+                self._note(row["uri"], "skipped")
                 continue
 
-            key = _content_key(media)
+            key = content_key(media)
             if key is not None and key in content_index:
                 sha, path = content_index[key]
                 # A dedup hit derives from the STORED message row, not a
@@ -324,9 +338,10 @@ class MediaCollector:
                 # observation, not "now".
                 self._record_custody(ctx, path, sha, row["uri"], row["first_seen"])
                 counts["duplicates"] += 1
+                self._note(row["uri"], "duplicate")
                 continue
 
-            size = _recorded_size(media)
+            size = recorded_size(media)
             if max_bytes is not None and size is not None and size > max_bytes:
                 # `--media-max-mb` (issue #53): decided from the size Telegram
                 # recorded, before a single byte is fetched.
@@ -335,6 +350,7 @@ class MediaCollector:
                     row["msg_id"], size / 1e6, ctx.settings.media_max_mb,
                 )
                 counts["too_large"] += 1
+                self._note(row["uri"], "too_large")
                 continue
 
             if floor_bytes and writes:
@@ -363,6 +379,7 @@ class MediaCollector:
                     ) from exc
                 if isinstance(outcome, str):
                     counts[outcome] += 1
+                    self._note(row["uri"], outcome)
                     continue
                 sha, received = outcome
                 existing = self._lookup_by_sha(ctx, sha)
@@ -372,6 +389,7 @@ class MediaCollector:
                     # Same D3 rationale as the content_index hit above.
                     self._record_custody(ctx, existing, sha, row["uri"], row["first_seen"])
                     counts["duplicates"] += 1
+                    self._note(row["uri"], "duplicate")
                     if key is not None:
                         content_index[key] = (sha, existing)
                     continue
@@ -406,6 +424,7 @@ class MediaCollector:
                             row["msg_id"], sha,
                         )
                         counts["skipped"] += 1
+                        self._note(row["uri"], "skipped")
                         continue
                     else:
                         _finalize(temp, path)
@@ -436,6 +455,7 @@ class MediaCollector:
                 observed_at=downloaded_at,
             )
             counts["downloaded"] += 1
+            self._note(row["uri"], "downloaded")
             if key is not None:
                 content_index[key] = (sha, loc)
 
@@ -458,7 +478,7 @@ class MediaCollector:
         `declared` caps the stream (a longer one raises `MediaSizeExceeded`
         mid-transfer, never after buffering). Only a *document* has an exact
         declared size, so only a short document is a mismatch; a photo's
-        declared size is an upper bound (see `_recorded_size`).
+        declared size is an upper bound (see `recorded_size`).
         """
         assert ctx.input_channel is not None  # guarded at the top of `collect`
         try:
@@ -505,7 +525,7 @@ class MediaCollector:
         index: dict[tuple[str, int], tuple[str, str]] = {}
         for r in rows:
             media = json.loads(r["media_json"]) if r["media_json"] else {}
-            key = _content_key(media)
+            key = content_key(media)
             if key is not None:
                 index[key] = (r["sha256"], r["path"])
         return index
