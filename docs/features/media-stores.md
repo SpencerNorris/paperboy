@@ -38,19 +38,27 @@ store. Mac first, using the operator's own Application Default Credentials.
   `<prefix>/<key>`, `store_id = gs://<bucket>/<prefix>`), and
   `build_media_store(settings, profile)`. `google.cloud.storage` is imported
   only inside `default_client_factory`, so local runs never pay its ~2.7 s
-  import. There is **no delete path** anywhere in the module.
+  import. There is **no delete path** anywhere in the module, nor in the client
+  library calls it makes (see ADR-0008).
 - **Write once.** Bytes stream into `<profile>/media/.incoming/<uuid>.part`
   (both stores; `MediaSink` also computes a crc32c). With the sha known, a
   bucket commit uploads with `if_generation_match=0` (create-only; also what
-  makes the library's resumable retries safe) and compares the server's crc32c
-  with the local one. The temp file is always deleted. A lost create race
+  makes the library's resumable retries safe) with our crc32c in the object
+  metadata, so GCS rejects a mismatching upload without creating it; the
+  server's crc32c is compared with the local one afterwards. (The library's own
+  `checksum="crc32c"` is not used: on a resumable upload it issues a DELETE on a
+  mismatch.) The temp file is always deleted. A lost create race
   (HTTP 412) is a duplicate, never an overwrite: the run carries on as a normal
   download.
 - **Per-store "already have it".** `media.sha256` is the primary key, so "the
   DB has it" does not mean "this store has it". A hit (by Telegram content id,
   or by sha after download) is a duplicate only if a `custody_log` row names this
-  store (offline, no request), else if `exists(key)` says so (one metadata GET).
-  A file known from a local run is downloaded again for a bucket run and
+  store (offline, no request), else if an existing object passes verification: its
+  server crc32c must equal the streamed one (one metadata GET); with no stream to
+  compare against, a bucket object is re-fetched rather than trusted.
+  Any object found instead of written (exact key, legacy key, lost race) is
+  verified the same way before it is adopted. A file known from a local run is
+  downloaded again for a bucket run and
   committed under the existing row's key: custody + a receipt, **no second
   `media` row**, counted `downloaded`. For a brand-new sha the store first looks
   for the exact key or a legacy-suffixed object (#62) and reuses it.
@@ -58,11 +66,12 @@ store. Mac first, using the operator's own Application Default Credentials.
   the full `gs://` URL, never a path. `MediaDownload`/`AvatarDownload` receipts
   carry `"store"` **only for a bucket run; a missing key means local** (legacy and
   local-run raw stays byte-identical). A bucket run also appends one
-  `MediaStore` marker `{store}` just before the media phase (local runs write
-  none) so a dedup-only run's custody rows still have a store in raw.
+  `MediaStore` marker `{store}` before the first phase that writes through the
+  store (`profiles` avatars or `media`; `"media": false` when the run has no
+  media phase; local runs write none) so a dedup-only run's custody rows still have a store in raw.
   `media.path` stays the store-neutral key.
-- **Errors.** CRC mismatch (or the library's `DataCorruption`):
-  `MediaStoreIntegrityError`; both digests at ERROR, no `media`/custody/receipt
+- **Errors.** CRC mismatch (server rejection, or a stored object whose crc32c
+  differs): `MediaStoreIntegrityError`; both digests at ERROR, no `media`/custody/receipt
   rows, the file is counted `skipped`, the object is left in place, the run
   continues. Manual recovery (ADR-0008): compare `gcloud storage hash` with
   `media.sha256`; the operator lifts the unlocked retention and deletes by hand;
@@ -121,15 +130,15 @@ operator's scratch directory, referenced by filename).
 
 ```
 $ uv run pytest -q --basetemp=<scratch>
-1073 passed in 87.63s (0:01:27)
+1081 passed in 84.42s (0:01:24)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
 0 errors, 0 warnings, 0 informations
 ```
 
-Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`, before this
-DoD commit): `CLAUDE.md`, `README.md`, `docs/adr/0003-guardrails.md`,
+Files in scope: the name-only diff against `origin/dev/gcs-pull` lists 48 files
+(it was 46 at the first review, not 50). They are: `CLAUDE.md`, `README.md`, `docs/adr/0003-guardrails.md`,
 `docs/adr/0008-media-stores.md`, `docs/data-model.md`,
 `docs/features/{fetch-media,media-stores,media-streaming,reproject}.md`,
 `docs/how-it-works.md`, `docs/opsec.md`,

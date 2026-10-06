@@ -47,17 +47,32 @@ whole file has streamed.
   local-run receipts omit it so legacy and local raw logs stay byte-identical.
   `media.path` stays the store-neutral key.
 - Every bucket run appends one paperboy-authored `MediaStore` raw record
-  `{"store": "<url>"}` before the media collector, so a custody row that only
-  records a duplicate still has its store derivable from raw. Local runs never
-  write it. Replay pins it per run.
-- "Already have it" is per store: a custody row naming this store, else
-  `store.exists(key)`. `media.sha256` stays the PK, so a file first stored
+  `{"store": "<url>"}` before the first collector that writes through the store
+  (`profiles` avatars or `media`), once per run, so a custody row that only
+  records a duplicate, or an avatar-only run's custody, still has its store
+  derivable from raw. A run without a media phase adds `"media": false` so
+  replay does not infer one. Local runs never write it. Replay pins it per run.
+- "Already have it" is per store: a custody row naming this store, else an
+  existing object that has been **verified**: with bytes just streamed its
+  server crc32c must equal ours; with no stream (a pre-download dedup hit) a
+  bucket cannot vouch for it, so the file is fetched again and checked. An
+  object found instead of written (existing key, legacy-suffixed key, or a lost
+  create race) is checked the same way, so a corrupt leftover is never adopted
+  as evidence. `media.sha256` stays the PK, so a file first stored
   locally is downloaded again in a bucket run, committed under the existing
   row's key, with custody and a receipt but no second `media` row.
-- crc32c is computed while streaming (`MediaSink`) and compared with the
-  server's after upload. A mismatch (or `DataCorruption`) raises
-  `MediaStoreIntegrityError`: both digests logged at ERROR, no rows, the file
-  counted `skipped`, the object left in place. **Manual recovery:** compare
+- crc32c is computed while streaming (`MediaSink`) and sent in the object
+  metadata (`blob.crc32c`), so **GCS validates the upload server-side** and
+  rejects a mismatch without creating the object (paperboy maps that 400 to
+  `MediaStoreIntegrityError`). The post-upload `blob.crc32c` comparison remains
+  as a second check. We deliberately do NOT pass the client library's
+  `checksum="crc32c"`: in google-cloud-storage 3.x a resumable upload (> 8 MiB)
+  that fails that check runs `blob.delete()`, a DELETE against the evidence
+  bucket (`tests/test_media_store_real_library.py` drives the real `Blob` and
+  asserts none is ever sent). An integrity failure logs both digests at ERROR,
+  writes no rows and counts the file `skipped`; should an object nevertheless
+  exist with a wrong crc32c it is left in place (no delete path) and every later
+  adoption re-checks it, so it is never certified. **Manual recovery:** compare
   `gcloud storage hash` with `media.sha256`; the operator lifts the unlocked
   retention and deletes by hand. Paperboy never will.
 - Transport failures after the library's retries raise `MediaStoreError`,
