@@ -51,6 +51,18 @@ want pulled. A target the store has never seen, or one that is not a channel
 handle/id, exits 1 before anything else is done (excluding nothing by accident
 would download what was meant to be kept out).
 
+## Media store (#63)
+
+`--media-store gs://<bucket>/<prefix>` (or `PAPERBOY_MEDIA_STORE`; the bucket
+must be listed in `PAPERBOY_MEDIA_STORE_BUCKETS`) sends the pull to a bucket
+with no local copy; see `media-stores.md`. The classification above is then
+per store: a custody row naming the bucket answers offline, otherwise one
+metadata GET per candidate (`MediaStore.exists`). **A bucket `--dry-run`
+therefore touches GCS (read-only metadata GETs, needs Application Default
+Credentials), never Telegram.** An unreachable bucket exits 1. `--media-store`
+is validated before anything runs; an unlisted bucket is a one-line config
+error (exit 1).
+
 ## Outcomes
 
 Offline classification (no network), first match wins:
@@ -62,7 +74,7 @@ Offline classification (no network), first match wins:
 | `not_in_store` | No `messages` row (or an unknown username). |
 | `deleted` | The message is tombstoned (`deleted_at`); the media collector never selects these. |
 | `no_media` | The message has no downloadable media (photo/document only). |
-| `already_stored` | The Telegram document/photo id is already in `media` (anywhere in the store, not only this channel), or this message already has a `media` / `custody_log` row. Reposts share content ids, so this count can exceed the catalogue's own "already downloaded" flag. |
+| `already_stored` | THIS run's media store (#63) already holds the file: the Telegram document/photo id (anywhere in the store, not only this channel) or this message resolves to a stored file, and a `custody_log` row names the run's store, or the store answers an existence check. Reposts share content ids, so this count can exceed the catalogue's own "already downloaded" flag. A file the database holds from a LOCAL run is `pending` for a bucket run until the bucket holds it. |
 | `pending` | To fetch. |
 
 After fetching, a `pending` row becomes one of the collector's outcomes:

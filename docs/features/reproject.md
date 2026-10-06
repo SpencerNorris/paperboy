@@ -175,6 +175,26 @@ operator can eyeball the correction before swapping files.
   exception is `--out-profile` (#70), which copies into the OUTPUT profile's
   `media/` through the live write path; the source profile is still never
   written.
+- **Bucket reads: the one network exception (#63, ADR-0003 amendment).** A
+  `MediaDownload`/`AvatarDownload` receipt that names a bucket store
+  (`"store": "gs://<bucket>/<prefix>"`; no `store` key means local) is read
+  back with ranged GETs through `MediaStore.open_read` and re-hashed against
+  the receipt sha, exactly like a local file. Only buckets in
+  `PAPERBOY_MEDIA_STORE_BUCKETS` are ever fetched from; a receipt naming any
+  other bucket is skipped with a WARNING (logged once per store). It needs
+  Application Default Credentials on the machine running reproject; without
+  them (or on a missing object, or an outage) the file is a recorded per-file
+  skip, logged once, never a reproject abort. Still absolute: no Telegram
+  (no session, `TelethonGateway` or `Budget`), no `t.me`/`web.archive.org`, no
+  keychain, and no write, upload or delete in any bucket. A source whose
+  receipts are all local builds no GCS client at all (tested: the client
+  factory is patched to raise). A bucket run's `MediaStore` marker is replayed
+  with its recorded stamp, so a replay of it reproduces `custody_log.store`
+  and the raw log byte for byte. A plain reproject writes no media bytes
+  anywhere; `--out-profile` of a bucket source copies the bytes into the
+  LOCAL output profile, which then replays as a local run (custody `local`,
+  no `store` key, no marker). Tests: `tests/test_reproject_bucket.py`,
+  `tests/test_replay_gateway.py`.
 - **Log beside `--out`.** `reproject` writes `<out filename>.log` (`x.sqlite.log`, `x.log.log`;
   never equal to the output DB; default `paperboy.reprojected.sqlite.log`), never into the source profile's
   `paperboy.log`.

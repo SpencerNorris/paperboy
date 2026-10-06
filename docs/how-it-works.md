@@ -59,7 +59,14 @@ data/default/
 Because the key is relative to the profile folder, you can move or copy the
 whole folder (to another disk, the VM, the bucket) and nothing breaks.
 
-Detail: [`adr/0007-media-keys.md`](adr/0007-media-keys.md) (#62).
+A file's full location is **store root + key**. A run picks one store: the
+profile folder (the default), or a bucket (`--media-store gs://<bucket>/<prefix>`)
+where the same key sits under the prefix. The database remembers which store
+each file went to (`custody_log.store`: `local` or the bucket URL), because the
+same fingerprint can be in one store and not yet in the other.
+
+Detail: [`adr/0007-media-keys.md`](adr/0007-media-keys.md) (#62),
+[`adr/0008-media-stores.md`](adr/0008-media-stores.md) (#63).
 
 ## 4. Replay and reproject: rebuilding the spreadsheets offline
 
@@ -128,9 +135,25 @@ disk. Steps and caveats: [`features/reproject.md`](features/reproject.md).
 
 ## 6. The media pull
 
-Large media pulls download straight into the target profile's `media/`, once.
-Downloads stream to disk in chunks, so a 2.4 GB video never sits in memory,
-and a free-disk floor stops the run before the disk fills (#64).
+Large media pulls download once into the run's media store: the target
+profile's `media/` by default. Downloads stream to disk in chunks, so a 2.4 GB
+video never sits in memory, and a free-disk floor stops the run before the
+disk fills (#64).
+
+**A bucket run (#63).** With `--media-store gs://<bucket>/<prefix>`, each file
+still streams into a short-lived temp file (we only know its fingerprint, and
+so its final name, once it has fully arrived). Then paperboy asks the bucket
+whether that name exists. If it does, the temp file is thrown away and only a
+custody row is written; if not, the file is uploaded **create-only** (the
+bucket refuses to replace an existing object) and its checksum is compared
+with the one computed while streaming. The temp file is then deleted, so no
+local copy remains. The bucket keeps deleted or replaced files for months, so
+paperboy has no way to delete or overwrite anything in it, ever. A checksum
+mismatch writes no rows and leaves the object for you to inspect. `reproject`
+later reads those files back from the bucket (read-only) to re-check their
+fingerprints, which is the one case where a rebuild touches the network; it
+never contacts Telegram. "Already have it" is checked per store: a file
+from a local run is downloaded again for a bucket run.
 
 `paperboy fetch-media LIST` (#68) pulls media for a prioritised list of
 messages that can span many channels. In plain terms:
