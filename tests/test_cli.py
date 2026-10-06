@@ -39,8 +39,10 @@ def _fixtures():
 def test_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup", "fetch-media"):
+    commands = ("auth", "doctor", "collect", "status", "export", "watch", "lookup")
+    for cmd in (*commands, "fetch-from-list"):
         assert cmd in result.stdout
+    assert "fetch-media" not in result.stdout
 
 
 def test_collect_writes_sqlite_and_exits_zero(tmp_path, monkeypatch):

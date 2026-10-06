@@ -1,4 +1,4 @@
-"""`paperboy fetch-media LIST` (#68). Synthetic channels/messages only."""
+"""`paperboy fetch-from-list LIST` (#68, #91). Synthetic channels/messages only."""
 
 import csv
 
@@ -8,7 +8,7 @@ from paperboy import app as composition
 from paperboy.cli import app
 from paperboy.doctor import Check
 from paperboy.store.db import Store
-from tests.test_fetch_media import BYTES, LIST, _gateway, _seed_store
+from tests.test_fetch_from_list import BYTES, LIST, _gateway, _seed_store
 
 runner = CliRunner()
 
@@ -37,13 +37,13 @@ def test_dry_run_builds_no_gateway_and_no_secrets(tmp_path, monkeypatch):
     path = _prepare(tmp_path)
     _forbid_network(monkeypatch)
     result = runner.invoke(
-        app, ["fetch-media", str(path), "--profile", "p", "--dry-run"], env=_env(tmp_path)
+        app, ["fetch-from-list", str(path), "--profile", "p", "--dry-run"], env=_env(tmp_path)
     )
     assert result.exit_code == 0, result.stdout
     assert "pending" in result.stdout and "priority" in result.stdout.lower()
     # 4 segments over 2 channels; ids only, never usernames.
     assert "chan_a" not in result.stdout
-    assert not list((tmp_path / "p").glob("fetch-media-*.csv"))
+    assert not list((tmp_path / "p").glob("fetch-from-list-*.csv"))
 
 
 def test_malformed_list_exits_1_listing_lines(tmp_path, monkeypatch):
@@ -51,7 +51,7 @@ def test_malformed_list_exits_1_listing_lines(tmp_path, monkeypatch):
     path = tmp_path / "bad.csv"
     path.write_text("uri\ntg:msg:1/1\nnope\ntg:msg:1/x\n", encoding="utf-8")
     result = runner.invoke(
-        app, ["fetch-media", str(path), "--profile", "p", "--dry-run"], env=_env(tmp_path)
+        app, ["fetch-from-list", str(path), "--profile", "p", "--dry-run"], env=_env(tmp_path)
     )
     assert result.exit_code == 1
     assert "3" in result.stdout and "4" in result.stdout
@@ -69,25 +69,27 @@ def test_live_run_exit_codes_and_default_report_path(tmp_path, monkeypatch):
     monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--unsafe", "--media-min-free-gb", "0"],
+        ["fetch-from-list", str(path), "--profile", "p", "--unsafe", "--media-min-free-gb", "0"],
         env=_env(tmp_path),
     )
     assert result.exit_code == 0, result.stdout
-    reports = list((tmp_path / "p").glob("fetch-media-*.csv"))
+    reports = list((tmp_path / "p").glob("fetch-from-list-*.csv"))
     assert len(reports) == 1
     with reports[0].open(newline="") as fh:
         assert [r["outcome"] for r in csv.DictReader(fh)] == ["downloaded"] * 5
 
-    # Second run: everything is already stored -> exit 0, no gateway built.
-    _forbid_network(monkeypatch)
+    # Second run: the media is already stored, but the posts are fetched again,
+    # so a gateway is built: a no-download re-run, exit 0.
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
     again = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--unsafe", "--report",
+        ["fetch-from-list", str(path), "--profile", "p", "--unsafe", "--report",
          str(tmp_path / "again.csv")],
         env=_env(tmp_path),
     )
     assert again.exit_code == 0, again.stdout
     assert "already_stored" in again.stdout
+    assert gw.download_media_calls == [1, 11, 2, 3, 12]  # the first run's, none added
 
 
 def test_stopped_run_exits_1_and_still_writes_the_report(tmp_path, monkeypatch):
@@ -104,7 +106,7 @@ def test_stopped_run_exits_1_and_still_writes_the_report(tmp_path, monkeypatch):
     report = tmp_path / "r.csv"
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--unsafe", "--media-min-free-gb", "0",
+        ["fetch-from-list", str(path), "--profile", "p", "--unsafe", "--media-min-free-gb", "0",
          "--report", str(report)],
         env=_env(tmp_path),
     )
@@ -131,7 +133,7 @@ def test_doctor_block_exits_1_before_any_segment(tmp_path, monkeypatch):
     report = tmp_path / "r.csv"
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--report", str(report)],
+        ["fetch-from-list", str(path), "--profile", "p", "--report", str(report)],
         env=_env(tmp_path),
     )
     assert result.exit_code == 1
@@ -146,7 +148,7 @@ def test_unwritable_report_fails_before_any_segment(tmp_path, monkeypatch):
     _forbid_network(monkeypatch)
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--unsafe", "--report",
+        ["fetch-from-list", str(path), "--profile", "p", "--unsafe", "--report",
          str(tmp_path / "no" / "such" / "dir" / "r.csv")],
         env=_env(tmp_path),
     )
@@ -165,7 +167,7 @@ def test_gateway_build_failure_still_writes_the_report(tmp_path, monkeypatch):
     report = tmp_path / "r.csv"
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--report", str(report)],
+        ["fetch-from-list", str(path), "--profile", "p", "--report", str(report)],
         env=_env(tmp_path),
     )
     assert result.exit_code == 1
@@ -176,9 +178,10 @@ def test_gateway_build_failure_still_writes_the_report(tmp_path, monkeypatch):
 def test_dry_run_prints_per_channel_counts_and_excludes(tmp_path, monkeypatch):
     path = _prepare(tmp_path)
     _forbid_network(monkeypatch)
+    monkeypatch.setattr("paperboy.cli.console.width", 200)  # keep each table row on one line
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--exclude-target", "10"],
+        ["fetch-from-list", str(path), "--profile", "p", "--dry-run", "--exclude-target", "10"],
         env=_env(tmp_path),
     )
     assert result.exit_code == 0, result.stdout
@@ -204,7 +207,7 @@ def test_unknown_exclude_target_exits_1_before_anything_else(tmp_path, monkeypat
     _forbid_network(monkeypatch)
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--exclude-target", "999"],
+        ["fetch-from-list", str(path), "--profile", "p", "--dry-run", "--exclude-target", "999"],
         env=_env(tmp_path),
     )
     assert result.exit_code == 1
@@ -218,6 +221,7 @@ def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monke
     _forbid_network(monkeypatch)
     client = FakeGcsClient()
     monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    monkeypatch.setattr("paperboy.cli.console.width", 200)
     # Make one list row look stored locally, so the bucket has to be asked about it.
     with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
         from tests.test_media_list import record_media
@@ -226,7 +230,7 @@ def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monke
     result = runner.invoke(
         app,
         [
-            "fetch-media", str(path), "--profile", "p", "--dry-run",
+            "fetch-from-list", str(path), "--profile", "p", "--dry-run",
             "--media-store", "gs://bkt/p/x",
         ],
         env={**_env(tmp_path), "PAPERBOY_MEDIA_STORE_BUCKETS": "bkt"},
@@ -234,7 +238,7 @@ def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monke
     assert result.exit_code == 0, result.stdout
     assert client.bucket("bkt").calls["exists"] > 0  # a bucket dry run touches GCS...
     assert client.bucket("bkt").calls["upload"] == 0  # ...read-only
-    assert "already_stored" in result.stdout and "pending" in result.stdout
+    assert "media_stored" in result.stdout and "pending" in result.stdout
 
 
 def test_dry_run_against_unlisted_bucket_is_a_config_error(tmp_path, monkeypatch):
@@ -242,8 +246,60 @@ def test_dry_run_against_unlisted_bucket_is_a_config_error(tmp_path, monkeypatch
     _forbid_network(monkeypatch)
     result = runner.invoke(
         app,
-        ["fetch-media", str(path), "--profile", "p", "--dry-run", "--media-store", "gs://bkt/p"],
+        ["fetch-from-list", str(path), "--profile", "p", "--dry-run", "--media-store", "gs://bkt/p"],
         env=_env(tmp_path),
     )
     assert result.exit_code == 1
     assert "media_store_buckets" in result.stdout
+
+
+def test_default_report_name_is_fetch_from_list(tmp_path, monkeypatch):
+    path = _prepare(tmp_path)
+    gw = _gateway(BYTES)
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return gw
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    result = runner.invoke(
+        app,
+        ["fetch-from-list", str(path), "--profile", "p", "--unsafe", "--no-media"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 0, result.stdout
+    [report] = list((tmp_path / "p").glob("fetch-from-list-*.csv"))
+    with report.open(newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert {(r["outcome"], r["post"]) for r in rows} == {("post_only", "fetched")}
+    assert gw.download_media_calls == []  # --no-media
+
+
+def test_removed_command_name_is_gone(tmp_path):
+    result = runner.invoke(app, ["fetch-media", "x.csv"], env=_env(tmp_path))
+    assert result.exit_code != 0
+
+
+def test_dry_run_counts_not_yet_collected_per_channel(tmp_path, monkeypatch):
+    path = _prepare(tmp_path, "tg:msg:10/1\ntg:msg:10/999\nt.me/unseen/4\n")
+    _forbid_network(monkeypatch)
+    monkeypatch.setattr("paperboy.cli.console.width", 200)  # keep each table row on one line
+    result = runner.invoke(
+        app, ["fetch-from-list", str(path), "--profile", "p", "--dry-run"], env=_env(tmp_path)
+    )
+    assert result.exit_code == 0, result.stdout
+    out = result.stdout
+    per_channel = out[out.lower().index("per channel"):]
+    header = next(
+        ln for ln in per_channel.splitlines() if "not_yet_collected" in ln and "in_store" in ln
+    )
+    cols = [c.strip() for c in header.strip("┃│ ").replace("┃", "│").split("│")]
+    rows = {}
+    for ln in per_channel.splitlines():
+        cells = [c.strip() for c in ln.strip().strip("│").split("│")]
+        if len(cells) == len(cols) and cells[0] in ("10", "-"):
+            rows[cells[0]] = dict(zip(cols, cells, strict=True))
+    assert rows["10"]["in_store"] == "1" and rows["10"]["not_yet_collected"] == "1"
+    assert rows["-"]["needs_resolve"] == "1"
+    assert "needs_resolve" in out and "posts calls" in out
+    assert "unseen" not in out  # a handle is never echoed
