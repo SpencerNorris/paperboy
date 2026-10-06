@@ -126,8 +126,10 @@ async def test_file_already_in_bucket_is_duplicate_without_upload(tmp_path, monk
         gw = FakeGateway({"media": {1: data}})
         res = await MediaCollector().collect(_ctx(st, gw, settings))
         assert res.counts["duplicates"] == 1 and res.counts["downloaded"] == 0
-        assert gw.download_media_calls == []
-        assert client.bucket("bkt").calls["exists"] >= 1
+        # A bucket object with no custody row is re-fetched and CRC-verified,
+        # never trusted on existence alone (review of #63).
+        assert gw.download_media_calls == [1]
+        assert client.bucket("bkt").calls["get_blob"] >= 1
         assert client.bucket("bkt").calls["upload"] == 0
         last = st.conn.execute("SELECT * FROM custody_log ORDER BY id DESC").fetchone()
         assert (last["store"], last["sha256"]) == (URL, sha)
@@ -232,3 +234,57 @@ async def test_run_marker_written_only_for_bucket_runs(tmp_path, monkeypatch, bu
             for r in st.conn.execute("SELECT payload_json FROM raw_records WHERE kind='MediaStore'")
         ]
         assert markers == ([{"store": URL}] if bucket_run else [])
+
+
+@pytest.mark.asyncio
+async def test_corrupt_object_is_not_adopted_by_a_later_run(tmp_path, monkeypatch):
+    """Run 1 leaves a CRC-mismatched object (no delete path). Run 2 must NOT
+    certify it: it re-checks the object's crc32c and again writes no rows."""
+    data = b"corrupt then retried"
+    client = FakeGcsClient()
+    client.bucket("bkt").corrupt_crc = "AAAAAA=="
+    settings = _bucket_settings(tmp_path, monkeypatch, client)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, _doc_msg(1))
+        for _ in range(2):
+            res = await MediaCollector().collect(
+                _ctx(st, FakeGateway({"media": {1: data}}), settings)
+            )
+            assert res.counts["skipped"] == 1 and res.counts["downloaded"] == 0
+            for table in ("media", "custody_log"):
+                assert st.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert _payload(st) == []
+        assert client.bucket("bkt").calls["upload"] == 1  # run 2 never re-uploaded
+
+
+@pytest.mark.asyncio
+async def test_hand_placed_wrong_object_is_not_adopted(tmp_path, monkeypatch):
+    data = b"expected bytes"
+    _, key = _key(data)
+    client = FakeGcsClient()
+    client.bucket("bkt").objects[f"p/x/{key}"] = b"something else entirely"
+    settings = _bucket_settings(tmp_path, monkeypatch, client)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, _doc_msg(1))
+        res = await MediaCollector().collect(
+            _ctx(st, FakeGateway({"media": {1: data}}), settings)
+        )
+        assert res.counts["skipped"] == 1 and res.counts["downloaded"] == 0
+        assert st.conn.execute("SELECT COUNT(*) FROM custody_log").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_lost_race_to_a_wrong_object_is_not_adopted(tmp_path, monkeypatch):
+    data = b"raced against garbage"
+    client = FakeGcsClient()
+    bucket = client.bucket("bkt")
+    bucket.race_once = True
+    bucket.race_data = b"not our bytes"
+    settings = _bucket_settings(tmp_path, monkeypatch, client)
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, _doc_msg(1))
+        res = await MediaCollector().collect(
+            _ctx(st, FakeGateway({"media": {1: data}}), settings)
+        )
+        assert res.counts["skipped"] == 1
+        assert st.conn.execute("SELECT COUNT(*) FROM custody_log").fetchone()[0] == 0

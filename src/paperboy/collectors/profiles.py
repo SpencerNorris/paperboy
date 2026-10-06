@@ -52,6 +52,7 @@ from paperboy.media_store import (
     MediaStoreIntegrityError,
     build_media_store,
     stored_in,
+    verify_existing,
 )
 from paperboy.store.db import dumps
 from paperboy.store.events import record_run_event
@@ -133,9 +134,12 @@ class ProfilesCollector:
         projection, as before): custody row first (offline), else one check."""
         if self._store is None or self._replay:
             return True
-        return stored_in(ctx.store.conn, sha, self._store_id) or self._store.exists(
-            media_key(sha, ".jpg")
-        )
+        if stored_in(ctx.store.conn, sha, self._store_id):
+            return True
+        # An object with no custody row is only trusted where it cannot be
+        # verified (local); a bucket object is re-fetched and CRC-checked.
+        key = media_key(sha, ".jpg")
+        return not self._store.verifiable and self._store.exists(key)
 
     def applies_to(self, target: Target) -> bool:
         return target.is_channel_like
@@ -674,14 +678,15 @@ class ProfilesCollector:
         commit, like media). `False` = integrity failure: counted, no rows."""
         store = self._store
         assert store is not None
-        if store.exists(key):
-            return True
         incoming = prepare_media_root(media_dir(ctx.settings, ctx.profile))
         temp = incoming / f"{uuid.uuid4().hex}.part"
         try:
             with MediaSink(temp) as sink:
                 sink.write(data)
-            store.commit(temp, key, sink.crc32c)
+            if store.exists(key):
+                verify_existing(store, key, sink.crc32c)  # never adopt unchecked
+            elif not store.commit(temp, key, sink.crc32c):
+                verify_existing(store, key, sink.crc32c)
         except MediaStoreIntegrityError as exc:
             ctx.log.error(
                 "profiles: avatar integrity failure, local crc32c %s remote crc32c %s; "

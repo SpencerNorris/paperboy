@@ -281,7 +281,10 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
     selection = source.media_selection(run)
-    if source.has_kind(run, "mediadownload") or source.media_store(run) is not None or (
+    store_marker = source.media_store(run)
+    if source.has_kind(run, "mediadownload") or (
+        store_marker is not None and store_marker.payload.get("media", True)
+    ) or (
         selection is not None
         and source.channel_established(run, selection.payload.get("channel_id"))
     ):

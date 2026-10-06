@@ -11,6 +11,12 @@ module has **no delete path at all** and `commit` is create-only
 (`if_generation_match=0`). A lost create race is reported as `False`, never as
 an overwrite.
 
+Integrity is checked **server-side**: `commit` puts our CRC32C in the object
+metadata so GCS rejects a mismatching upload without creating the object. The
+client library's own `checksum="crc32c"` is deliberately NOT used: on a
+resumable upload (> 8 MiB) it answers a mismatch with `blob.delete()`, which
+would be a DELETE against the evidence bucket.
+
 `google.cloud.storage` costs ~2.7 s to import, so it is imported only inside
 `default_client_factory` (and the error-path helpers). A local-only run, and a
 reproject of a local-only source, never import it.
@@ -45,9 +51,12 @@ class MediaStoreError(Exception):
 
 
 class MediaStoreIntegrityError(MediaStoreError):
-    """The object was created but its server-side CRC32C differs from the one
-    computed while streaming. The object is left in place (there is no delete
-    path); ADR-0008 documents the manual recovery."""
+    """A stored object's CRC32C differs from the one computed while streaming:
+    either the upload was rejected/created wrong, or an object already under
+    the key is not our bytes. Nothing is recorded for the file. A wrongly
+    created object is left in place (there is no delete path) and is never
+    adopted later, because every adoption re-checks its CRC32C; ADR-0008
+    documents the manual recovery."""
 
     def __init__(self, key: str, local_crc32c: str, remote_crc32c: str) -> None:
         super().__init__(
@@ -74,9 +83,17 @@ class MediaStore(Protocol):
     """Byte storage for media, addressed by profile-relative keys."""
 
     store_id: str
+    verifiable: bool
+    """True when the store reports a server-side CRC32C (`crc32c`), so an object
+    that already exists can be checked before it is adopted as evidence."""
 
     def exists(self, key: str) -> bool:
         """True if an object/file lives under exactly `key`."""
+        ...
+
+    def crc32c(self, key: str) -> str | None:
+        """The stored object's CRC32C (base64), or `None` if the store keeps
+        none (`verifiable` is False) or the object is absent."""
         ...
 
     def find_key(self, sha256: str) -> str | None:
@@ -98,12 +115,16 @@ class LocalMediaStore:
     """The profile folder: today's behaviour behind the `MediaStore` seam."""
 
     store_id = LOCAL_STORE_ID
+    verifiable = False
 
     def __init__(self, profile_root: Path) -> None:
         self._root = profile_root
 
     def exists(self, key: str) -> bool:
         return resolve_key_under(self._root, key).exists()
+
+    def crc32c(self, key: str) -> str | None:
+        return None  # a local file has no server-side checksum
 
     def find_key(self, sha256: str) -> str | None:
         return find_existing_key(self._root, sha256)
@@ -175,6 +196,7 @@ class GcsMediaStore:
         self._client_factory = client_factory
         self._client: Any = None
         self.store_id = f"gs://{bucket}/{prefix}"
+        self.verifiable = True
 
     def _bucket(self) -> Any:
         if self._client is None:
@@ -200,6 +222,14 @@ class GcsMediaStore:
         log.debug("media store: exists(%s) -> %s", key, found)
         return found
 
+    def crc32c(self, key: str) -> str | None:
+        name = self._name(key)
+        try:
+            blob = self._bucket().get_blob(name)
+        except _transport_errors() as exc:
+            raise MediaStoreError(f"metadata read failed: {type(exc).__name__}") from exc
+        return None if blob is None else blob.crc32c
+
     def find_key(self, sha256: str) -> str | None:
         shard_prefix = f"{self._prefix}/{MEDIA_PREFIX}/{sha256[:2]}/{sha256}"
         try:
@@ -213,22 +243,28 @@ class GcsMediaStore:
         return None
 
     def commit(self, temp: Path, key: str, crc32c_b64: str) -> bool:
-        from google.api_core.exceptions import PreconditionFailed
-        from google.cloud.storage.exceptions import DataCorruption
+        from google.api_core.exceptions import BadRequest, PreconditionFailed
 
         blob = self._bucket().blob(self._name(key))
+        # Our CRC32C rides in the object metadata: GCS validates the uploaded
+        # bytes against it and rejects a mismatch WITHOUT creating the object.
+        # Do not switch this to the library's `checksum="crc32c"`: on a
+        # resumable upload that path calls `blob.delete()` on a mismatch.
+        blob.crc32c = crc32c_b64
         try:
             # if_generation_match=0: create only if no live object has this name.
             # It also makes the library's resumable upload retry-safe.
-            blob.upload_from_filename(str(temp), if_generation_match=0, checksum="crc32c")
+            blob.upload_from_filename(str(temp), if_generation_match=0, checksum=None)
         except PreconditionFailed:
             log.info("media store: %s already exists (lost create race); not overwritten", key)
             return False
-        except DataCorruption as exc:
-            log.error("media store: server reported corruption uploading %s", key)
-            raise MediaStoreIntegrityError(
-                key, crc32c_b64, "reported by the client library"
-            ) from exc
+        except BadRequest as exc:
+            if "crc32c" in str(exc).lower():
+                log.error("media store: server rejected the upload of %s: crc32c mismatch", key)
+                raise MediaStoreIntegrityError(
+                    key, crc32c_b64, "rejected by the server"
+                ) from exc
+            raise MediaStoreError(f"upload failed: {type(exc).__name__}") from exc
         except _transport_errors() as exc:
             raise MediaStoreError(f"upload failed: {type(exc).__name__}") from exc
         remote = blob.crc32c
@@ -246,6 +282,19 @@ class GcsMediaStore:
         except _transport_errors() as exc:
             raise MediaStoreError(f"open failed: {type(exc).__name__}") from exc
         return _GcsReader(raw)
+
+
+def verify_existing(store: MediaStore, key: str, crc32c_b64: str) -> None:
+    """Before adopting an object that is already in `store` as the copy of the
+    bytes just streamed (crc32c `crc32c_b64`), prove it is those bytes.
+
+    Raises `MediaStoreIntegrityError` on a mismatch; a store with no checksum
+    (local) is trusted, as it always was.
+    """
+    remote = store.crc32c(key)
+    if remote is not None and remote != crc32c_b64:
+        log.error("media store: existing object %s has a different crc32c; not adopting", key)
+        raise MediaStoreIntegrityError(key, crc32c_b64, remote)
 
 
 def default_client_factory() -> Any:

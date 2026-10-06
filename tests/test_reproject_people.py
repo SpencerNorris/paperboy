@@ -158,9 +158,12 @@ def people_fixtures() -> dict:
     }
 
 
-async def run_people_collect(data_dir: Path, *, enrich: bool = True, mutate=None) -> Path:
+async def run_people_collect(
+    data_dir: Path, *, enrich: bool = True, mutate=None, settings_over: dict | None = None
+) -> Path:
     settings = load_settings(
-        "default", {"data_dir": data_dir, "unsafe": True, "enrich_profiles": enrich}
+        "default",
+        {"data_dir": data_dir, "unsafe": True, "enrich_profiles": enrich, **(settings_over or {})},
     )
     db = data_dir / "default" / "paperboy.sqlite"
     fixtures = people_fixtures()

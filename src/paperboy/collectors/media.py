@@ -58,6 +58,7 @@ from paperboy.media_store import (
     MediaStoreIntegrityError,
     build_media_store,
     stored_in,
+    verify_existing,
 )
 from paperboy.store.db import dumps
 
@@ -419,7 +420,7 @@ class MediaCollector:
                     if (
                         existing is not None
                         and not replay
-                        and self._held(ctx, store, sha, existing, replay, receipt_key)
+                        and self._held(ctx, store, sha, existing, replay, receipt_key, crc32c)
                     ):
                         # Safety-net dedup: two distinct document/photo ids hashed to
                         # the same bytes (or `key` was None, e.g. a malformed dict),
@@ -526,17 +527,29 @@ class MediaCollector:
         key: str,
         replay: bool,
         receipt_key: str | None,
+        crc32c: str | None = None,
     ) -> bool:
         """Whether THIS run's store already has the file, so only custody is due.
 
         Live: a `custody_log` row naming the store (offline, no request), else
-        one existence check. Replay: the live run's receipt is the record - a
-        receipt means it downloaded the bytes, no receipt means it did not.
+        an existing object. An existing object is never trusted blindly: with
+        the streamed `crc32c` it is verified (mismatch raises
+        `MediaStoreIntegrityError`); with no stream (a pre-download dedup hit)
+        a verifiable store cannot vouch for it, so the file is re-fetched and
+        verified. Replay: the live run's receipt is the record - a receipt
+        means it downloaded the bytes, no receipt means it did not.
         """
         if replay:
             return receipt_key is None
         assert store is not None
-        return stored_in(ctx.store.conn, sha, store.store_id) or store.exists(key)
+        if stored_in(ctx.store.conn, sha, store.store_id):
+            return True
+        if not store.exists(key):
+            return False
+        if crc32c is None:
+            return not store.verifiable
+        verify_existing(store, key, crc32c)
+        return True
 
     @staticmethod
     def _place(
@@ -553,16 +566,21 @@ class MediaCollector:
 
         `reuse` (a brand-new sha): the bytes may already sit under that exact
         key or a legacy-suffixed one (a pre-#62 file) - reuse it rather than
-        write a second copy. Commit is create-only; a lost race means the bytes
-        are verifiably there, so it carries on as a normal download.
+        write a second copy. Commit is create-only. Any object found instead of
+        written (reused, or won by a racing writer) is first checked against the
+        streamed `crc32c`, so a corrupt leftover is never adopted as evidence
+        (`MediaStoreIntegrityError`: no rows).
         """
-        if reuse and not store.exists(loc):
+        if reuse:
+            if store.exists(loc):
+                verify_existing(store, loc, crc32c)
+                return loc
             found = store.find_key(sha)
             if found is not None:
+                verify_existing(store, found, crc32c)
                 return found
-        elif reuse:
-            return loc
         if not store.commit(temp, loc, crc32c):
+            verify_existing(store, loc, crc32c)
             ctx.log.info("media: %s already in the store; kept the existing object", sha[:12])
         return loc
 

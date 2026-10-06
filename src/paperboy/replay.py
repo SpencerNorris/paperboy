@@ -710,8 +710,9 @@ class ReplaySource:
         return found[-1] if found else None
 
     def media_store(self, run: ReplayRun) -> RunMarker | None:
-        """The run's `MediaStore` marker (#63, ADR-0008): written before the media
-        phase of a bucket run, payload `{store}`. Local runs write none."""
+        """The run's `MediaStore` marker (#63, ADR-0008): written before the first
+        store-writing phase (profiles or media) of a bucket run, payload `{store}`
+        (plus `media: false` when the run had no media phase). Local runs write none."""
         found = self._markers(run, "mediastore")
         return found[-1] if found else None
 

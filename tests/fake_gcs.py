@@ -51,11 +51,13 @@ class FakeBlob:
         if bucket.race_once:
             # Someone else created the object between our exists() and upload.
             bucket.race_once = False
-            bucket.objects[self.name] = data
+            bucket.objects[self.name] = bucket.race_data if bucket.race_data is not None else data
         if self.name in bucket.objects:
             raise PreconditionFailed("object exists")
         bucket.objects[self.name] = data
         self.crc32c = bucket.corrupt_crc or crc32c_b64(data)
+        if bucket.corrupt_crc:
+            bucket.stored_crc[self.name] = bucket.corrupt_crc
 
     def open(self, mode: str = "rb", chunk_size: int | None = None, **_: object) -> io.BytesIO:
         self._bucket.calls["open"] += 1
@@ -72,7 +74,7 @@ class FakeBucket:
     def __init__(self, name: str) -> None:
         self.name = name
         self.objects: dict[str, bytes] = {}
-        self.calls = {"exists": 0, "upload": 0, "open": 0, "list": 0, "delete": 0}
+        self.calls = {"exists": 0, "upload": 0, "open": 0, "list": 0, "delete": 0, "get_blob": 0}
         self.granted: set[str] = {"storage.objects.create", "storage.objects.get"}
         self.retention_period: int | None = 8_035_200
         self.versioning_enabled: bool | None = True
@@ -81,9 +83,20 @@ class FakeBucket:
         self.corrupt_crc: str | None = None  # server-side crc32c to report after upload
         self.upload_error: Exception | None = None
         self.race_once = False
+        self.race_data: bytes | None = None  # what the racing writer stored (default: same bytes)
+        self.stored_crc: dict[str, str] = {}  # per-object crc32c override (corrupt leftovers)
 
     def blob(self, name: str) -> FakeBlob:
         return FakeBlob(self, name)
+
+    def get_blob(self, name: str) -> FakeBlob | None:
+        """The stored object's metadata (its server-side crc32c), or `None`."""
+        self.calls["get_blob"] += 1
+        if name not in self.objects:
+            return None
+        blob = FakeBlob(self, name)
+        blob.crc32c = self.stored_crc.get(name) or crc32c_b64(self.objects[name])
+        return blob
 
     def list_blobs(self, prefix: str = "", **_: object) -> Iterator[FakeBlob]:
         self.calls["list"] += 1

@@ -1323,3 +1323,27 @@ async def test_avatar_known_locally_is_fetched_into_a_new_bucket(tmp_path, monke
         assert gw.avatar_calls == [701] and res.counts["avatars"] == 1
         assert len(client.bucket("bkt").objects) == 1
         assert st.conn.execute("select count(*) from media").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_avatar_wrong_object_in_bucket_is_not_adopted(tmp_path, monkeypatch):
+    """An object already under the avatar's key whose bytes differ is never
+    certified: no media/custody row, the avatar is counted skipped."""
+    import hashlib
+
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"jpeg-1"
+    sha = hashlib.sha256(data).hexdigest()
+    client = FakeGcsClient()
+    client.bucket("bkt").objects[f"p/x/media/{sha[:2]}/{sha}.jpg"] = b"not the avatar"
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    over = {"enrich_profiles": True, "media_store": "gs://bkt/p/x", "media_store_buckets": "bkt"}
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed_channel(st)
+        _seed_stub(st, 1)
+        gw = _enrich_gw(ids=(1,), user_photos={1: _photos(701)}, avatar={701: data})
+        res = await ProfilesCollector().collect(_ctx(st, gw, _settings(tmp_path, **over)))
+        assert res.counts["avatars"] == 0 and res.counts["skipped"] == 1
+        for table in ("media", "custody_log"):
+            assert st.conn.execute(f"select count(*) from {table}").fetchone()[0] == 0

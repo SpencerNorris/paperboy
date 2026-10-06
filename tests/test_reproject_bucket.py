@@ -105,3 +105,30 @@ def test_out_profile_copies_bucket_media_into_local_profile(tmp_path, monkeypatc
     assert _rows(db, "SELECT DISTINCT store FROM custody_log") == [("local",)]
     assert _rows(db, "SELECT count(*) FROM raw_records WHERE kind='MediaStore'") == [(0,)]
     assert client.bucket("bkt").calls["upload"] == uploads  # copying never writes to a bucket
+
+
+def test_avatar_only_bucket_run_reprojects_with_bucket_custody(tmp_path, monkeypatch):
+    """A bucket run with `profiles` but no `media` phase still records which store
+    its avatars went to, so a reproject (and a reproject of that) keeps the
+    bucket as custody and the receipt's `store` (review of #63)."""
+    from tests.test_reproject_people import run_people_collect
+
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    db = asyncio.run(run_people_collect(tmp_path, settings_over=BUCKET_OVER))
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPERBOY_MEDIA_STORE_BUCKETS", "bkt")
+    assert client.bucket("bkt").objects  # the avatar really went to the bucket
+    assert _rows(db, "SELECT DISTINCT store FROM custody_log") == [(URL,)]
+    markers = _rows(db, "SELECT payload_json FROM raw_records WHERE kind='MediaStore'")
+    assert [json.loads(m[0]) for m in markers] == [{"store": URL, "media": False}]
+
+    out = tmp_path / "default" / "paperboy.reprojected.sqlite"
+    result = runner.invoke(app, ["reproject", "--profile", "default"])
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db, out)
+    assert _rows(out, "SELECT DISTINCT store FROM custody_log") == [(URL,)]
+    receipts = _rows(out, "SELECT payload_json FROM raw_records WHERE kind='AvatarDownload'")
+    assert receipts and all(json.loads(r[0])["store"] == URL for r in receipts)
+    # The marker must not make replay invent a media phase.
+    assert _rows(out, "SELECT count(*) FROM raw_records WHERE kind='MediaDownload'") == [(0,)]
