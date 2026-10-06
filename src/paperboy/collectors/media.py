@@ -441,8 +441,9 @@ class MediaCollector:
                     loc = existing or media_key(sha, _guess_ext(kind, mime_type, file_name))
                     if replay and receipt_key is not None:
                         loc = receipt_key  # faithful to what the live run stored
+                    lost_race = False
                     if store is not None and temp is not None:
-                        loc = self._place(
+                        loc, lost_race = self._place(
                             ctx, store, temp, sha, loc, crc32c, reuse=existing is None
                         )
                     elif store is None and receipt_key is None:
@@ -499,8 +500,12 @@ class MediaCollector:
                     {"channel_id": channel_id, "msg_id": row["msg_id"]},
                     observed_at=downloaded_at,
                 )
-                counts["downloaded"] += 1
-                self._note(row["uri"], "downloaded")
+                # Spec section 2 step 3: a lost create race is a duplicate (another
+                # writer's verified object is kept), never a download. The rows above
+                # are still written: this DB had no record of the bytes.
+                outcome_key = "duplicates" if lost_race else "downloaded"
+                counts[outcome_key] += 1
+                self._note(row["uri"], "duplicate" if lost_race else "downloaded")
                 if key is not None:
                     content_index[key] = (sha, loc)
         except MediaStoreError as exc:
@@ -561,8 +566,10 @@ class MediaCollector:
         crc32c: str,
         *,
         reuse: bool,
-    ) -> str:
-        """Put the finished temp file into `store` under `loc`; return the key used.
+    ) -> tuple[str, bool]:
+        """Put the finished temp file into `store` under `loc`; return
+        `(key used, lost_race)`; `lost_race` is True when a concurrent writer
+        created the object first (counted as a duplicate by the caller).
 
         `reuse` (a brand-new sha): the bytes may already sit under that exact
         key or a legacy-suffixed one (a pre-#62 file) - reuse it rather than
@@ -574,15 +581,16 @@ class MediaCollector:
         if reuse:
             if store.exists(loc):
                 verify_existing(store, loc, crc32c)
-                return loc
+                return loc, False
             found = store.find_key(sha)
             if found is not None:
                 verify_existing(store, found, crc32c)
-                return found
+                return found, False
         if not store.commit(temp, loc, crc32c):
             verify_existing(store, loc, crc32c)
             ctx.log.info("media: %s already in the store; kept the existing object", sha[:12])
-        return loc
+            return loc, True
+        return loc, False
 
     async def _stream_one(
         self,

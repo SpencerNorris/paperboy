@@ -57,7 +57,7 @@ whole file has streamed.
   server crc32c must equal ours; with no stream (a pre-download dedup hit) a
   bucket cannot vouch for it, so the file is fetched again and checked. An
   object found instead of written (existing key, legacy-suffixed key, or a lost
-  create race) is checked the same way, so a corrupt leftover is never adopted
+  create race, which is counted as a duplicate, spec section 2 step 3) is checked the same way, so a corrupt leftover is never adopted
   as evidence. `media.sha256` stays the PK, so a file first stored
   locally is downloaded again in a bucket run, committed under the existing
   row's key, with custody and a receipt but no second `media` row.
@@ -72,9 +72,16 @@ whole file has streamed.
   asserts none is ever sent). An integrity failure logs both digests at ERROR,
   writes no rows and counts the file `skipped`; should an object nevertheless
   exist with a wrong crc32c it is left in place (no delete path) and every later
-  adoption re-checks it, so it is never certified. **Manual recovery:** compare
-  `gcloud storage hash` with `media.sha256`; the operator lifts the unlocked
-  retention and deletes by hand. Paperboy never will.
+  adoption re-checks it, so it is never certified. **Manual recovery of a corrupt
+  leftover object** (paperboy never deletes or overwrites): (1) find it in the
+  ERROR log (both digests, message id) or by running `gcloud storage hash` on
+  the object and comparing with the expected sha256 (`media.sha256` if a row
+  exists, else the sha in the receipt/log); (2) the operator, outside paperboy,
+  lifts the bucket's unlocked retention policy and removes the object (versioning
+  and soft-delete keep a recoverable copy for the soft-delete window); (3) re-run
+  the same collect: the key is free, the file is downloaded and created fresh.
+  Until then every run re-checks the object, writes no rows for it and counts the
+  file `skipped`.
 - Transport failures after the library's retries raise `MediaStoreError`,
   which stops the media phase (`PhaseStop`); a bucket outage is not per-file
   and never causes a re-download. Uploads happen outside `Budget.call`.

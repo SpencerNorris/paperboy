@@ -48,8 +48,10 @@ store. Mac first, using the operator's own Application Default Credentials.
   server's crc32c is compared with the local one afterwards. (The library's own
   `checksum="crc32c"` is not used: on a resumable upload it issues a DELETE on a
   mismatch.) The temp file is always deleted. A lost create race
-  (HTTP 412) is a duplicate, never an overwrite: the run carries on as a normal
-  download.
+  (HTTP 412) is a duplicate, never an overwrite: the other writer's object is
+  verified and kept, the rows and receipt are still written (this DB had no
+  record of the bytes), and the file is counted under `duplicates`, not
+  `downloaded`.
 - **Per-store "already have it".** `media.sha256` is the primary key, so "the
   DB has it" does not mean "this store has it". A hit (by Telegram content id,
   or by sha after download) is a duplicate only if a `custody_log` row names this
@@ -132,13 +134,16 @@ operator's scratch directory, referenced by filename).
 ### Gates (pasted tool output)
 
 ```
-$ uv run pytest -q --basetemp=<scratch>
-1081 passed in 84.42s (0:01:24)
+$ NO_COLOR=1 TERM=dumb uv run pytest -q --basetemp=<scratch>
+1085 passed in 88.01s (0:01:28)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
 0 errors, 0 warnings, 0 informations
 ```
+
+(`NO_COLOR=1`: without it, 9 CLI-help assertions fail on ANSI colour codes in
+the operator's terminal environment; that is not a code defect.)
 
 Files in scope: the name-only diff against `origin/dev/gcs-pull` lists 48 files
 (it was 46 at the first review, not 50). They are: `CLAUDE.md`, `README.md`, `docs/adr/0003-guardrails.md`,
@@ -166,6 +171,15 @@ smoke prefix. Unredacted transcripts in `<scratch>`: `L1-doctor-unredacted.txt`,
 `L2-collect-unredacted.txt`, `L3-collect-unredacted.txt`,
 `reproject-mini-unredacted.txt`, `bucket-describe-unredacted.txt`,
 `gcloud-ls-unredacted.txt`, `object-sha256-unredacted.txt`, `live-calls.log`.
+
+**Which commit the live smoke ran on.** The live smoke below ran at `fad48a2`.
+Later commits changed the upload path (server-side crc32c in object metadata,
+verify-before-adopt, avatar replay) and the lost-race count (duplicate, not
+downloaded). No second live smoke was run: the feature's cap of 3 media files in
+the retained bucket is already spent, so a re-run (which would upload again)
+would break it. The changed paths are covered offline by the fake-bucket tests
+and `tests/test_media_store_real_library.py` (the real client library against a
+stub transport, asserting create-only uploads and no DELETE).
 
 **Live Telegram invocations: 3 of 5** (L1 doctor, L2 collect, L3 collect). The
 live-call counter file holds 4 lines: the first line was written for an L1

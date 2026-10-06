@@ -193,7 +193,7 @@ async def test_store_transport_error_is_a_phase_stop_not_a_retry(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_lost_create_race_continues_as_downloaded(tmp_path, monkeypatch):
+async def test_lost_create_race_is_counted_as_a_duplicate(tmp_path, monkeypatch):
     data = b"raced"
     _, key = _key(data)
     client = FakeGcsClient()
@@ -204,7 +204,7 @@ async def test_lost_create_race_continues_as_downloaded(tmp_path, monkeypatch):
         res = await MediaCollector().collect(
             _ctx(st, FakeGateway({"media": {1: data}}), settings)
         )
-        assert res.counts["downloaded"] == 1
+        assert res.counts["duplicates"] == 1 and res.counts["downloaded"] == 0
         assert st.conn.execute("SELECT COUNT(*) FROM media").fetchone()[0] == 1
         assert _payload(st)[0]["store"] == URL
     assert client.bucket("bkt").objects == {f"p/x/{key}": data}
