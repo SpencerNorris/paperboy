@@ -439,8 +439,11 @@ A new `messages` row exists, `run_events` has `channel` and `posts` only, no
 
 Totals: 4 of 4 permitted live invocations (counter file `<scratch>/91/live-calls.log`),
 2 media files (one local, one bucket; 54 KB each), 0.1 MB. No STOP condition was
-hit; `STOP-LIVE` was never created. The smokes ran on commit `d6e96c7`;
-later commits change only documentation.
+hit; `STOP-LIVE` was never created. The transcripts above ran on code
+from before commit `4bdaa45`, which changed the live path (a post Telegram
+answers live is restored from its tombstone, and `--exclude-target` is
+re-checked on a handle-resolved channel); the re-smoke at the end of this
+section ran on the final commit.
 
 **Reproject** (offline; `PAPERBOY_DATA_DIR=<scratch>`, the bucket in
 `PAPERBOY_MEDIA_STORE_BUCKETS`, `reproject --profile default --include-target <A>
