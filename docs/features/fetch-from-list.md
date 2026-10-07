@@ -466,6 +466,88 @@ reprojected run_events [('channel', 13), ('graph', 3), ('history', 3), ('media',
 `posts` was replayed for all six fetch runs. The bucket object was read back
 read-only for the custody row.
 
+### Re-smoke on the final commit (operator-approved, 2026-10-07)
+
+Run on the branch tip `aee9e90` (after `4bdaa45`), against the scratch store only
+(no bucket write), with two more live invocations (live-call log: 6 lines) and
+one media file (a photo, 85 KB). VPN check before each call: both Telegram DCs
+routed via `utun*`. List of three rows, built in the scratch dir:
+
+```
+t.me/<A>/<id1>
+tg:msg:<A>/<id1>
+tg:msg:<B>/<id2>
+```
+
+Row 1 is a username link to a channel the store knows; row 2 names the same
+message by id; row 3 is a never-downloaded photo. Setup note: a username the
+store knows resolves offline (see "Input"), so to exercise the live handle
+route the scratch store's `channels.username` for `@<A>` was blanked first (the
+`channel` phase writes it back). The tombstone row the operator asked for could
+not be built: the scratch store holds no message row with `deleted_at` set and
+every tombstone is an `empty` answer from Telegram, so no tombstoned post was
+plausibly live. The second row above (same message as row 1) exercises the
+handle+id dedupe instead; the "tombstone cleared" path is covered by unit tests
+only.
+
+**Invocation 5** (`--max-rpc 30 --max-flood-sleep 60 --media-max-mb 1`), report:
+
+```
+line_no,uri,outcome,post,sha256,key,reason
+1,tg:msg:<A>/<id1>,no_media,fetched,,,
+2,tg:msg:<A>/<id1>,duplicate_row,skipped,,,
+3,tg:msg:<B>/<id2>,downloaded,fetched,e7c822cc9750...,media/e7/e7c822cc9750....jpg,
+```
+
+The log shows `channel access: id=<A> via=handle` (the live
+`contacts.resolveUsername`), then the posts and media phases for segment 1;
+segment 2 never ran (its only message was fetched once), and segment 3 ran
+through `via=saved_key`. 87022 bytes downloaded, 15 RPCs (four of them the start-up account checks).
+
+The `ChannelAccess` receipt (`raw_records`) carries `via: handle`,
+`granted: true`, `handle: @<A>`. The `--exclude-target` re-check on the resolved
+channel excluded nothing (none was passed).
+
+**Invocation 6** (same command, re-run), report:
+
+```
+line_no,uri,outcome,post,sha256,key,reason
+1,tg:msg:<A>/<id1>,no_media,fetched,,,
+2,tg:msg:<A>/<id1>,duplicate_row,skipped,,,
+3,tg:msg:<B>/<id2>,already_stored,fetched,e7c822cc9750...,media/e7/e7c822cc9750....jpg,
+```
+
+0 bytes downloaded, 12 RPCs: the posts were fetched again, the media was
+`already_stored`. Both channel-access receipts were `via=saved_key` (row 1 now
+resolved offline, since invocation 5 wrote the username back).
+
+File check: `sha256` of the stored file equals `media.sha256` (`e7c822cc9750...`),
+and `media.size` is 87022 = the file's size.
+
+**Reproject** (offline, `reproject --profile default --include-target <A>
+--include-target <B> --include-target <C> --out <scratch>/reprojected-3.sqlite`),
+source vs output for the three channels:
+
+```
+messages                       source   31241 reprojected   31241 equal
+message_revisions              source   31246 reprojected   31246 equal
+message_metrics                source   31217 reprojected   31217 equal
+message_tombstones             source    2339 reprojected    2339 equal
+media(re-smoke msg)            source       1 reprojected       1 equal
+custody(re-smoke msg)          source       1 reprojected       1 equal
+tombstone <B>/<id>             source       2 reprojected       2 equal
+source run_events      [('channel', 17), ('graph', 3), ('history', 3), ('media', 12), ('participants', 6), ('posts', 10), ('profiles', 9)]
+reprojected run_events [('channel', 17), ('graph', 3), ('history', 3), ('media', 12), ('participants', 6), ('posts', 10), ('profiles', 9)]
+```
+
+The `posts` phase replayed for all ten fetch runs (six from the earlier smokes
+plus two segments in each of these two invocations). A wider media count over all
+three channels differs (source 50, output 2). The 48 missing rows are `@<C>`
+downloads from an older plain media run (2026-09-24/26) whose raw rows carry no
+`MediaSelection` marker; the earlier reproject of this store (before this
+re-smoke) also produced none of them, so the gap predates `fetch-from-list` and
+is not touched by it.
+
 ### Docs updated
 
 `docs/features/fetch-from-list.md` (renamed from `fetch-media.md`, rewritten),
