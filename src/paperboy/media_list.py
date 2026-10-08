@@ -26,13 +26,17 @@ from __future__ import annotations
 import csv
 import json
 import re
-import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from paperboy.collectors.media import DOWNLOADABLE_KINDS, content_key, recorded_size
+from paperboy.collectors.media import (
+    DOWNLOADABLE_KINDS,
+    content_key,
+    load_content_index,
+    recorded_size,
+)
 from paperboy.ids import msg_uri, parse_uri
 from paperboy.media_store import MediaStore, stored_in
 from paperboy.store.channels import find_channel_id
@@ -188,25 +192,35 @@ class ClassifiedRow:
     needs_resolve: bool = False
 
 
-def _global_indexes(store: Store) -> tuple[dict[tuple[str, int], tuple[str, str]], set[str]]:
-    """`content_key -> (sha256, path)` over EVERY stored file, and the set of
-    message uris that already have a `media`/`custody_log` record."""
-    index: dict[tuple[str, int], tuple[str, str]] = {}
-    for r in store.conn.execute(
-        "SELECT media.sha256 AS sha256, media.path AS path, messages.media_json AS mj "
-        "FROM media JOIN messages ON media.message_uri = messages.uri"
+_GROUP_KINDS = frozenset({"megagroup", "forum"})
+
+
+def linked_discussion_groups(store: Store, channel_id: int) -> set[int]:
+    """The discussion groups that follow `channel_id` into an exclusion: channels
+    joined to it by a `linked_group` edge stored in EITHER direction (Telegram's
+    `linked_chat_id` is bidirectional, so the edge points from whichever side was
+    collected), kept only when the other end is not a broadcast channel. One-way
+    by rule (#70): excluding a parent excludes its group; excluding only a group
+    never excludes its parent. A channel that is itself a group has no followers."""
+    row = store.conn.execute("SELECT kind FROM channels WHERE id = ?", (channel_id,)).fetchone()
+    if row is not None and row["kind"] in _GROUP_KINDS:
+        return set()
+    uri = f"tg:channel:{channel_id}"
+    linked: set[int] = set()
+    for edge in store.conn.execute(
+        "SELECT subject_uri, object_uri FROM edges WHERE predicate = 'linked_group' "
+        "AND (subject_uri = ? OR object_uri = ?)", (uri, uri),
     ):
-        key = content_key(json.loads(r["mj"])) if r["mj"] else None
-        if key is not None:
-            index[key] = (r["sha256"], r["path"])
-    uris = {
-        r[0] for r in store.conn.execute(
-            "SELECT message_uri FROM media WHERE message_uri IS NOT NULL "
-            "UNION SELECT source_message_uri FROM custody_log "
-            "WHERE source_message_uri IS NOT NULL"
-        )
-    }
-    return index, uris
+        for other in (edge["subject_uri"], edge["object_uri"]):
+            kind, (other_id,) = parse_uri(other)
+            if kind != "channel" or other_id == channel_id:
+                continue
+            other_row = store.conn.execute(
+                "SELECT kind FROM channels WHERE id = ?", (other_id,)
+            ).fetchone()
+            if other_row is None or other_row["kind"] != "broadcast":
+                linked.add(other_id)  # a group, or one not collected yet (cannot tell)
+    return linked
 
 
 def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
@@ -230,42 +244,37 @@ def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
         if channel_id is None:
             raise MediaListError(f"--exclude-target {spec!r}: no such channel in this store")
         ids.add(channel_id)
-        for edge in store.conn.execute(
-            "SELECT object_uri FROM edges WHERE subject_uri = ? AND predicate = 'linked_group'",
-            (f"tg:channel:{channel_id}",),
-        ):
-            kind, (group_id,) = parse_uri(edge["object_uri"])
-            if kind == "channel":
-                ids.add(group_id)
+        ids |= linked_discussion_groups(store, channel_id)
     return frozenset(ids)
 
 
-def _known_files(
-    store: Store, uri: str, content: tuple[str, str] | None
-) -> list[tuple[str, str]]:
-    """Every `(sha256, key)` the database associates with this message: the file
-    its content id resolves to, its own `media` row, and its custody sightings."""
-    found: list[tuple[str, str]] = [] if content is None else [content]
-    for r in store.conn.execute(
-        "SELECT sha256, path FROM media WHERE message_uri = ? "
-        "UNION SELECT sha256, path FROM custody_log WHERE source_message_uri = ?",
-        (uri, uri),
-    ):
-        pair = (r["sha256"], r["path"])
-        if pair not in found:
-            found.append(pair)
-    return found
+def held_file(
+    store: Store,
+    media_store: MediaStore,
+    media_kind: str | None,
+    media_json: str | None,
+    index: dict[tuple[str, int], tuple[str, str]],
+) -> tuple[str, str] | None:
+    """`(sha256, media key)` of the file for a message's CURRENT media when THIS
+    run's store already holds it, else `None` (nothing to download, or it must
+    be downloaded into this store, #63).
 
-
-def _held_by_store(
-    conn: sqlite3.Connection, media_store: MediaStore, files: list[tuple[str, str]]
-) -> bool:
-    """Whether the run's store already holds one of `files`. A custody row naming
-    the store answers offline; otherwise one existence check per file (a bucket
+    Judged by the content key of the media as the message row stores it now - the
+    caller reads the row after the posts phase has refreshed it - and the file a
+    custody sighting recorded for that very content (`load_content_index`), never
+    by what an older version of the post once downloaded (#91). A custody row
+    naming the store answers offline; otherwise one existence check (a bucket
     dry run therefore touches GCS - metadata GETs - but never Telegram)."""
-    if any(stored_in(conn, sha, media_store.store_id) for sha, _ in files):
-        return True
-    return any(media_store.exists(key) for _, key in files)
+    if (media_kind or "").lower() not in DOWNLOADABLE_KINDS or not media_json:
+        return None
+    key = content_key(json.loads(media_json))
+    file = index.get(key) if key is not None else None
+    if file is None:
+        return None
+    sha, path = file
+    if stored_in(store.conn, sha, media_store.store_id) or media_store.exists(path):
+        return file
+    return None
 
 
 def classify_rows(
@@ -282,7 +291,7 @@ def classify_rows(
     addressable row. The flags say what the store already holds: `in_store`,
     `media_held` (THIS run's `media_store` has the file, #63), `needs_resolve`.
     No Telegram, no gateway; a bucket store is asked for metadata."""
-    index, stored_uris = _global_indexes(store)
+    index = load_content_index(store.conn)
     usernames = {
         r["username"].lower(): r["id"]
         for r in store.conn.execute("SELECT id, username FROM channels WHERE username IS NOT NULL")
@@ -315,20 +324,10 @@ def classify_rows(
             out.append(ClassifiedRow(row, "pending", uri, channel_id))
             continue
         media = json.loads(msg["media_json"]) if msg["media_json"] else {}
-        declared = recorded_size(media)
-        held = False
-        hint = None
-        if (msg["media_kind"] or "").lower() in DOWNLOADABLE_KINDS:
-            key = content_key(media)
-            hint = index.get(key) if key is not None else None
-            if uri in stored_uris or hint is not None:
-                files = _known_files(store, uri, hint)
-                # If the database knows the file but this run's store does not,
-                # the media phase downloads it again into this store.
-                held = _held_by_store(store.conn, media_store, files)
+        stored = held_file(store, media_store, msg["media_kind"], msg["media_json"], index)
         out.append(ClassifiedRow(
-            row, "pending", uri, channel_id, declared, hint if held else None,
-            in_store=True, media_held=held,
+            row, "pending", uri, channel_id, recorded_size(media), stored,
+            in_store=True, media_held=stored is not None,
         ))
     return out
 
@@ -353,13 +352,6 @@ class Segment:
     def msg_ids(self) -> list[int]:
         """Every listed id: all of them are fetched, stored or not."""
         return sorted({c.row.msg_id for c in self.rows})
-
-    @property
-    def media_ids(self) -> list[int]:
-        """The ids the media phase walks: those whose file this run's store does
-        not already hold. Walking a held row would add a `duplicate` custody row
-        per re-run."""
-        return sorted({c.row.msg_id for c in self.rows if not c.media_held})
 
     @property
     def address(self) -> int | str:

@@ -63,6 +63,8 @@ from paperboy.media_store import (
 from paperboy.store.db import dumps
 
 if TYPE_CHECKING:
+    import sqlite3
+
     from paperboy.targets import Target
 
 # Telethon's `to_dict()` uses the PascalCase TL class name ("MessageMediaPhoto",
@@ -134,6 +136,38 @@ def content_key(media: dict) -> tuple[str, int] | None:
         did = doc.get("id")
         return ("document", did) if did is not None else None
     return None
+
+
+def content_key_text(key: tuple[str, int]) -> str:
+    """`content_key` as stored in `custody_log.content_key` (`photo:<id>`)."""
+    return f"{key[0]}:{key[1]}"
+
+
+def load_content_index(
+    conn: sqlite3.Connection, channel_id: int | None = None
+) -> dict[tuple[str, int], tuple[str, str]]:
+    """`content_key -> (sha256, media key)` for every file a custody sighting
+    recorded under that content (the newest sighting wins). Keyed by the content
+    the sighting was FOR (`custody_log.content_key`), never by the message's
+    current media_json: a post edited to a different photo must not inherit the
+    file of the old one (#91). A sighting with no recorded key (an edited
+    message backfilled by migration 0008, an avatar) is simply absent: its
+    content is fetched again. `channel_id` limits the index to one channel's
+    messages (the media phase); `None` spans every channel (`fetch-from-list`)."""
+    sql = (
+        "SELECT c.content_key AS content_key, c.sha256 AS sha256, media.path AS path "
+        "FROM custody_log c JOIN media ON media.sha256 = c.sha256 "
+    )
+    params: tuple[object, ...] = ()
+    if channel_id is not None:
+        sql += "JOIN messages m ON m.uri = c.source_message_uri AND m.channel_id = ? "
+        params = (channel_id,)
+    sql += "WHERE c.content_key IS NOT NULL ORDER BY c.id"
+    index: dict[tuple[str, int], tuple[str, str]] = {}
+    for r in conn.execute(sql, params):
+        kind, _, ident = r["content_key"].partition(":")
+        index[(kind, int(ident))] = (r["sha256"], r["path"])
+    return index
 
 
 def recorded_size(media: dict) -> int | None:
@@ -358,7 +392,7 @@ class MediaCollector:
                         # fresh download (D3) — its own `first_seen` is the
                         # observation, not "now".
                         self._record_custody(
-                            ctx, path, sha, row["uri"], row["first_seen"], store_id
+                            ctx, path, sha, row["uri"], row["first_seen"], store_id, key
                         )
                         counts["duplicates"] += 1
                         self._note(row["uri"], "duplicate")
@@ -427,7 +461,7 @@ class MediaCollector:
                         # and this store already has them. Same D3 rationale as the
                         # content_index hit above.
                         self._record_custody(
-                            ctx, existing, sha, row["uri"], row["first_seen"], store_id
+                            ctx, existing, sha, row["uri"], row["first_seen"], store_id, key
                         )
                         counts["duplicates"] += 1
                         self._note(row["uri"], "duplicate")
@@ -494,7 +528,7 @@ class MediaCollector:
                             loc, downloaded_at,
                         ),
                     )
-                self._record_custody(ctx, loc, sha, row["uri"], downloaded_at, store_id)
+                self._record_custody(ctx, loc, sha, row["uri"], downloaded_at, store_id, key)
                 ctx.store.add_raw(
                     "MediaDownload", raw_payload, ctx.tier,
                     {"channel_id": channel_id, "msg_id": row["msg_id"]},
@@ -642,24 +676,11 @@ class MediaCollector:
         self, ctx: CollectContext, channel_id: int
     ) -> dict[tuple[str, int], tuple[str, str]]:
         """`content_key -> (sha256, media key)` (ADR-0007: relative to the profile
-        dir) for every file already downloaded for this channel — seeded from
-        persisted state, so dedup works across separate `collect` runs, not
-        just within one.
-        """
-        rows = ctx.store.conn.execute(
-            "SELECT media.sha256 AS sha256, media.path AS path, "
-            "messages.media_json AS media_json "
-            "FROM media JOIN messages ON media.message_uri = messages.uri "
-            "WHERE messages.channel_id = ?",
-            (channel_id,),
-        ).fetchall()
-        index: dict[tuple[str, int], tuple[str, str]] = {}
-        for r in rows:
-            media = json.loads(r["media_json"]) if r["media_json"] else {}
-            key = content_key(media)
-            if key is not None:
-                index[key] = (r["sha256"], r["path"])
-        return index
+        dir) for every file already downloaded for this channel - seeded from
+        persisted custody, so dedup works across separate `collect` runs, not
+        just within one. See `load_content_index` for why the key comes from the
+        sighting, not from the message's current media."""
+        return load_content_index(ctx.store.conn, channel_id)
 
     def _lookup_by_sha(self, ctx: CollectContext, sha: str) -> str | None:
         row = ctx.store.conn.execute("SELECT path FROM media WHERE sha256=?", (sha,)).fetchone()
@@ -673,9 +694,14 @@ class MediaCollector:
         message_uri: str,
         recorded_at: str,
         store_id: str,
+        content: tuple[str, int] | None,
     ) -> None:
         ctx.store.conn.execute(
-            "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri, store) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (key, sha, recorded_at, message_uri, store_id),
+            "INSERT INTO custody_log "
+            "(path, sha256, recorded_at, source_message_uri, store, content_key) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                key, sha, recorded_at, message_uri, store_id,
+                content_key_text(content) if content is not None else None,
+            ),
         )
