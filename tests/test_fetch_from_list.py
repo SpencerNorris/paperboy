@@ -134,10 +134,10 @@ async def test_end_to_end_two_channels_two_tiers(tmp_path):
         markers = st.conn.execute(
             "SELECT run_id FROM raw_records WHERE kind='ChannelContextReused'"
         ).fetchall()
-        # Each segment's media run reuses the channel its posts run established
-        # (4), and the two P2 segments' posts runs reuse the P1 context (2).
-        assert len(markers) == 6
-        assert len({m["run_id"] for m in markers}) == 6
+        # A channel is established ALONE once (2 runs); every segment's posts run
+        # (4) and media run (4) then reuse that context.
+        assert len(markers) == 8
+        assert len({m["run_id"] for m in markers}) == 8
         rows = _report(report)
         assert [r["line_no"] for r in rows] == ["2", "3", "4", "5", "6"]
         assert [r["outcome"] for r in rows] == ["downloaded"] * 5
@@ -308,10 +308,11 @@ async def test_live_collector_list_is_the_standard_one(tmp_path, monkeypatch):
             _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
-    # Per segment: the channel and the posts, then (once the posts are stored and
-    # the files this run's store lacks are known) the media phase alone.
+    # A channel is established alone, first; per segment the posts, then (once
+    # the posts are stored and the files this run's store lacks are known) the
+    # media phase alone.
     assert seen and all(
-        [type(c) for c in cs] in ([ChannelCollector, PostsCollector], [MediaCollector])
+        [type(c) for c in cs] in ([ChannelCollector], [PostsCollector], [MediaCollector])
         for cs in seen
     )
     assert {type(c) for cs in seen for c in cs} == {
@@ -886,3 +887,206 @@ def test_excluding_only_a_group_does_not_exclude_its_parent_channel(tmp_path, su
         assert excluded == {77}
         assert excluded_channel_ids(st, ["@chan_group"]) == {77}
         assert excluded_channel_ids(st, ["@chan_a"]) == {10, 77}
+
+
+# ── a same-channel repost keeps its own custody row; only the download is skipped ──
+
+
+@pytest.mark.asyncio
+async def test_repost_in_a_later_segment_writes_its_own_custody_row(tmp_path):
+    """Posts 10/1 (P1) and 10/2 (P2) carry the SAME photo. The file is downloaded
+    once, but every sighting - where and when the file appeared - keeps a custody
+    row naming the content, exactly as `collect`'s media phase writes one."""
+    gw = _gateway(
+        {1: b"same", 2: b"same"},
+        get_messages={1: _photo_msg(1, 555), 2: _photo_msg(2, 555)},
+    )
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        classified = _classified(st, tmp_path, "uri,priority\ntg:msg:10/1,P1\ntg:msg:10/2,P2\n")
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+        assert summary.complete and gw.download_media_calls == [1]  # one download
+        assert [(r["uri"], r["outcome"]) for r in _report(report)] == [
+            ("tg:msg:10/1", "downloaded"), ("tg:msg:10/2", "duplicate"),
+        ]
+        custody = st.conn.execute(
+            "select source_message_uri, content_key from custody_log order by id"
+        ).fetchall()
+        assert [(r[0], r[1]) for r in custody] == [
+            ("tg:msg:10/1", "photo:555"), ("tg:msg:10/2", "photo:555"),
+        ]
+        # A re-run adds nothing: both sightings are already recorded.
+        again = _classified(st, tmp_path, "tg:msg:10/1\ntg:msg:10/2\n")
+        gw2 = _gateway({}, get_messages={1: _photo_msg(1, 555), 2: _photo_msg(2, 555)})
+        await fetch_from_list(
+            gw2, st, _settings(tmp_path), again, LOG, profile="p",
+            report_path=tmp_path / "r2.csv",
+        )
+        assert gw2.download_media_calls == []
+        assert st.conn.execute("select count(*) from custody_log").fetchone()[0] == 2
+
+
+# ── a cross-channel repost is reported as stored, never walked (ADR-0009, #95) ──
+
+
+def _doc_msg(mid, doc_id, size=2_000_000):
+    return {"_": "message", "id": mid, "message": "", "date": 1767322445,
+            "media": {"_": "MessageMediaDocument", "document": {
+                "_": "Document", "id": doc_id, "access_hash": 1, "size": size,
+                "mime_type": "video/mp4", "attributes": []}}}
+
+
+@pytest.mark.asyncio
+async def test_cross_channel_repost_is_already_stored_without_download_or_custody(tmp_path):
+    """10/1 holds photo 1001. 20/11 carries the same photo: nothing is downloaded,
+    no custody row is written for it, the report names the holding file, and a
+    re-run changes nothing."""
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(
+            _gateway({1: b"same-bytes"}, get_messages={1: _photo_msg(1, 1001)}),
+            st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        (held,) = _report(tmp_path / "r0.csv")
+        assert held["outcome"] == "downloaded"
+        for n in (1, 2):  # the run, then its re-run
+            gw = _gateway({11: b"same-bytes"}, get_messages={11: _photo_msg(11, 1001)})
+            await fetch_from_list(
+                gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:20/11\n"), LOG,
+                profile="p", report_path=tmp_path / f"r{n}.csv",
+            )
+            (row,) = _report(tmp_path / f"r{n}.csv")
+            assert gw.download_media_calls == []
+            assert (row["outcome"], row["sha256"], row["key"]) == (
+                "already_stored", held["sha256"], held["key"],
+            )
+            assert st.conn.execute(
+                "select count(*) from custody_log where source_message_uri = 'tg:msg:20/11'"
+            ).fetchone()[0] == 0
+        assert st.conn.execute("select count(*) from custody_log").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_channel_repost_is_never_too_large(tmp_path):
+    """The cross-channel decision is made before any size cap: with
+    `--media-max-mb 1` the repost of a 2 MB file is `already_stored`, not
+    `too_large`."""
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(
+            _gateway({1: b"v" * 2_000_000}, get_messages={1: _doc_msg(1, 5005)}),
+            st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        capped = _settings(tmp_path).model_copy(update={"media_max_mb": 1})
+        gw = _gateway({11: b"v" * 2_000_000}, get_messages={11: _doc_msg(11, 5005)})
+        await fetch_from_list(
+            gw, st, capped, _classified(st, tmp_path, "tg:msg:20/11\n"), LOG,
+            profile="p", report_path=tmp_path / "r1.csv",
+        )
+        (row,) = _report(tmp_path / "r1.csv")
+        assert row["outcome"] == "already_stored" and gw.download_media_calls == []
+
+
+# ── exclusion is decided on the channel as Telegram reports it (fail-closed) ──
+
+
+@pytest.mark.asyncio
+async def test_group_of_an_excluded_parent_without_a_stored_edge_is_not_fetched(tmp_path):
+    """P (10) is excluded. The store has a saved key for its discussion group G
+    (77) but no `linked_group` edge yet; only G's `ChatFull` says
+    `linked_chat_id = 10`. G's channel is established ALONE first, the edge is
+    recorded, and only then is exclusion decided: no `getMessages`, no download."""
+    from paperboy.media_list import excluded_channel_ids
+
+    g_chat = {"_": "channel", "id": 77, "access_hash": 770, "title": "G", "megagroup": True}
+    g_full = {
+        "_": "messages.chatFull",
+        "full_chat": {"_": "channelFull", "id": 77, "participants_count": 1, "pts": 1,
+                      "linked_chat_id": 10},
+        "chats": [g_chat], "users": [],
+    }
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        seed_channel(st, 10, "chan_a", access_hash=100)
+        seed_channel(st, 77, None, access_hash=770, megagroup=True)
+        excluded = excluded_channel_ids(st, ["@chan_a"])
+        assert excluded == {10}  # no edge yet: the group is not known to follow
+        gw = _gateway(
+            {5: b"g5"}, get_messages={5: _photo_msg(5, 7705)},
+            full_channel_by_id={77: g_full, 10: _full(10, "chan_a")},
+        )
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:77/5\n"), LOG,
+            profile="p", report_path=report, excluded_ids=excluded,
+        )
+    assert summary.complete
+    assert "get_messages" not in gw.calls and gw.download_media_calls == []
+    (row,) = _report(report)
+    assert (row["outcome"], row["post"]) == ("excluded", "skipped")
+
+
+# ── --no-media describes the post as stored now ──
+
+
+@pytest.mark.asyncio
+async def test_no_media_edited_post_is_post_only_without_the_old_file(tmp_path):
+    """A post held as file A and edited to photo B: under `--no-media` nothing is
+    downloaded, and the row is `post_only` with no sha - not `already_stored`
+    with A."""
+    one = "tg:msg:10/1\n"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(
+            _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path, one), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        gw = _edited_scenario_gateway({})
+        await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, one), LOG,
+            profile="p", report_path=tmp_path / "r1.csv", with_media=False,
+        )
+        (row,) = _report(tmp_path / "r1.csv")
+        assert (row["outcome"], row["post"], row["sha256"], row["key"]) == (
+            "post_only", "fetched", "", "",
+        )
+        assert gw.download_media_calls == []
+
+
+@pytest.mark.asyncio
+async def test_posts_stop_after_partial_batches_still_reports_the_fetched_rows(tmp_path):
+    """101 listed ids = two `getMessages` batches; the second hits a FLOOD_WAIT over
+    the ceiling. The 100 rows of the first batch were stored, and their report
+    describes the stored posts (edited to new photos: `post_only`, no sha) rather
+    than the offline classification; the 101st stays `not_attempted`."""
+    from paperboy.budget import PhaseStop
+
+    ids = range(1, 102)
+    gw = _gateway(
+        {}, get_messages={i: _photo_msg(i, 90_000 + i) for i in ids},
+        get_messages_errors=[None, PhaseStop("flood wait 3600s")],
+    )
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        seed_channel(st, 10, "chan_a", access_hash=100)
+        for i in ids:
+            seed_msg(st, 10, i, photo_id=7)  # every post is photo 7 ...
+        await fetch_from_list(  # ... whose file a first run stores: all rows look held
+            _gateway({1: b"seven"}, get_messages={1: _photo_msg(1, 7)}), st,
+            _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        classified = _classified(st, tmp_path, "".join(f"tg:msg:10/{i}\n" for i in ids))
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG,
+            profile="p", report_path=report, with_media=False,
+        )
+    assert not summary.complete and "posts phase_stop" in (summary.stop_reason or "")
+    rows = _report(report)
+    assert [r["outcome"] for r in rows[:100]] == ["post_only"] * 100
+    assert {r["sha256"] for r in rows[:100]} == {""}
+    assert rows[100]["outcome"] == "not_attempted"

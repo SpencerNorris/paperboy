@@ -200,6 +200,10 @@ def test_0008_backfills_custody_content_key_only_where_certain(tmp_path):
                 "(message_uri, observed_at, content_hash, media_json) values (?, 't', ?, ?)",
                 (uri, f"{uri}{pid}{fref}", photo(pid, fref)),
             )
+        conn.execute(  # the file 'ab' was stored for message 1/1
+            "insert into media (sha256, message_uri, kind, size, path, downloaded_at) "
+            "values ('ab', 'tg:msg:1/1', 'photo', 1, 'media/ab/x', 'now')"
+        )
         for uri in ("tg:msg:1/1", "tg:msg:1/2", None):
             conn.execute(
                 "insert into custody_log (path, sha256, recorded_at, source_message_uri) "
@@ -211,3 +215,48 @@ def test_0008_backfills_custody_content_key_only_where_certain(tmp_path):
             r[0] for r in conn.execute("select content_key from custody_log order by id")
         ]
         assert keys == ["photo:100", None, None]
+
+
+def test_0008_does_not_stamp_a_dedup_sighting_of_a_file_stored_for_an_edited_post(tmp_path):
+    """The pre-0008 index filed a file under its message's CURRENT media. Post P was
+    downloaded as photo 1001 (file A) and later edited to 2002; Q, stable on 2002,
+    then got a dedup sighting naming A. A is NOT photo 2002's file, so Q's sighting
+    must stay NULL (unknown), though Q itself never changed (#91, review F4)."""
+    import json as _json
+
+    from paperboy.store.db import _MIGRATIONS_DIR
+
+    def photo(pid):
+        return _json.dumps(
+            {"_": "MessageMediaPhoto", "photo": {"_": "Photo", "id": pid}}
+        )
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        conn = st.conn
+        for uri, mid, pid in (("tg:msg:1/1", 1, 2002), ("tg:msg:1/2", 2, 2002)):
+            conn.execute(
+                "insert into messages (uri, channel_id, msg_id, media_json, media_kind, "
+                "content_hash, first_seen, last_seen) "
+                "values (?, 1, ?, ?, 'MessageMediaPhoto', 'h', 't', 't')",
+                (uri, mid, photo(pid)),
+            )
+        # P (1/1) was photo 1001, then edited to 2002; Q (1/2) was always 2002.
+        for uri, pid in (("tg:msg:1/1", 1001), ("tg:msg:1/1", 2002), ("tg:msg:1/2", 2002)):
+            conn.execute(
+                "insert into message_revisions "
+                "(message_uri, observed_at, content_hash, media_json) values (?, 't', ?, ?)",
+                (uri, f"{uri}{pid}", photo(pid)),
+            )
+        conn.execute(  # file A, downloaded for P while it was photo 1001
+            "insert into media (sha256, message_uri, kind, size, path, downloaded_at) "
+            "values ('aa', 'tg:msg:1/1', 'photo', 1, 'media/aa/x', 'now')"
+        )
+        for uri in ("tg:msg:1/1", "tg:msg:1/2"):  # P's download, Q's dedup hit
+            conn.execute(
+                "insert into custody_log (path, sha256, recorded_at, source_message_uri) "
+                "values ('media/aa/x', 'aa', 'now', ?)", (uri,),
+            )
+        conn.execute("alter table custody_log drop column content_key")
+        conn.executescript((_MIGRATIONS_DIR / "0008_custody_content_key.sql").read_text())
+        assert [r[0] for r in conn.execute(
+            "select content_key from custody_log order by id")] == [None, None]
