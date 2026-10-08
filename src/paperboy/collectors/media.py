@@ -463,6 +463,24 @@ class MediaCollector:
                         self._record_custody(
                             ctx, existing, sha, row["uri"], row["first_seen"], store_id, key
                         )
+                        # The bytes WERE fetched (that is how the match was found),
+                        # so the same receipt a download leaves records it: replay
+                        # has no other trace of this custody row, and without a
+                        # receipt `reproject` would silently drop it (#91 review).
+                        # Same observed_at as the custody row (the message's
+                        # `first_seen`), so replay reproduces `recorded_at`.
+                        dup_payload = {
+                            "sha256": sha, "kind": kind, "size": received,
+                            "mime_type": mime_type, "file_name": file_name,
+                            "path": existing, "message_uri": row["uri"],
+                        }
+                        if store_id != LOCAL_STORE_ID:
+                            dup_payload["store"] = store_id
+                        ctx.store.add_raw(
+                            "MediaDownload", dup_payload, ctx.tier,
+                            {"channel_id": channel_id, "msg_id": row["msg_id"]},
+                            observed_at=row["first_seen"],
+                        )
                         counts["duplicates"] += 1
                         self._note(row["uri"], "duplicate")
                         if key is not None:

@@ -3,14 +3,17 @@ their media (#68, extended by #91).
 
 The list is classified offline (`media_list.classify_rows`), the rows still
 `pending` are grouped into `(priority, channel)` segments, and each segment is
-one ordinary `collect_channel` pass over the `channel`, `posts` and `media`
-collectors: `posts` fetches EVERY listed id of the segment by
-`channels.getMessages` and projects it through the same code `history` uses
-(already-stored posts are re-fetched, so edits and counters are current), and
-`media` then walks the ids whose file the run's store does not hold yet - so
-budget, guardrails, dedup, custody, streaming and `--media-max-mb` all apply
-unchanged, and `reproject` replays a segment as it would any other run
-(ADR-0005).
+a few ordinary `collect_channel` runs over the standard collectors. A channel
+is first established ALONE (`channel`; once per command), and only then is
+`--exclude-target` applied to it - a group of an excluded parent can be
+recognised only by the `ChatFull` it reports. Then run 1 is `posts`, which
+fetches EVERY listed id of the segment by `channels.getMessages` and projects
+it through the same code `history` uses (already-stored posts are re-fetched,
+so edits and counters are current), and run 2 is `media`, over the ids the
+fresh posts show to need it (`_media_ids_after_posts`; skipped by `--no-media`
+or when nothing needs it). Budget, guardrails, dedup, custody, streaming and
+`--media-max-mb` all apply unchanged, and `reproject` replays every run as it
+would any other (ADR-0005).
 
 One gateway (one MTProto session, one `Budget`) serves the whole command. A
 segment targets its channel BY ID (`parse_target(str(channel_id))`), so the
@@ -19,7 +22,7 @@ key, from-message, verified stored handle) and records a `ChannelAccess`
 receipt. The one exception is a handle row whose channel the store has never
 seen: it has no id to address, so the segment targets the handle and the
 channel is resolved live, through the same phase (route `handle`, recorded as a
-receipt). A channel is established once: later segments of it reuse the
+receipt). A channel is established once: its later runs reuse the
 `ChannelContext` and append a `ChannelContextReused` marker instead of
 re-running `channel`.
 
@@ -243,7 +246,8 @@ async def _run_segments(
     # (`contacts.resolveUsername` is flood-limited, and a channel is established
     # once per command).
     resolved_handles: dict[str, int] = {}
-    media_store = build_media_store(settings, profile) if with_media else None
+    # Also under --no-media: the report says whether the run's store holds a file.
+    media_store = build_media_store(settings, profile)
     excluded = set(excluded_ids)
     # (channel_id, msg_id) of every row already given to a segment: a row that
     # names the same message through another form (a handle and a `tg:msg:`) is
@@ -299,6 +303,33 @@ async def _run_segments(
                 if r.outcome == "not_attempted":
                     r.outcome, r.reason = "excluded", EXCLUDED_REASON
             continue
+        if cid not in contexts:
+            # An id row: establish the channel ALONE first, exactly as a handle
+            # row does, and only then decide exclusion. A group of an excluded
+            # parent is recognisable only from the `ChatFull` it reports
+            # (`linked_chat_id`), recorded by this phase as a `linked_group`
+            # edge; fetching posts in the same run would be fail-open. The
+            # channel's own metadata is therefore stored even for a channel
+            # that turns out to be excluded (docs: "Exclusion").
+            phase_results, established = await collect_channel_with_context(
+                gateway, store, settings, parse_target(str(cid)), ["channel"], log,
+                collectors=[ChannelCollector()], profile=profile,
+            )
+            stop = _stop_check(phase_results, ("channel",), label, log)
+            if stop is not None and stop[0] == "end":
+                return stop[1]
+            if stop is not None or established is None:
+                reason = stop[1] if stop else "the channel could not be established"
+                dead_channels[address] = dead_channels[cid] = reason
+                _mark_no_access(seg_rows, reason)
+                continue
+            contexts[cid] = established
+            if _excludes(store, excluded, cid):
+                log.info("%s: channel %s turned out to be excluded", label, cid)
+                for r in seg_rows:
+                    if r.outcome == "not_attempted":
+                        r.outcome, r.reason = "excluded", EXCLUDED_REASON
+                continue
         for r in list(seg_rows):
             key = (cid, r.classified.row.msg_id)
             if key in claimed:
@@ -320,24 +351,25 @@ async def _run_segments(
         target = parse_target(str(cid))
         end_reason: str | None = None
         stop: tuple[str, str] | None = None
+        refreshed = False
         try:
-            # Step 1: the channel and the posts. Media eligibility depends on
-            # what the posts phase just stored, so it is decided only now.
-            phase_results, established = await collect_channel_with_context(
-                gateway, store, seg_settings, target, ["channel", "posts"], log,
-                collectors=[ChannelCollector(), PostsCollector(outcomes=post_outcomes)],
-                profile=profile, channel_context=contexts.get(cid),
+            # Run 1: the posts. Media eligibility depends on what they just
+            # stored, so it is decided only now.
+            phase_results, _ = await collect_channel_with_context(
+                gateway, store, seg_settings, target, ["posts"], log,
+                collectors=[PostsCollector(outcomes=post_outcomes)],
+                profile=profile, channel_context=contexts[cid],
             )
-            stop = _stop_check(phase_results, ("channel", "posts"), label, log)
+            stop = _stop_check(phase_results, ("posts",), label, log)
             if stop is not None and stop[0] == "end":
                 end_reason = stop[1]
             elif stop is None:
-                if established is not None:
-                    contexts.setdefault(cid, established)
-                if media_store is not None and cid in contexts:
+                media_ids = _refresh_rows(store, media_store, cid, seg_rows, post_outcomes)
+                refreshed = True
+                if with_media and media_ids:
                     end_reason = await _run_media_step(
-                        gateway, store, seg_settings, seg, seg_rows, cid, contexts[cid],
-                        post_outcomes, media_outcomes, media_store, log, profile, label,
+                        gateway, store, seg_settings, media_ids, cid, contexts[cid],
+                        media_outcomes, log, profile, label,
                     )
         except MediaStoreError as exc:
             log.warning("%s: cannot reach the media store: %s; ending the command", label, exc)
@@ -345,7 +377,14 @@ async def _run_segments(
         finally:
             # Merge even when an unexpected error escapes mid-segment: rows the
             # posts/media phases already finished and recorded must be reported
-            # as such, not left `not_attempted`.
+            # as such, not left `not_attempted`. Rows of a posts run that
+            # stopped after some batches are refreshed too: their report must
+            # describe the post as stored now, not as classified offline.
+            if not refreshed:
+                try:
+                    _refresh_rows(store, media_store, cid, seg_rows, post_outcomes)
+                except MediaStoreError:
+                    log.warning("%s: cannot reach the media store to refresh rows", label)
             for r in seg_rows:
                 _settle(
                     store, r, post_outcomes.get(r.classified.uri),
@@ -368,24 +407,17 @@ async def _run_media_step(
     gateway: Gateway,
     store: Store,
     seg_settings: Settings,
-    seg: Segment,
-    seg_rows: list[RowResult],
+    media_ids: list[int],
     cid: int,
     context: ChannelContext,
-    post_outcomes: dict[str, str],
     media_outcomes: dict[str, str],
-    media_store: MediaStore,
     log: logging.Logger,
     profile: str,
     label: str,
 ) -> str | None:
-    """Step 2 of a segment: decide, from the posts just stored, which files this
-    run's store lacks, and run the `media` phase over exactly those messages (a
-    separate run that reuses the channel: the selection can only be known once
-    the posts are in). Returns why the command must end, else `None`."""
-    media_ids = _media_ids_after_posts(store, media_store, seg_rows, post_outcomes)
-    if not media_ids:
-        return None
+    """Run 2 of a segment: the `media` phase over exactly `media_ids` (a separate
+    run that reuses the channel: the selection can only be known once the posts
+    are in). Returns why the command must end, else `None`."""
     media_settings = seg_settings.model_copy(update={"media_msgs": media_ids})
     results, _ = await collect_channel_with_context(
         gateway, store, media_settings, parse_target(str(cid)), ["media"], log,
@@ -402,16 +434,29 @@ async def _run_media_step(
     return None
 
 
-def _media_ids_after_posts(
-    store: Store, media_store: MediaStore, seg_rows: list[RowResult],
+def _refresh_rows(
+    store: Store, media_store: MediaStore, channel_id: int, seg_rows: list[RowResult],
     post_outcomes: dict[str, str],
 ) -> list[int]:
-    """The message ids whose file this run's store does not hold yet, judged on
-    the rows the posts phase has just written (spec 2.2 step 3): the content key
-    of the post's CURRENT media, not of any earlier version of it. Also refreshes
-    each fetched row's `media_held`/`stored`, which the report and the outcome
-    use. Walking a held row would add a `duplicate` custody row per re-run."""
-    index = load_content_index(store.conn)
+    """Re-judge every fetched row on the post as the posts phase just stored it
+    (spec 2.2 step 3), whether or not a media phase follows: the content key of
+    the post's CURRENT media, never an earlier version's. Sets each row's
+    `in_store`/`stored`/`media_held` (what the report and the outcome use) and
+    returns the ids the media phase must walk:
+
+    * file not held by this run's store: download it;
+    * held under a custody sighting of THIS channel (a same-channel repost) but
+      this message has no sighting of its own yet: walk it, the media phase
+      records a `duplicate` custody row and skips the download;
+    * held only under ANOTHER channel (a cross-channel repost, ADR-0009): not
+      walked - reported `already_stored` with the holding file, no custody row,
+      and decided before any size cap, so `--media-max-mb` cannot touch it.
+
+    The two indexes are the very ones the media phase uses (its per-channel
+    index is `load_content_index(conn, channel_id)`), so the selection and the
+    phase agree on what is a download and what a duplicate."""
+    global_index = load_content_index(store.conn)
+    channel_index = load_content_index(store.conn, channel_id)
     ids: set[int] = set()
     for r in seg_rows:
         c = r.classified
@@ -422,14 +467,14 @@ def _media_ids_after_posts(
         ).fetchone()
         if msg is None:
             continue
-        file = held_file(store, media_store, msg["media_kind"], msg["media_json"], index)
+        key = content_key(json.loads(msg["media_json"])) if msg["media_json"] else None
+        same_channel = key is not None and key in channel_index
+        file = held_file(
+            store, media_store, msg["media_kind"], msg["media_json"],
+            channel_index if same_channel else global_index,
+        )
         c.in_store, c.stored, c.media_held = True, file, file is not None
-        if file is None or not _has_sighting(store, c.uri, msg["media_json"]):
-            # Nothing held yet -> download. Held, but THIS message never got its
-            # own custody row for the content (a repost of a file stored under
-            # another message) -> the media phase records the sighting and skips
-            # the download, as `collect` does. A message already recorded is not
-            # walked again (no `duplicate` custody row per re-run).
+        if file is None or (same_channel and not _has_sighting(store, c.uri, msg["media_json"])):
             ids.add(c.row.msg_id)
     return sorted(ids)
 
