@@ -8,8 +8,9 @@ by-id amendment). Plans: `docs/superpowers/plans/2026-10-06-fetch-from-list.md`
 `docs/superpowers/plans/2026-09-29-media-list-fetch.md` (#68). Shared
 constraints and the live smoke protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`. Plain-language
-walk-through: `docs/how-it-works.md` §6. **No migration** (schema unchanged);
-the only raw-log addition in #91 is a context tag (see "Replay"). Builds on #84
+walk-through: `docs/how-it-works.md` §6. **Migration `0008_custody_content_key`**
+(`custody_log.content_key`, ADR-0009, `docs/data-model.md`); the only raw-log
+addition in #91 is a context tag (see "Replay"). Builds on #84
 (collect by channel id) and #63 (per-run media stores).
 
 The command was named `fetch-media` until #91 (pre-release: no alias).
@@ -72,8 +73,17 @@ cannot be matched offline; once the handle resolves, the later row is marked
 
 `--exclude-target T` (repeatable; the forms `reproject --exclude-target` takes:
 a handle, `123`, `-100123`, `t.me/c/123`) marks every row of that channel
-`excluded`, offline, with no network. A channel's linked discussion group
-follows its parent (via the stored `linked_group` edge). It is a guard for
+`excluded`, offline, with no network. **Exclusion is one-way.** Excluding a
+parent channel also excludes its linked discussion group; excluding only a group
+does NOT exclude its parent. The link is read from the stored `linked_group`
+edge in either direction (Telegram's `linked_chat_id` is bidirectional, so the
+edge points from whichever side was collected), and the group is the end whose
+`channels.kind` is not `broadcast` (`media_list.linked_discussion_groups`; a
+linked channel not yet in `channels` counts as a group, a channel that is itself
+a group has no followers). A channel found to be a group of an excluded one is
+added to the excluded set, so its later segments are caught too. Tests:
+`test_excludes_a_group_linked_to_an_excluded_parent_in_either_edge_direction`,
+`test_excluding_only_a_group_does_not_exclude_its_parent_channel`. It is a guard for
 running against a store that still holds an investigation the operator does not
 want pulled. A target the store has never seen, or one that is not a channel
 handle/id, exits 1 before anything else is done (excluding nothing by accident
@@ -105,10 +115,12 @@ labels are decided offline, because every addressable row has its post fetched:
 Three flags say what the store already knows about a pending row, and drive the
 `--dry-run` tables: `in_store` (a `messages` row exists; otherwise the post is
 "not yet collected"), `media_held` (THIS run's media store already holds the
-file: the Telegram document/photo id, anywhere in the store, or this message
-resolves to a stored file, and a `custody_log` row names the run's store or the
-store answers an existence check; a file the database holds from a LOCAL run is
-not held by a bucket run until the bucket has it) and `needs_resolve` (a handle
+file for the message's CURRENT media: a custody sighting recorded under the
+same Telegram photo/document id (`custody_log.content_key`, ADR-0009) names a
+file, and a `custody_log` row names the run's store or the store answers an
+existence check; a file the database holds from a LOCAL run is not held by a
+bucket run until the bucket has it. This is the OFFLINE estimate: after the
+`posts` phase has refreshed the row the fetch decides again, see "Segments") and `needs_resolve` (a handle
 row for a channel the store has never seen, above). A tombstoned row is
 pending too: Telegram's answer decides between `deleted_upstream` and a live
 post. A LIVE answer for a row the store had tombstoned clears its `deleted_at`
@@ -120,9 +132,9 @@ precedence:
 
 | Outcome | Meaning |
 |---|---|
-| `downloaded`, `duplicate`, `too_large`, `size_mismatch`, `unavailable`, `skipped` | The media phase's own result for the file (`duplicate`: same bytes/content id as a stored file, custody recorded; `too_large`: `--media-max-mb`; `skipped`: a per-file skip such as an expired file reference). |
-| `already_stored` | THIS run's media store already held the file (`media_held`); the post was still re-fetched. |
+| `downloaded`, `duplicate`, `too_large`, `size_mismatch`, `unavailable`, `skipped` | The media phase's own result for the file (`duplicate`: same bytes/content id as a stored file - a repost - so no download, but this message's own custody row is recorded; `too_large`: `--media-max-mb`; `skipped`: a per-file skip such as an expired file reference). |
 | `deleted_upstream` | Telegram answered `MessageEmpty` for the id: deleted, or never existed (an id above the channel's newest post answers the same). It is projected as a tombstone with evidence `empty`, exactly as `history` does, and no media is attempted. |
+| `already_stored` | THIS run's media store already held the file for the post's current media and this message already has its custody row; the post was still re-fetched. |
 | `post_only` | Fetched with `--no-media`. |
 | `no_media` | Fetched, but the post has nothing downloadable (not a photo/document). |
 | `no_access` | The channel could not be reached at run time (below). |
@@ -144,8 +156,9 @@ of the pair, so every P1 segment runs before any P2 segment (without a
 `priority` column: one segment per channel). Within a segment ids are fetched
 ascending; list order decides only the order of segments.
 
-Each segment is one ordinary `collect_channel` run over the **standard**
-collectors, in this order:
+Each segment is **two** ordinary `collect_channel` runs over the **standard**
+collectors: run 1 is `channel` + `posts`, run 2 (only when something needs
+media) is `media` alone. In order:
 
 1. **`channel`**, targeting the channel id from the list row (or the handle,
    above). It reaches the channel through #84's Step A (saved key, then a
@@ -164,19 +177,36 @@ collectors, in this order:
    row, author peer and forward edge; an edit appends a `message_revisions` row;
    a counter change appends a `message_metrics` row; `MessageEmpty` becomes a
    tombstone, never a blank row. Cost: ⌈ids/100⌉ calls per segment.
-3. **`media`**, unless `--no-media` or nothing is left to download, narrowed to
-   the segment's ids whose file this run's store does not hold (`media_msgs`).
-   Held rows are left out on purpose: walking one would add a `duplicate`
-   custody row on every re-run. The media phase selects its rows after `posts`
-   ran, so a post fetched in this very run is downloaded in the same run.
+3. **`media`** (a SECOND run of the segment, a marker run that reuses the
+   channel the first established), unless `--no-media` or nothing needs it. What
+   needs it is decided only now, on the posts the first run just stored (spec
+   2.2 step 3): for each fetched post the CURRENT `media_json` is turned into a
+   content key and looked up in the custody index (`load_content_index`,
+   ADR-0009). The media run walks (`media_msgs`, recorded as `MediaSelection`)
+   exactly the ids that are
+   * **not held**: no file for that content in this run's store - it is
+     downloaded (this is what makes a post edited to a different photo download
+     the new one, not report the old file); or
+   * **held but unrecorded**: the file is held (stored under another message, a
+     repost) but THIS message has no custody row for the content yet - the media
+     phase records the sighting and skips the download (outcome `duplicate`).
+   A message that already has its own custody row for the content is left out:
+   walking it again would add a `duplicate` row on every re-run. So **every
+   sighting keeps its own custody row** (provenance: where and when a file
+   appeared, with its content key); only the download is skipped. The offline
+   `media_held` flag is only a preview and the report's `already_stored`
+   reflects this post-posts decision.
 
 Budget, guardrails, dedup, custody, streaming, `--media-max-mb` and the
 free-disk floor apply unchanged. One gateway (one MTProto session, one
 `Budget`) serves the whole command, so `--max-rpc` bounds it all.
 
-A channel is established once per command: later segments of it receive the
-cached `ChannelContext` (in-process only, never persisted) and skip `channel`,
-appending one `ChannelContextReused` marker instead. With a saved key (the
+A channel is established once per command: later segments of it, and each
+segment's own media run, receive the cached `ChannelContext` (in-process only,
+never persisted) and skip `channel`, appending one `ChannelContextReused` marker
+instead. Likewise an unknown `@handle` is resolved once per command: if it
+appears under two priorities, the second segment reuses the id the first
+resolved and makes no second `contacts.resolveUsername` call. With a saved key (the
 usual case) a list run makes no `contacts.resolveUsername` call at all.
 
 Why identity holds: the only input that shapes which channel an id segment
@@ -205,7 +235,8 @@ fetches from is its id, and that id is in the raw log twice over (the
   selection, so no list row is silently filtered out.
 * Unreached rows are `not_attempted`; exit 1; the report is written in every
   case (`try/finally`). Re-running resumes: posts are fetched again (cheap), and
-  media already in the run's store is not downloaded again.
+  media already in the run's store is not downloaded again and adds no custody
+  row.
 * The doctor preflight runs once (skipped by `--unsafe`); a block exits 1 before
   any segment, with a report of all-`not_attempted`.
 
@@ -244,8 +275,12 @@ Each segment is a normal run, with additions so `reproject` reproduces it (see
   1 has no `ResolvedPeer`).
 * `MediaSelection` `{channel_id, msg_ids}` is written whenever a media phase is
   scoped with `media_msgs`, **just before the media phase runs** and only if the
-  channel was established; replay walks only those ids. Pre-amendment runs carry
-  `{msg_ids}` only and replay as before.
+  channel was established; replay walks only those ids. Since #91 the media run
+  is its own run (marker run, posts evidence absent), so the selection is the
+  ids decided after the posts phase, repost sightings included: replay writes
+  the same custody rows, `content_key` and all (the replayed media phase
+  derives it from the replayed message exactly as live does). Pre-amendment runs
+  carry `{msg_ids}` only and replay as before.
 * The `posts` receipts (#91) are ordinary message raw records tagged
   `method: "channels.getMessages"`. **No new raw kind.** Replay detects the
   phase from the tag, sets `post_msgs` to the recorded ids, and
@@ -263,6 +298,29 @@ established; `posts` iff the run holds `getMessages` receipts. A segment
 recorded before #91 (a selection, no receipts) replays exactly as it did;
 access refused replays `channel` only and leaves no posts, media or custody
 rows, exactly as live.
+
+## Migration 0008 (`custody_log.content_key`)
+
+`0008_custody_content_key.sql` (ADR-0009) adds a nullable `content_key` to
+`custody_log` and backfills it only where certain: a sighting of a message whose
+current media and every revision agree on one content key. Sightings of an
+edited message, and avatars, stay NULL ("unknown"): the media phase then
+downloads that content again (a redundant download, never a missed one).
+`raw_records` is untouched. It is applied by `Store.open` like every migration;
+`docs/data-model.md` documents the column.
+
+## Review fixes (round 1)
+
+* **Media eligibility after posts (B1).** Decided on the post as just stored,
+  keyed by content (Segments, step 3). Before, a post edited to a new photo was
+  reported with the old file and never downloaded.
+* **Each unknown handle resolved once (M1)** and **exclusion symmetric in edge
+  direction but one-way (M3)**: see "Input" and "Segments".
+* **`deleted_upstream` before `already_stored` (M2)** in the outcome table, as in
+  `_settle`.
+* **`MessageEmpty` above the newest post (M4)** is projected as an `empty`
+  tombstone, as `history` does; it cannot be told from a deletion (see
+  "Deviations"), and a later live answer clears it.
 
 ## Deviations from the plan / spec
 
@@ -526,7 +584,8 @@ and `media.size` is 87022 = the file's size.
 
 **Reproject** (offline, `reproject --profile default --include-target <A>
 --include-target <B> --include-target <C> --out <scratch>/reprojected-3.sqlite`),
-source vs output for the three channels:
+source vs output for the three channels (`compare3.out`, pasted verbatim apart from
+the redacted ids; the two DIFF lines are real):
 
 ```
 messages                       source   31241 reprojected   31241 equal
@@ -535,30 +594,48 @@ message_metrics                source   31217 reprojected   31217 equal
 message_tombstones             source    2339 reprojected    2339 equal
 media(re-smoke msg)            source       1 reprojected       1 equal
 custody(re-smoke msg)          source       1 reprojected       1 equal
-tombstone <B>/<id>             source       2 reprojected       2 equal
-source run_events      [('channel', 17), ('graph', 3), ('history', 3), ('media', 12), ('participants', 6), ('posts', 10), ('profiles', 9)]
+media (all 3 channels)         source      50 reprojected       2 DIFF
+custody_log (all 3 ch)         source     161 reprojected       2 DIFF
+new post <C>/<id>       source       1 reprojected       1 equal
+tombstone <B>/<id>     source       2 reprojected       2 equal
+source run_events [('channel', 17), ('graph', 3), ('history', 3), ('media', 12), ('participants', 6), ('posts', 10), ('profiles', 9)]
 reprojected run_events [('channel', 17), ('graph', 3), ('history', 3), ('media', 12), ('participants', 6), ('posts', 10), ('profiles', 9)]
 ```
 
-The `posts` phase replayed for all ten fetch runs (six from the earlier smokes
-plus two segments in each of these two invocations). A wider media count over all
-three channels differs (source 50, output 2). The 48 missing rows are `@<C>`
-downloads from an older plain media run (2026-09-24/26) whose raw rows carry no
-`MediaSelection` marker; the earlier reproject of this store (before this
-re-smoke) also produced none of them, so the gap predates `fetch-from-list` and
-is not touched by it.
+`posts` replayed for all ten fetch runs (six from the earlier smokes plus two
+segments in each of these two invocations). Every table that `fetch-from-list`
+writes (messages, revisions, metrics, tombstones, the re-smoke message's `media` and
+`custody_log` rows, the new post, the tombstone) is `equal`. **Two lines are
+not: `media` over all three channels (source 50, reprojected 2) and
+`custody_log` over all three channels (source 161, reprojected 2).** They are
+not a `fetch-from-list` defect:
+
+* The 48 missing `media` rows are `@<C>` downloads from older plain media runs
+  (2026-09-24/26) whose raw rows carry no `MediaSelection` marker; the
+  `custody_log` gap (159 rows) is consistent with the same loss (those downloads
+  wrote custody rows too; not itemised here). The earlier reproject of this store (before the re-smoke) dropped
+  them too.
+* To test that claim instead of asserting it, `reproject` was run from the base
+  branch (`dev/gcs-pull` @ 7e6de9d, no #91 code) against the same scratch source
+  store, same scope, fresh output (offline). Result for the three channels:
+  `media` source 50, base-reprojected 2, #91-reprojected 2; `custody_log` source
+  161, base-reprojected 2, #91-reprojected 2 (whole store: `media` 306 vs 2,
+  `custody_log` 1838 vs 2, in both). The base branch loses exactly the same rows,
+  so the gap predates #91. Tracked in issue #94 (comment with these counts); not
+  fixed here because it is orthogonal to `fetch-from-list` and independent of this
+  change's code.
 
 ### Docs updated
 
 `docs/features/fetch-from-list.md` (renamed from `fetch-media.md`, rewritten),
 `README.md` (commands row, documentation list, report filename, config table),
-`CLAUDE.md` (commands and the "In progress on `dev/gcs-pull`" status),
+`CLAUDE.md` (commands and the "In progress on `dev/gcs-pull`" status, migration 0008),
 `docs/how-it-works.md` §6, `docs/features/reproject.md` ("Replaying
 `fetch-from-list` runs"), `docs/features/media-stores.md`,
 `docs/features/collect-channel.md`, `docs/features/pacing.md`,
-`docs/data-model.md` (the `getMessages` receipts' context; no schema change),
-`docs/adr/0005-run-structure.md` and `docs/adr/0008-media-stores.md` (rename only;
-no new ADR, per the spec), `docs/superpowers/specs/2026-10-06-fetch-from-list-design.md`
+`docs/data-model.md` (the `getMessages` receipts' context; `custody_log.content_key`,
+migration 0008), `docs/adr/0009-custody-records-content-key.md` (new),
+`docs/adr/0005-run-structure.md` and `docs/adr/0008-media-stores.md` (rename only), `docs/superpowers/specs/2026-10-06-fetch-from-list-design.md`
 (§2.3 amendment for handle rows), `docs/superpowers/plans/2026-10-06-fetch-from-list.md`.
 The PR body carries the code-atlas note: the standard collector list gained `posts`
 (run by `fetch-from-list` and by `reproject`'s replay list, never by `collect`).

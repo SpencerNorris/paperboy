@@ -63,8 +63,7 @@ access_hash, msg_id}}`), `key_source_raw_id` (a live-store raw id,
 informational, not a cross-store foreign key) and, for `handle`, `handle`.
 Context: `{target, channel_id}`. Only stamped runs carry it.
 
-Two more kinds are written by paperboy itself for `fetch-from-list` (#68, no schema
-change, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
+Two more kinds are written by paperboy itself for `fetch-from-list` (#68, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
 segment that reused an already-established channel) and `MediaSelection`
 (`{channel_id, msg_ids}`; legacy `{msg_ids}`; the message ids a scoped media phase
 was allowed to walk, written just before the media phase). `reproject` reads them
@@ -75,7 +74,7 @@ to replay those runs exactly.
 records, with context `{channel_id, method: "channels.getMessages"}`. The `method`
 tag is the only difference from `history`'s records: `reproject` uses it to tell the
 two apart (a `getMessages` receipt is not evidence of a `history` phase) and to
-rebuild the ids the phase asked for. No new kind, no schema change.
+rebuild the ids the phase asked for. No new kind; the only schema change of #91 is `custody_log.content_key` (migration `0008`).
 
 Per-run media stores (#63, ADR-0008) add one more and extend two receipts.
 `MediaStore` (`{store}`, the run's `gs://<bucket>/<prefix>`) is written once, just
@@ -319,6 +318,7 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |
 | `store` | TEXT | Which media store this sighting's bytes are in (migration `0007_media_stores`, #63): `local` (the profile folder) or the full `gs://<bucket>/<prefix>` URL; never a filesystem path. NOT NULL, default `local` (every earlier row was written by a local run). One sha can have rows in several stores. |
+| `content_key` | TEXT | The Telegram content this sighting was FOR, `photo:<id>` or `document:<id>` (migration `0008_custody_content_key`, #91, ADR-0009). Lets the dedup index file a file under the content it was downloaded for, not under whatever its message carries now (a post edited to another photo). NULL = unknown: avatar sightings (no message), and sightings backfilled by the migration for a message whose media changed across revisions; a NULL sighting is ignored by the index, so its content is downloaded again (redundant, never missed). |
 
 ## Web (Phase 2)
 

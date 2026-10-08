@@ -54,7 +54,10 @@ rows; no migration. #91 `fetch-from-list` is on `feat/fetch-from-list` (PR pendi
 between `channel` and `media` that fetches every listed post by `channels.getMessages`
 (≤100 ids per call, the same projection `history` uses via the shared
 `observe_message`), `--no-media`, handle rows for unseen channels resolved live, and
-replay of the `posts` receipts (tagged `method: channels.getMessages`); no migration. Order and protocol:
+replay of the `posts` receipts (tagged `method: channels.getMessages`); migration
+0008 `custody_log.content_key` (ADR-0009: media eligibility is decided after `posts`,
+keyed by content; every repost sighting keeps its own custody row; `--exclude-target`
+is one-way, parent -> linked group). Order and protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first

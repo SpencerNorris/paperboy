@@ -162,7 +162,9 @@ many channels. In plain terms:
 1. **Read the list.** Each row names one message. If any row is malformed the
    whole command stops before touching anything and says which lines.
 2. **Sort the rows offline.** Against what is already stored, a row is a
-   duplicate, excluded (`--exclude-target` names its channel) or still to do. Every
+   duplicate, excluded (`--exclude-target` names its channel, and also its linked
+   discussion group; excluding only a group never excludes its parent channel) or
+   still to do. Every
    row that is still to do will have its post fetched, whether we hold it or
    not, so the offline step only counts what we already have: posts in the
    store, posts not yet collected, media already in this run's store. No network
@@ -172,8 +174,8 @@ many channels. In plain terms:
    channel", in the order they first appear in the list, so all the important
    rows are fetched before the rest. Inside a segment ids go in message-id
    order.
-4. **Run each segment as an ordinary collect run** over the same session, in
-   three steps. First the channel, reached by its id the same way `collect` does
+4. **Run each segment as ordinary collect runs** over the same session, in
+   three steps (two runs: channel + posts, then media). First the channel, reached by its id the same way `collect` does
    (a key we already saved, a message that mentioned it, or a handle we can
    verify; no name lookup is needed when we hold a key; a link with a handle we
    have never seen is looked up by that handle). A channel we cannot reach is
@@ -182,16 +184,21 @@ many channels. In plain terms:
    turned into a message row, exactly as `history` does it, so a post we never
    had appears, an edit becomes a revision, new view counts become a metric row
    and a deleted post becomes a tombstone. Posts we already hold are asked for
-   again so they are current. Then the **media** of the rows whose file this
-   run's store does not hold yet. Later segments of a channel reuse the first
+   again so they are current. Then, once the posts are stored, the **media**: for each fetched
+   post we look at the photo or document it carries *now* (Telegram's id for it,
+   remembered with every custody row, [ADR-0009](adr/0009-custody-records-content-key.md)) and download only what this run's
+   store does not hold. A post edited to a different photo therefore downloads the
+   new one. A repost of a file we hold is not downloaded again, but it still gets
+   its own custody row (where and when the file appeared); a message that already
+   has its row is left alone, so re-runs add nothing. Later segments of a channel reuse the first
    one's access and leave a small note, `ChannelContextReused` (channel id and
    the run that got access, never the key). A segment also notes which message
    ids its media step was allowed to fetch (`MediaSelection`), just before the
    download starts.
 5. **Replay follows the notes.** `reproject` reads those notes, and the
    `channels.getMessages` tag on the saved post answers, to rebuild exactly the
-   same messages, revisions, `media` and `custody_log` rows, offline, with no new
-   tables. It replays a step only where it actually ran: a channel that was
+   same messages, revisions, `media` and `custody_log` rows, offline. The one
+   schema change is migration 0008, a `content_key` column on `custody_log`. It replays a step only where it actually ran: a channel that was
    refused leaves nothing to replay.
 6. **A report for every row.** The report CSV has one line per input row, what
    happened to its post and what happened to its media. If the command stops
