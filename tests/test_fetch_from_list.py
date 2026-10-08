@@ -134,8 +134,10 @@ async def test_end_to_end_two_channels_two_tiers(tmp_path):
         markers = st.conn.execute(
             "SELECT run_id FROM raw_records WHERE kind='ChannelContextReused'"
         ).fetchall()
-        assert len(markers) == 2  # the two P2 segments reused their channel
-        assert len({m["run_id"] for m in markers}) == 2
+        # Each segment's media run reuses the channel its posts run established
+        # (4), and the two P2 segments' posts runs reuse the P1 context (2).
+        assert len(markers) == 6
+        assert len({m["run_id"] for m in markers}) == 6
         rows = _report(report)
         assert [r["line_no"] for r in rows] == ["2", "3", "4", "5", "6"]
         assert [r["outcome"] for r in rows] == ["downloaded"] * 5
@@ -306,10 +308,15 @@ async def test_live_collector_list_is_the_standard_one(tmp_path, monkeypatch):
             _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path), LOG,
             profile="p", report_path=tmp_path / "r.csv",
         )
+    # Per segment: the channel and the posts, then (once the posts are stored and
+    # the files this run's store lacks are known) the media phase alone.
     assert seen and all(
-        [type(c) for c in cs] == [ChannelCollector, PostsCollector, MediaCollector]
+        [type(c) for c in cs] in ([ChannelCollector, PostsCollector], [MediaCollector])
         for cs in seen
     )
+    assert {type(c) for cs in seen for c in cs} == {
+        ChannelCollector, PostsCollector, MediaCollector,
+    }
 
 
 @pytest.mark.asyncio
@@ -743,3 +750,139 @@ async def test_held_file_but_deleted_upstream_reports_deleted_upstream(tmp_path)
         )
     [r] = _report(report)
     assert (r["outcome"], r["post"]) == ("deleted_upstream", "deleted_upstream")
+
+
+# ── an edited post: the NEW media is decided after the posts phase (#91 B1) ──
+
+
+def _edited_scenario_gateway(media):
+    """Channel 10 / message 1 now carries a different photo than the stored one."""
+    return _gateway(media, get_messages={1: _photo_msg(1, 999_001)})
+
+
+@pytest.mark.asyncio
+async def test_edited_post_new_media_is_downloaded_not_reported_as_the_old_file(tmp_path):
+    """A post held as file A and then edited to photo B: the re-fetched post's NEW
+    media is downloaded (eligibility is decided after the posts phase), the report
+    shows B, A's custody row is untouched, and a re-run says `already_stored` with B."""
+    one = "tg:msg:10/1\n"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(  # file A is stored for 10/1
+            _gateway(BYTES), st, _settings(tmp_path), _classified(st, tmp_path, one), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        (sha_a,) = {r[0] for r in st.conn.execute("select sha256 from custody_log")}
+        custody_a = st.conn.execute(
+            "select id, path, sha256, recorded_at, source_message_uri from custody_log"
+        ).fetchall()
+
+        # The channel edits the post to photo B. Classified BEFORE the fetch, the
+        # row still looks held: the decision must be remade after the posts phase.
+        stale = _classified(st, tmp_path, one)
+        assert stale[0].media_held
+        gw = _edited_scenario_gateway({1: b"new-photo"})
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), stale, LOG,
+            profile="p", report_path=tmp_path / "r1.csv",
+        )
+        assert summary.complete and summary.counts["downloaded"] == 1
+        assert gw.download_media_calls == [1]
+        (row,) = _report(tmp_path / "r1.csv")
+        assert row["outcome"] == "downloaded" and row["sha256"] != sha_a
+        assert (tmp_path / "p" / row["key"]).read_bytes() == b"new-photo"
+        # A's custody row is untouched; B added its own.
+        after = st.conn.execute(
+            "select id, path, sha256, recorded_at, source_message_uri from custody_log "
+            "where sha256 = ?", (sha_a,)
+        ).fetchall()
+        assert [tuple(r) for r in after] == [tuple(r) for r in custody_a]
+
+        # Re-run: held now, and the report names B (not the older A).
+        again = _classified(st, tmp_path, one)
+        assert again[0].media_held
+        gw2 = _edited_scenario_gateway({})
+        summary = await fetch_from_list(
+            gw2, st, _settings(tmp_path), again, LOG,
+            profile="p", report_path=tmp_path / "r2.csv",
+        )
+        assert summary.counts["already_stored"] == 1 and gw2.download_media_calls == []
+        (row2,) = _report(tmp_path / "r2.csv")
+        assert (row2["outcome"], row2["sha256"], row2["key"]) == (
+            "already_stored", row["sha256"], row["key"],
+        )
+
+
+# ── an unknown handle under two priorities resolves once (#91 M1) ────────────
+
+
+@pytest.mark.asyncio
+async def test_same_unknown_handle_under_two_priorities_is_resolved_once(tmp_path):
+    """`contacts.resolveUsername` is flood-limited and a channel is established
+    once per command: the second segment of the handle reuses the first's id."""
+    gw = _gateway(
+        {5: b"n5", 6: b"n6"},
+        resolve=_resolved(30, "chan_new"),
+        full_channel_by_id={30: _full(30, "chan_new")},
+        get_messages={5: _photo_msg(5, 305), 6: _photo_msg(6, 306)},
+    )
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        classified = _classified(
+            st, tmp_path,
+            "uri,priority\nhttps://t.me/Chan_New/5,P1\nhttps://t.me/Chan_New/6,P2\n",
+        )
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG, profile="p", report_path=report,
+        )
+    assert summary.complete and summary.counts["downloaded"] == 2
+    assert gw.calls.count("resolve") == 1
+    assert [(r["uri"], r["outcome"]) for r in _report(report)] == [
+        ("tg:msg:30/5", "downloaded"), ("tg:msg:30/6", "downloaded"),
+    ]
+
+
+# ── linked-group exclusion works in both edge directions (#91 M3) ────────────
+
+
+@pytest.mark.parametrize("subject,obj", [(10, 77), (77, 10)])
+def test_excludes_a_group_linked_to_an_excluded_parent_in_either_edge_direction(
+    tmp_path, subject, obj
+):
+    from paperboy.fetch_from_list import _excludes
+    from paperboy.ids import utc_now_iso
+    from paperboy.store.edges import add_edge
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_channel(st, 77, None, megagroup=True)
+        seed_channel(st, 20, "chan_b")
+        add_edge(st, f"tg:channel:{subject}", "linked_group", f"tg:channel:{obj}",
+                 utc_now_iso(), "stranger", None, None)
+        excluded = {10}
+        assert _excludes(st, excluded, 77)  # the group follows its excluded parent
+        assert excluded == {10, 77}
+        assert not _excludes(st, excluded, 20)  # an unrelated channel is untouched
+
+
+@pytest.mark.parametrize("subject,obj", [(10, 77), (77, 10)])
+def test_excluding_only_a_group_does_not_exclude_its_parent_channel(tmp_path, subject, obj):
+    """Exclusion is one-way: a group follows its parent, never the reverse - in
+    either stored edge direction, and for both the fetch-time and the offline
+    (`--exclude-target`) check."""
+    from paperboy.fetch_from_list import _excludes
+    from paperboy.ids import utc_now_iso
+    from paperboy.media_list import excluded_channel_ids
+    from paperboy.store.edges import add_edge
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_channel(st, 77, "chan_group", megagroup=True)
+        add_edge(st, f"tg:channel:{subject}", "linked_group", f"tg:channel:{obj}",
+                 utc_now_iso(), "stranger", None, None)
+        excluded = {77}
+        assert not _excludes(st, excluded, 10)
+        assert excluded == {77}
+        assert excluded_channel_ids(st, ["@chan_group"]) == {77}
+        assert excluded_channel_ids(st, ["@chan_a"]) == {10, 77}

@@ -167,3 +167,47 @@ def test_0007_custody_log_store_column(tmp_path):
         )
         row = st.conn.execute("select store from custody_log").fetchone()
         assert row["store"] == "local"
+
+
+def test_0008_backfills_custody_content_key_only_where_certain(tmp_path):
+    """A sighting gets its content key when its message never carried another
+    key; an edited message's sightings stay NULL (unknown), never guessed (#91)."""
+    import json as _json
+
+    from paperboy.store.db import _MIGRATIONS_DIR
+
+    def photo(pid, fref="x"):
+        return _json.dumps(
+            {"_": "MessageMediaPhoto", "photo": {"_": "Photo", "id": pid, "file_reference": fref}}
+        )
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        conn = st.conn
+        for uri, mid in (("tg:msg:1/1", 1), ("tg:msg:1/2", 2)):
+            conn.execute(
+                "insert into messages (uri, channel_id, msg_id, media_json, media_kind, "
+                "content_hash, first_seen, last_seen) "
+                "values (?, 1, ?, ?, 'MessageMediaPhoto', 'h', 't', 't')",
+                (uri, mid, photo(100 if mid == 1 else 300)),
+            )
+        # 1/1: two revisions, SAME photo (a refreshed file_reference). 1/2: edited A -> B.
+        for uri, pid, fref in (
+            ("tg:msg:1/1", 100, "a"), ("tg:msg:1/1", 100, "b"),
+            ("tg:msg:1/2", 200, "a"), ("tg:msg:1/2", 300, "a"),
+        ):
+            conn.execute(
+                "insert into message_revisions "
+                "(message_uri, observed_at, content_hash, media_json) values (?, 't', ?, ?)",
+                (uri, f"{uri}{pid}{fref}", photo(pid, fref)),
+            )
+        for uri in ("tg:msg:1/1", "tg:msg:1/2", None):
+            conn.execute(
+                "insert into custody_log (path, sha256, recorded_at, source_message_uri) "
+                "values ('media/ab/x', 'ab', 'now', ?)", (uri,),
+            )
+        conn.execute("alter table custody_log drop column content_key")
+        conn.executescript((_MIGRATIONS_DIR / "0008_custody_content_key.sql").read_text())
+        keys = [
+            r[0] for r in conn.execute("select content_key from custody_log order by id")
+        ]
+        assert keys == ["photo:100", None, None]

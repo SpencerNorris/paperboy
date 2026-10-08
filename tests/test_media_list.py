@@ -3,10 +3,12 @@
 All handles, ids and rows here are synthetic.
 """
 
+import json
 from pathlib import Path
 
 import pytest
 
+from paperboy.collectors.media import content_key, content_key_text
 from paperboy.ids import utc_now_iso
 from paperboy.media_list import (
     MediaListError,
@@ -113,10 +115,11 @@ def test_empty_list_is_an_error(tmp_path):
 # ── classification + segments ──────────────────────────────────────────────
 
 
-def seed_channel(st, channel_id, username, access_hash=None):
+def seed_channel(st, channel_id, username, access_hash=None, *, megagroup=False):
     """A `channels` row; with `access_hash`, also a full (non-`min`) `peers` row,
     i.e. a saved key (route 1 of Step A, #84)."""
-    chan = {"_": "channel", "id": channel_id, "access_hash": 1, "title": "T", "broadcast": True}
+    chan = {"_": "channel", "id": channel_id, "access_hash": 1, "title": "T"}
+    chan["megagroup" if megagroup else "broadcast"] = True
     if username:
         chan["username"] = username
     full = {"_": "channelFull", "id": channel_id, "pts": 1}
@@ -155,10 +158,20 @@ def record_media(st, message_uri, sha, store="local"):
 
 
 def record_media_custody(st, message_uri, sha, store):
+    """A download's custody sighting, with the content key of the message's
+    media AS IT STANDS NOW (what the media phase records)."""
+    row = st.conn.execute(
+        "SELECT media_json FROM messages WHERE uri = ?", (message_uri,)
+    ).fetchone()
+    key = content_key(json.loads(row["media_json"])) if row and row["media_json"] else None
     st.conn.execute(
-        "INSERT INTO custody_log (path, sha256, recorded_at, source_message_uri, store) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (f"media/{sha[:2]}/{sha}", sha, utc_now_iso(), message_uri, store),
+        "INSERT INTO custody_log "
+        "(path, sha256, recorded_at, source_message_uri, store, content_key) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            f"media/{sha[:2]}/{sha}", sha, utc_now_iso(), message_uri, store,
+            content_key_text(key) if key else None,
+        ),
     )
 
 
@@ -208,6 +221,31 @@ def test_classify_covers_every_offline_outcome(tmp_path):
         assert out[9].uri == "t.me/nobody/1" and out[9].channel_id is None
 
 
+def test_edited_post_is_not_held_by_its_old_file(tmp_path):
+    """`media_held` follows the content key of the post's CURRENT media: a file
+    downloaded for an older version of the post does not make the new one held
+    (#91), and the same photo on another message still does."""
+    with Store.open(tmp_path / "p.sqlite") as st:
+        seed_channel(st, 10, "chan_a")
+        seed_msg(st, 10, 1, photo_id=100)
+        record_media(st, "tg:msg:10/1", "a" * 64)  # file A, for photo 100
+        path = _write(tmp_path, "l.txt", "tg:msg:10/1\n")
+        before = classify_rows(
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path)
+        )
+        assert before[0].media_held and before[0].stored == ("a" * 64, f"media/aa/{'a' * 64}")
+        seed_msg(st, 10, 1, photo_id=200)  # edited to a different photo
+        after = classify_rows(
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path)
+        )
+        assert not after[0].media_held and after[0].stored is None
+        record_media(st, "tg:msg:10/1", "b" * 64)  # file B, for photo 200
+        again = classify_rows(
+            st, parse_media_list(path), media_store=LocalMediaStore(tmp_path)
+        )
+        assert again[0].media_held and again[0].stored == ("b" * 64, f"media/bb/{'b' * 64}")
+
+
 def test_unknown_username_makes_a_handle_segment(tmp_path):
     """A handle row whose channel the store never saw is addressed by handle."""
     with Store.open(tmp_path / "p.sqlite") as st:
@@ -216,23 +254,10 @@ def test_unknown_username_makes_a_handle_segment(tmp_path):
         segs = plan_segments(
             classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
         )
-    assert [(s.channel_id, s.username, s.msg_ids, s.media_ids) for s in segs] == [
-        (None, "nobody", [1, 3], [1, 3]),
-        (10, None, [1], [1]),
+    assert [(s.channel_id, s.username, s.msg_ids) for s in segs] == [
+        (None, "nobody", [1, 3]),
+        (10, None, [1]),
     ]
-
-
-def test_segment_media_ids_exclude_held_rows(tmp_path):
-    with Store.open(tmp_path / "p.sqlite") as st:
-        seed_channel(st, 10, "chan_a")
-        seed_msg(st, 10, 1, doc_id=1001)
-        seed_msg(st, 10, 2, doc_id=1002)
-        record_media(st, "tg:msg:10/2", "a" * 64)
-        path = _write(tmp_path, "l.txt", "tg:msg:10/1\ntg:msg:10/2\ntg:msg:10/3\n")
-        segs = plan_segments(
-            classify_rows(st, parse_media_list(path), media_store=LocalMediaStore(tmp_path))
-        )
-    assert [(s.msg_ids, s.media_ids) for s in segs] == [([1, 2, 3], [1, 3])]
 
 
 def test_segments_group_by_priority_then_channel_in_first_appearance_order(tmp_path):
@@ -300,7 +325,7 @@ def test_exclude_target_marks_rows_excluded_offline(tmp_path):
 def test_excluded_channel_ids_follows_the_linked_group(tmp_path):
     with Store.open(tmp_path / "p.sqlite") as st:
         seed_channel(st, 10, "chan_a")
-        seed_channel(st, 77, None)
+        seed_channel(st, 77, None, megagroup=True)
         seed_channel(st, 20, "chan_b")
         add_edge(st, "tg:channel:10", "linked_group", "tg:channel:77",
                  utc_now_iso(), "stranger", None, None)

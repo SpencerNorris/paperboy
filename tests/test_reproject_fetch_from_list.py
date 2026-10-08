@@ -89,7 +89,8 @@ async def build_source(
     post_extras: bool = False,
 ) -> Path:
     """Runs 1-2 (extended: 1-3) collect the channels; the rest are the fetch-from-list
-    segments (four, or six extended).
+    segments, each a posts run (`channel` + `posts`, or a marker run reusing the
+    channel) followed by a media-only marker run when it has files to download.
 
     `post_extras` adds, to channel 20's segment, an edited post (message 2 of
     channel 10 gains text and a view counter), a new text post and a post Telegram
@@ -165,7 +166,11 @@ async def build_source(
         assert summary.complete
         if extended:
             assert summary.counts["no_access"] == 1
-            assert sum(summary.counts[k] for k in ("downloaded", "duplicate")) == 6
+            # The reposts 10/3 and 10/4 (photo of 10/1) are held by content once
+            # 10/1's file is stored earlier in the same command: no download,
+            # but each keeps its own custody row (a `duplicate` sighting).
+            assert summary.counts["downloaded"] == 4
+            assert summary.counts["duplicate"] == 2
     return db
 
 
@@ -176,45 +181,69 @@ def _reproject(tmp_path: Path, monkeypatch):
 
 def test_detect_phases_media_requires_established_channel(tmp_path):
     """Replay what ran, never what was intended (#68 spec 9.3). A granted segment
-    keeps `media` without its MediaDownload raws (the selection plus the
-    established channel are evidence); a refused one, whose run has no `ChatFull`,
-    never does; a selection naming a channel the run did not establish does not
-    either."""
+    keeps `media` without its MediaDownload raws (the selection is the evidence);
+    a refused one, whose run has no `ChatFull`, never gets one; and in a
+    single-run `channel` + `media` (`collect --media-msgs`), a selection naming a
+    channel the run did not establish is not evidence either."""
     db = asyncio.run(build_source(tmp_path, extended=True))
     with sqlite3.connect(db) as conn:
         conn.execute("DELETE FROM raw_records WHERE lower(kind) = 'mediadownload'")
     src = ReplaySource.open(db, tmp_path / "default")
-    runs = src.runs()
-    phases = [detect_phases(src, run) for run in runs]
-    # 3 collect runs, then P1(10) P1(20) P2(10)/marker P2(20)/marker P3(10)/marker P3(30).
-    assert phases[3] == ["channel", "posts", "media"] and phases[4] == phases[3]
-    assert phases[5] == ["posts", "media"] and phases[7] == ["posts", "media"]
-    assert phases[8] == ["channel"], "refused channel: no media phase to replay"
-    # A selection naming another channel than the run established: no media.
-    with sqlite3.connect(db) as conn:
+    phases = [detect_phases(src, run) for run in src.runs()]
+    # 3 collect runs, then per segment a posts run and (if it has files to fetch)
+    # a media-only marker run: P1(10) P1(20) P2(10) P2(20); P3(10) holds only a
+    # repost of a stored file (its media run records the sighting, no download);
+    # P3(30) is refused.
+    assert phases[3] == ["channel", "posts"] and phases[4] == ["media"]
+    assert phases[5] == ["channel", "posts"] and phases[6] == ["media"]
+    assert phases[7] == ["posts"] and phases[8] == ["media"]
+    assert phases[9] == ["posts"] and phases[10] == ["media"]
+    assert phases[11] == ["posts"] and phases[12] == ["media"]
+    assert phases[13] == ["channel"], "refused channel: no media phase to replay"
+
+    legacy = tmp_path / "legacy"
+    settings = load_settings(
+        "default", {"data_dir": legacy, "media_min_free_gb": 0, "media_msgs": [1]}
+    )
+    with Store.open(legacy / "default" / "paperboy.sqlite") as store:
+        fx = _collect_fixtures(10, "chan_a", PHOTOS_A) | {"media": {1: b"a1"}}
+        asyncio.run(collect_channel(
+            FakeGateway(fx), store, settings, parse_target("@chan_a"),
+            ["channel", "history", "media"], LOG,
+        ))
+    ldb = legacy / "default" / "paperboy.sqlite"
+    src = ReplaySource.open(ldb, legacy / "default")
+    assert detect_phases(src, src.runs()[0]) == ["channel", "history", "media"]
+    with sqlite3.connect(ldb) as conn:
+        conn.execute("DELETE FROM raw_records WHERE lower(kind) = 'mediadownload'")
+    src = ReplaySource.open(ldb, legacy / "default")
+    assert detect_phases(src, src.runs()[0]) == ["channel", "history", "media"]
+    with sqlite3.connect(ldb) as conn:
         conn.execute(
             "UPDATE raw_records SET payload_json = json_set(payload_json, '$.channel_id', 999) "
-            "WHERE kind = 'MediaSelection' AND run_id = ?", (runs[3].run_id,),
+            "WHERE kind = 'MediaSelection'"
         )
-    src = ReplaySource.open(db, tmp_path / "default")
-    assert detect_phases(src, src.runs()[3]) == ["channel", "posts"]
+    src = ReplaySource.open(ldb, legacy / "default")
+    assert detect_phases(src, src.runs()[0]) == ["channel", "history"]
 
 
 def test_detect_phases_marker_run_is_posts_and_media(tmp_path):
     db = asyncio.run(build_source(tmp_path))
     src = ReplaySource.open(db, tmp_path / "default")
     phases = [detect_phases(src, run) for run in src.runs()]
-    # Two collect runs, two first segments (channel + posts + media: the
-    # getMessages receipts are not history evidence), two marker segments.
+    # Two collect runs, then per segment a posts run (the getMessages receipts
+    # are not history evidence; the second segment of a channel reuses it via a
+    # marker) and a media-only marker run.
     assert phases[:2] == [["channel", "history"]] * 2
-    assert phases[2] == ["channel", "posts", "media"] and phases[3] == phases[2]
-    assert phases[4] == ["posts", "media"] and phases[5] == ["posts", "media"]
+    assert phases[2:6] == [["channel", "posts"], ["media"]] * 2
+    assert phases[6:] == [["posts"], ["media"]] * 2
 
 
 def test_marker_run_without_posts_evidence_is_media_only(tmp_path):
     """A segment recorded before #91 has a MediaSelection and no getMessages
     receipts: it replays exactly as it did (`media`, and `channel` + `media` for
-    a first segment)."""
+    a first segment). Here the posts runs lose their receipts and the media runs
+    keep their selection."""
     db = asyncio.run(build_source(tmp_path))
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -223,8 +252,8 @@ def test_marker_run_without_posts_evidence_is_media_only(tmp_path):
         )
     src = ReplaySource.open(db, tmp_path / "default")
     phases = [detect_phases(src, run) for run in src.runs()]
-    assert phases[2] == ["channel", "media"] and phases[3] == phases[2]
-    assert phases[4] == ["media"] and phases[5] == ["media"]
+    assert phases[3] == ["media"] and phases[5] == ["media"]
+    assert phases[7] == ["media"] and phases[9] == ["media"]
 
 
 def test_history_evidence_ignores_getmessages_receipts(tmp_path):
@@ -242,8 +271,11 @@ def test_fetched_post_ids(tmp_path):
     src = ReplaySource.open(db, tmp_path / "default")
     runs = src.runs()
     assert src.fetched_post_ids(runs[0]) == []  # history's records are not receipts
-    # Segments in list order: P1(10) [1], P1(20) [11], P2(10) [2, 3], P2(20) [12].
-    assert [src.fetched_post_ids(r) for r in runs[2:]] == [[1], [11], [2, 3], [12]]
+    # Segments in list order: P1(10) [1], P1(20) [11], P2(10) [2, 3], P2(20) [12];
+    # each one's media-only run (every second run) fetched no posts.
+    assert [src.fetched_post_ids(r) for r in runs[2:]] == [
+        [1], [], [11], [], [2, 3], [], [12], [],
+    ]
 
 
 def test_no_media_run_detects_posts_only(tmp_path):
@@ -299,8 +331,8 @@ def test_reproject_replays_marker_runs_to_identical_media_and_custody(
 ):
     db = asyncio.run(build_source(tmp_path))
     src = sqlite3.connect(db)
-    # The repost got its custody row from the P2 segment only (msg 3), and
-    # message 4 - never selected - has none.
+    # The repost 10/3 (photo of 10/1) is held by content once 10/1's file is
+    # stored, yet keeps its own custody row; message 4 - never listed - has none.
     custody = {
         r[0] for r in src.execute("SELECT source_message_uri FROM custody_log")
     }
@@ -317,7 +349,8 @@ def test_reproject_replays_marker_runs_to_identical_media_and_custody(
         markers = conn.execute(
             "SELECT run_id FROM raw_records WHERE kind='ChannelContextReused'"
         ).fetchall()
-        assert len(markers) == 2
+        # Four media-only runs and the two P2 posts runs reuse their channel.
+        assert len(markers) == 6
         assert conn.execute(
             "SELECT count(*) FROM raw_records WHERE kind='MediaSelection'"
         ).fetchone()[0] == 4
@@ -361,7 +394,8 @@ def test_exclude_target_drops_that_channels_marker_runs_too(tmp_path, monkeypatc
         markers = conn.execute(
             "SELECT payload_json FROM raw_records WHERE kind='ChannelContextReused'"
         ).fetchall()
-        assert len(markers) == 1 and '"channel_id": 20' in markers[0][0]
+        # Channel 20: its P1 media run, and its P2 posts and media runs.
+        assert len(markers) == 3 and all('"channel_id": 20' in m[0] for m in markers)
         assert conn.execute(
             "SELECT count(*) FROM custody_log WHERE source_message_uri LIKE 'tg:msg:10/%'"
         ).fetchone()[0] == 0
@@ -402,7 +436,8 @@ def test_reproject_matches_live_for_normal_refused_and_zero_download_segments(
 ):
     db = asyncio.run(build_source(tmp_path, extended=True))
     custody, media = _custody_and_media(db)
-    # Zero-download segment: 10/4 dedup'd to 10/1's file (custody, no MediaDownload).
+    # Zero-download segment: 10/4 is held by 10/1's file, so nothing is
+    # downloaded, but its media run records the sighting as custody.
     assert any(uri == "tg:msg:10/4" for uri, _, _ in custody)
     # Refused segment: nothing for channel 30 anywhere.
     assert not any(uri.startswith("tg:msg:30/") for uri, _, _ in custody)
@@ -434,8 +469,8 @@ def test_marker_replay_reads_the_hash_from_chatfull_not_a_resolve(tmp_path):
     db = asyncio.run(build_source(tmp_path, extended=True))
     src = ReplaySource.open(db, tmp_path / "default")
     marker_runs = [r for r in src.runs() if src.context_markers(r)]
-    assert len(marker_runs) == 3
-    for run in src.runs()[3:8]:
+    assert len(marker_runs) == 8
+    for run in src.runs()[3:13]:
         assert not src.has_kind(run, "resolvedpeer")
     marker = src.context_markers(marker_runs[0])[0]
     assert src.resolved_access_hash(
@@ -484,3 +519,55 @@ def test_no_fetch_from_list_only_collector_in_replay(tmp_path, monkeypatch):
     for collectors in seen:
         assert {ChannelCollector, PostsCollector, MediaCollector} <= set(collectors)
         assert all(c.__module__.startswith("paperboy.collectors.") for c in collectors)
+
+
+def test_reproject_reproduces_an_edited_posts_new_download(tmp_path, monkeypatch):
+    """Parity for #91 B1: post 10/1 was downloaded (file A), then edited to a new
+    photo and fetched again. The live run downloads the new file; replay must
+    reproduce the revision, both files and both custody sightings, and a re-run
+    afterwards (`already_stored`, no new rows) must replay too."""
+    db = asyncio.run(build_source(tmp_path))
+    settings = load_settings("default", {"data_dir": tmp_path, "media_min_free_gb": 0})
+    one = tmp_path / "one.csv"
+    one.write_text("tg:msg:10/1\n", encoding="utf-8")
+
+    async def fetch_again(media: dict, report: str):
+        gw = FakeGateway({
+            "self": {"_": "user", "id": 1, "self": True},
+            "get_messages": {1: {
+                "_": "message", "id": 1, "message": "", "date": 1767322446,
+                "media": {"_": "MessageMediaPhoto", "photo": {"_": "Photo", "id": 9101}},
+            }},
+            "full_channel_by_id": {10: _full(10, "chan_a")},
+            "media": media,
+        })
+        with Store.open(db) as store:
+            summary = await fetch_from_list(
+                gw, store, settings, classify_rows(
+                    store, parse_media_list(one),
+                    media_store=LocalMediaStore(tmp_path / "default"),
+                ), LOG, profile="default", report_path=tmp_path / report,
+            )
+        return summary, gw
+
+    summary, gw = asyncio.run(fetch_again({1: b"a1-edited"}, "edit.csv"))
+    assert summary.counts["downloaded"] == 1 and gw.download_media_calls == [1]
+    summary, gw = asyncio.run(fetch_again({}, "again.csv"))
+    assert summary.counts["already_stored"] == 1 and gw.download_media_calls == []
+
+    src = sqlite3.connect(db)
+    try:
+        sightings = src.execute(
+            "SELECT content_key FROM custody_log WHERE source_message_uri = 'tg:msg:10/1' "
+            "ORDER BY id"
+        ).fetchall()
+        assert [r[0] for r in sightings] == ["photo:101", "photo:9101"]
+        assert src.execute(
+            "SELECT count(*) FROM message_revisions WHERE message_uri = 'tg:msg:10/1'"
+        ).fetchone()[0] == 2
+    finally:
+        src.close()
+
+    result = _reproject(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert_round_trip(db, tmp_path / "default" / "paperboy.reprojected.sqlite")

@@ -422,3 +422,31 @@ def test_guess_ext_unusable_suffix_falls_through_to_mime():
 
     assert _guess_ext("document", "application/pdf", "Statement No. 5") == ".pdf"
     assert _guess_ext("document", None, "Statement No. 5") == ""
+
+
+@pytest.mark.asyncio
+async def test_post_edited_to_new_media_is_downloaded_not_deduped_to_the_old_file(tmp_path):
+    """Dedup is by the content a custody sighting was FOR, not by the message's
+    current media: a post downloaded as photo A, then edited to photo B, must
+    download B (#91)."""
+    settings = _settings(tmp_path)
+    old, new = b"old photo bytes", b"new photo bytes"
+    with Store.open(tmp_path / "p.sqlite") as st:
+        _seed(st, _photo_msg(1, photo_id=100))
+        gw = FakeGateway({"media": {1: old}})
+        await MediaCollector().collect(_ctx(st, gw, settings))
+        _seed(st, _photo_msg(1, photo_id=200))  # the channel edits the post
+        gw2 = FakeGateway({"media": {1: new}})
+        res = await MediaCollector().collect(_ctx(st, gw2, settings))
+        assert res.counts["downloaded"] == 1 and gw2.download_media_calls == [1]
+        sightings = st.conn.execute(
+            "SELECT sha256, content_key FROM custody_log ORDER BY id"
+        ).fetchall()
+        assert [(r["sha256"], r["content_key"]) for r in sightings] == [
+            (hashlib.sha256(old).hexdigest(), "photo:100"),
+            (hashlib.sha256(new).hexdigest(), "photo:200"),
+        ]
+        # A further pass recognises B (and A) as held: custody only, no download.
+        gw3 = FakeGateway({"media": {}})
+        res = await MediaCollector().collect(_ctx(st, gw3, settings))
+        assert res.counts["downloaded"] == 0 and gw3.download_media_calls == []

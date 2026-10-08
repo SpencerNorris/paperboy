@@ -32,6 +32,7 @@
  ],
  "custody_log": [
   {
+   "content_key": "document:9",
    "id": 1,
    "path": "media/7b/7bb6f9f7a47a63e684925af3608c059edcc371eb81188c48c9714896fb1091fd.txt",
    "recorded_at": "2026-01-01T00:00:00+00:00",
