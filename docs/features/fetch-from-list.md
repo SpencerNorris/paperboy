@@ -426,14 +426,15 @@ assert on Rich output, which colour codes break). Run on the final code
 
 ```
 $ uv run pytest -q --basetemp=<scratch>/pytest-91-fix
-1127 passed in 253.75s (0:04:13)
+1136 passed in 160.26s (0:02:40)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
 0 errors, 0 warnings, 0 informations
 ```
 
-Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`):
+Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`, run after the last
+code commit; the docs commit that records this block adds no new path):
 
 ```
 CLAUDE.md README.md
@@ -445,9 +446,9 @@ docs/superpowers/specs/2026-10-06-fetch-from-list-design.md
 src/paperboy/{cli,config,fetch_from_list,fetch_media,gateway,media_list,media_store,progress,replay,reproject}.py
 src/paperboy/collectors/{base,history,media,posts}.py src/paperboy/store/messages.py
 src/paperboy/store/migrations/0008_custody_content_key.sql
-tests/{conftest,test_cli,test_cli_fetch_from_list,test_collector_media,test_collector_posts,
-  test_fetch_from_list,test_fetch_media,test_media_list,test_reproject_fetch_from_list,
-  test_reproject_fetch_media,test_store_migrations}.py
+tests/{conftest,test_cli,test_cli_fetch_from_list,test_collector_media,test_collector_media_stores,
+  test_collector_posts,test_fetch_from_list,test_fetch_media,test_media_list,
+  test_reproject_fetch_from_list,test_reproject_fetch_media,test_store_migrations}.py
 tests/fixtures/reproject/parity_golden.json
 ```
 
@@ -456,18 +457,48 @@ deleted/renamed halves of the rename.)
 
 **Live status: the live re-smoke of THIS final commit is PENDING operator
 approval.** The live-call log is at 6 of 6; no live call was made in the review
-rounds. The live transcripts below ran on earlier commits (before the migration
-and the post-posts media decision); everything on this commit was exercised
-offline only: the full suite, the replay parity tests, and the base-branch
-reproject comparison in the reproject section below.
+rounds. The live transcripts below ran on earlier commits (before migration 0008,
+the post-posts media decision and the channel-first exclusion); everything on this
+commit was exercised offline only: the full suite above, the replay parity tests,
+and the base-branch reproject comparison in the reproject section below.
 
-New tests of round 2 (each written to fail first):
-`test_repost_in_a_later_segment_writes_its_own_custody_row` (a same-command repost
-gets its custody row; failed before with `assert [('tg:msg:10/1', 'photo:555')] ==
-[('tg:msg:10/1', 'photo:555'), ('tg:msg:10/2', 'photo:555')]`),
-`test_excluding_only_a_group_does_not_exclude_its_parent_channel` (both edge
-directions; failed before with `assert not True`), plus the edited-post, handle-once
-and either-direction tests of round 1 and the migration test.
+Tests added or changed in review rounds 1-2 (all committed; each new one was run
+against the code before its fix and failed there, the failing line is quoted):
+
+* `test_repost_in_a_later_segment_writes_its_own_custody_row` (same-channel repost
+  keeps its custody row; re-run adds none). With the one condition that walks a
+  held-but-unrecorded message removed it failed with `assert [('tg:msg:10/...eady_stored')]
+  == [('tg:msg:10/... 'duplicate')]`. (A round-2 DoD cited this test but it had been
+  lost by an overwrite of the test file's tail; it is restored here.)
+* `test_cross_channel_repost_is_already_stored_without_download_or_custody`:
+  failed on the round-2 code with `assert [11] == []` (the repost was downloaded).
+* `test_cross_channel_repost_is_never_too_large`: failed with `assert ('too_large'
+  == 'already_stored'`.
+* `test_group_of_an_excluded_parent_without_a_stored_edge_is_not_fetched`: failed
+  with `assert ('get_messages' not in ['get_self', 'get_full_channel',
+  'get_messages', 'download_media'])`.
+* `test_no_media_edited_post_is_post_only_without_the_old_file`: failed with
+  `assert ('already_sto...f6cfd114.jpg') == ('post_only', ...`.
+* `test_posts_stop_after_partial_batches_still_reports_the_fetched_rows`: failed with
+  `assert ['already_sto..._stored', ...] == ['post_only',...st_only', ...]`.
+* `test_0008_does_not_stamp_a_dedup_sighting_of_a_file_stored_for_an_edited_post`:
+  failed with `assert [None, 'photo:2002'] == [None, None]`.
+* `test_reproject_reproduces_a_sha_dedup_custody_row`: failed without the receipt
+  with `custody_log diverged: only in source: [(... 'tg:msg:10/2', 'local',
+  'photo:102')]`.
+* `test_reproject_reproduces_a_cross_channel_repost`: failed on the round-2 code with
+  `assert (1, 0) == (1, 1)`.
+* `test_excluding_only_a_group_does_not_exclude_its_parent_channel` and
+  `test_excludes_a_group_linked_to_an_excluded_parent_in_either_edge_direction`
+  (round 2; the former failed before the one-way rule with `assert not True`).
+* Updated expectations (run layout is now channel / posts / media; reposts are
+  `duplicate`): `tests/test_reproject_fetch_from_list.py` (19 tests),
+  `test_end_to_end_two_channels_two_tiers`, `test_live_collector_list_is_the_standard_one`,
+  `test_file_already_in_bucket_is_duplicate_without_upload`.
+* `established is None` (the channel phase returning no context without a stop) is
+  handled as a dead channel; it cannot be produced through the fake gateway, so it
+  is covered only through the refused-channel test
+  (`test_channel_phase_skip_continues_with_other_channels`).
 
 Reviewer checks, with output:
 
@@ -482,7 +513,7 @@ notes.
 
 ### Offline smokes
 
-* `tests/test_reproject_fetch_from_list.py` (17 tests) is the parity gate: a
+* `tests/test_reproject_fetch_from_list.py` (19 tests) is the parity gate: a
   source built from `collect` runs plus `fetch-from-list` segments, including an
   edited post (a revision and a metric row), a new text post with author peer and
   forward edge, a `MessageEmpty` tombstone, a refused channel, a zero-download
