@@ -372,27 +372,53 @@ built for this run from two channels already in the store.
 ### Gates (pasted output)
 
 The full suite was run with `TERM=dumb` and `FORCE_COLOR` unset (the CLI tests
-assert on Rich output, which colour codes break).
+assert on Rich output, which colour codes break). Run on the final code
+(round-2 fixes; later commits are documentation only):
 
 ```
-$ uv run pytest -q
-1113 passed in 738.99s (0:12:18)
+$ uv run pytest -q --basetemp=<scratch>/pytest-91-fix
+1127 passed in 253.75s (0:04:13)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
 0 errors, 0 warnings, 0 informations
 ```
 
-Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`, before this
-DoD commit): `CLAUDE.md`, `README.md`, `docs/adr/0005-run-structure.md`,
-`docs/adr/0008-media-stores.md`, `docs/data-model.md`,
-`docs/features/{collect-channel,fetch-from-list,fetch-media,media-stores,pacing,reproject}.md`,
-`docs/how-it-works.md`, `docs/superpowers/plans/2026-10-06-fetch-from-list.md`,
-`docs/superpowers/specs/2026-10-06-fetch-from-list-design.md`,
-`src/paperboy/{cli,config,fetch_from_list,fetch_media,gateway,media_list,media_store,progress,replay,reproject}.py`,
-`src/paperboy/collectors/{base,history,posts}.py`,
-`tests/{test_cli,test_cli_fetch_from_list,test_collector_posts,test_fetch_from_list,test_media_list,test_reproject_fetch_from_list}.py`
-(`fetch-media.md` and `fetch_media.py` appear as the deleted halves of the renames).
+Files in scope (`git diff --name-only origin/dev/gcs-pull...HEAD`):
+
+```
+CLAUDE.md README.md
+docs/adr/0005-run-structure.md docs/adr/0008-media-stores.md
+docs/adr/0009-custody-records-content-key.md docs/data-model.md
+docs/features/{collect-channel,fetch-from-list,fetch-media,media-stores,pacing,reproject}.md
+docs/how-it-works.md docs/superpowers/plans/2026-10-06-fetch-from-list.md
+docs/superpowers/specs/2026-10-06-fetch-from-list-design.md
+src/paperboy/{cli,config,fetch_from_list,fetch_media,gateway,media_list,media_store,progress,replay,reproject}.py
+src/paperboy/collectors/{base,history,media,posts}.py src/paperboy/store/messages.py
+src/paperboy/store/migrations/0008_custody_content_key.sql
+tests/{conftest,test_cli,test_cli_fetch_from_list,test_collector_media,test_collector_posts,
+  test_fetch_from_list,test_fetch_media,test_media_list,test_reproject_fetch_from_list,
+  test_reproject_fetch_media,test_store_migrations}.py
+tests/fixtures/reproject/parity_golden.json
+```
+
+(`fetch-media.md`, `fetch_media.py` and the two `*_fetch_media` test files appear as the
+deleted/renamed halves of the rename.)
+
+**Live status: the live re-smoke of THIS final commit is PENDING operator
+approval.** The live-call log is at 6 of 6; no live call was made in the review
+rounds. The live transcripts below ran on earlier commits (before the migration
+and the post-posts media decision); everything on this commit was exercised
+offline only: the full suite, the replay parity tests, and the base-branch
+reproject comparison in the reproject section below.
+
+New tests of round 2 (each written to fail first):
+`test_repost_in_a_later_segment_writes_its_own_custody_row` (a same-command repost
+gets its custody row; failed before with `assert [('tg:msg:10/1', 'photo:555')] ==
+[('tg:msg:10/1', 'photo:555'), ('tg:msg:10/2', 'photo:555')]`),
+`test_excluding_only_a_group_does_not_exclude_its_parent_channel` (both edge
+directions; failed before with `assert not True`), plus the edited-post, handle-once
+and either-direction tests of round 1 and the migration test.
 
 Reviewer checks, with output:
 
@@ -407,7 +433,7 @@ notes.
 
 ### Offline smokes
 
-* `tests/test_reproject_fetch_from_list.py` (16 tests) is the parity gate: a
+* `tests/test_reproject_fetch_from_list.py` (17 tests) is the parity gate: a
   source built from `collect` runs plus `fetch-from-list` segments, including an
   edited post (a revision and a metric row), a new text post with author peer and
   forward edge, a `MessageEmpty` tombstone, a refused channel, a zero-download
