@@ -56,8 +56,9 @@ between `channel` and `media` that fetches every listed post by `channels.getMes
 `observe_message`), `--no-media`, handle rows for unseen channels resolved live, and
 replay of the `posts` receipts (tagged `method: channels.getMessages`); migration
 0008 `custody_log.content_key` (ADR-0009: media eligibility is decided after `posts`,
-keyed by content; every repost sighting keeps its own custody row; `--exclude-target`
-is one-way, parent -> linked group). Order and protocol:
+keyed by content; every same-channel repost sighting keeps its own custody row, a
+cross-channel repost is `already_stored` without one (#95); `--exclude-target` is
+one-way, parent -> linked group, and decided after the channel is established). Order and protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first

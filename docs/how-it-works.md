@@ -175,11 +175,14 @@ many channels. In plain terms:
    rows are fetched before the rest. Inside a segment ids go in message-id
    order.
 4. **Run each segment as ordinary collect runs** over the same session, in
-   three steps (two runs: channel + posts, then media). First the channel, reached by its id the same way `collect` does
+   three steps (separate runs: the channel once, then the posts, then the media). First the channel, reached by its id the same way `collect` does
    (a key we already saved, a message that mentioned it, or a handle we can
    verify; no name lookup is needed when we hold a key; a link with a handle we
    have never seen is looked up by that handle). A channel we cannot reach is
-   marked `no_access` for its rows and the command goes on. Then the **posts**:
+   marked `no_access` for its rows and the command goes on. Only once the channel is
+   established is `--exclude-target` applied to it, because a discussion group
+   of an excluded channel is recognisable only from what Telegram says about it
+   (its metadata is stored, nothing else is fetched). Then the **posts**:
    one request per 100 ids, and each answer is saved as raw first and then
    turned into a message row, exactly as `history` does it, so a post we never
    had appears, an edit becomes a revision, new view counts become a metric row
@@ -188,9 +191,11 @@ many channels. In plain terms:
    post we look at the photo or document it carries *now* (Telegram's id for it,
    remembered with every custody row, [ADR-0009](adr/0009-custody-records-content-key.md)) and download only what this run's
    store does not hold. A post edited to a different photo therefore downloads the
-   new one. A repost of a file we hold is not downloaded again, but it still gets
-   its own custody row (where and when the file appeared); a message that already
-   has its row is left alone, so re-runs add nothing. Later segments of a channel reuse the first
+   new one. A repost of a file we hold, in the same channel, is not downloaded again but
+   still gets its own custody row (where and when the file appeared); a repost
+   whose file is held under *another* channel is just reported as already stored
+   (no download, no custody row); a message that already has its row is left
+   alone, so re-runs add nothing. Later segments of a channel reuse the first
    one's access and leave a small note, `ChannelContextReused` (channel id and
    the run that got access, never the key). A segment also notes which message
    ids its media step was allowed to fetch (`MediaSelection`), just before the

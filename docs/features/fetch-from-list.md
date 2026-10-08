@@ -85,7 +85,17 @@ added to the excluded set, so its later segments are caught too. Tests:
 `test_excludes_a_group_linked_to_an_excluded_parent_in_either_edge_direction`,
 `test_excluding_only_a_group_does_not_exclude_its_parent_channel`. It is a guard for
 running against a store that still holds an investigation the operator does not
-want pulled. A target the store has never seen, or one that is not a channel
+want pulled. **Exclusion is fail-closed.** The stored edge may not exist yet (a group whose
+parent was never collected with it), and a group of an excluded parent is
+recognisable only from the `ChatFull` it reports (`linked_chat_id`). So an id
+segment's channel is established ALONE first (the `channel` phase records the
+edge), `--exclude-target` is re-checked against the result, and only then are
+posts fetched; before this, an unknown group was fetched in the same run that
+revealed it. Test:
+`test_group_of_an_excluded_parent_without_a_stored_edge_is_not_fetched`.
+**Limitation:** that establishing run stores the channel's own metadata
+(`channels`, snapshots, edges, peers) even for a channel that turns out to be
+excluded; no posts, media or messages are fetched for it. A target the store has never seen, or one that is not a channel
 handle/id, exits 1 before anything else is done (excluding nothing by accident
 would download what was meant to be kept out).
 
@@ -156,12 +166,14 @@ of the pair, so every P1 segment runs before any P2 segment (without a
 `priority` column: one segment per channel). Within a segment ids are fetched
 ascending; list order decides only the order of segments.
 
-Each segment is **two** ordinary `collect_channel` runs over the **standard**
-collectors: run 1 is `channel` + `posts`, run 2 (only when something needs
-media) is `media` alone. In order:
+A channel's first segment starts with a run of its own, `channel` alone; every
+segment then has a `posts` run and, only when something needs media, a `media`
+run. All are ordinary `collect_channel` runs over the **standard** collectors
+(the later ones reuse the established channel). In order:
 
-1. **`channel`**, targeting the channel id from the list row (or the handle,
-   above). It reaches the channel through #84's Step A (saved key, then a
+1. **`channel`**, alone, once per channel per command, targeting the channel id
+   from the list row (or the handle, above). Exclusion is decided only after it
+   (see "Exclusion is fail-closed" below). It reaches the channel through #84's Step A (saved key, then a
    message that referenced it, then a verified stored handle; see
    `docs/features/collect-channel.md`), records a `ChannelAccess` receipt, and
    refuses an answer for any other id (`full_chat.id == requested id`). A handle
@@ -176,9 +188,14 @@ media) is `media` alone. In order:
    `discussion` behave and test exactly as before): a new post gets its message
    row, author peer and forward edge; an edit appends a `message_revisions` row;
    a counter change appends a `message_metrics` row; `MessageEmpty` becomes a
-   tombstone, never a blank row. Cost: ⌈ids/100⌉ calls per segment.
-3. **`media`** (a SECOND run of the segment, a marker run that reuses the
-   channel the first established), unless `--no-media` or nothing needs it. What
+   tombstone, never a blank row. Cost: ⌈ids/100⌉ calls per segment. After
+   it, every fetched row is re-judged on the post as stored now (held file,
+   `stored`, `media_held`), **whether or not a media run follows**: under
+   `--no-media`, or when the phase stopped after some batches, the report still
+   describes the stored post (an edited post whose new photo is not held is
+   `post_only` with an empty sha, never `already_stored` with the old file).
+3. **`media`** (a further run of the segment, a marker run that reuses the
+   channel), unless `--no-media` or nothing needs it. What
    needs it is decided only now, on the posts the first run just stored (spec
    2.2 step 3): for each fetched post the CURRENT `media_json` is turned into a
    content key and looked up in the custody index (`load_content_index`,
@@ -187,22 +204,37 @@ media) is `media` alone. In order:
    * **not held**: no file for that content in this run's store - it is
      downloaded (this is what makes a post edited to a different photo download
      the new one, not report the old file); or
-   * **held but unrecorded**: the file is held (stored under another message, a
-     repost) but THIS message has no custody row for the content yet - the media
-     phase records the sighting and skips the download (outcome `duplicate`).
+   * **held but unrecorded, same channel**: the file is held under a custody
+     sighting of THIS channel (a repost) but this message has no custody row
+     for the content yet - the media phase records the sighting and skips the
+     download (outcome `duplicate`).
    A message that already has its own custody row for the content is left out:
    walking it again would add a `duplicate` row on every re-run. So **every
-   sighting keeps its own custody row** (provenance: where and when a file
-   appeared, with its content key); only the download is skipped. The offline
-   `media_held` flag is only a preview and the report's `already_stored`
-   reflects this post-posts decision.
+   same-channel sighting keeps its own custody row** (provenance: where and
+   when a file appeared, with its content key); only the download is skipped.
+
+   **A cross-channel repost is different (operator decision, ADR-0009, follow-up
+   #95).** A row whose current content is held only under ANOTHER channel is
+   reported `already_stored` with the holding file and is **not walked**: no
+   download and no custody row of its own. It is decided before any size cap, so
+   `--media-max-mb` can never turn it into `too_large`, and a re-run does not
+   select it again. The selection and the media phase use the same per-channel
+   index (`load_content_index(conn, channel_id)`), so they agree on what is a
+   download and what a duplicate. The sighting is still recoverable from the
+   data: `SELECT m.uri, c.sha256, c.path FROM messages m JOIN custody_log c ON
+   c.content_key = CASE lower(json_extract(m.media_json,'$._')) WHEN
+   'messagemediaphoto' THEN 'photo:' || json_extract(m.media_json,'$.photo.id')
+   WHEN 'messagemediadocument' THEN 'document:' ||
+   json_extract(m.media_json,'$.document.id') END` finds every message
+   carrying a content that a custody row recorded, in any channel.
+   The offline `media_held` flag is only a preview.
 
 Budget, guardrails, dedup, custody, streaming, `--media-max-mb` and the
 free-disk floor apply unchanged. One gateway (one MTProto session, one
 `Budget`) serves the whole command, so `--max-rpc` bounds it all.
 
-A channel is established once per command: later segments of it, and each
-segment's own media run, receive the cached `ChannelContext` (in-process only,
+A channel is established once per command: its later runs (every segment's
+posts and media run) receive the cached `ChannelContext` (in-process only,
 never persisted) and skip `channel`, appending one `ChannelContextReused` marker
 instead. Likewise an unknown `@handle` is resolved once per command: if it
 appears under two priorities, the second segment reuses the id the first
@@ -269,7 +301,7 @@ Each segment is a normal run, with additions so `reproject` reproduces it (see
 `docs/features/reproject.md`, "Replaying `fetch-from-list` runs", and ADR-0005):
 
 * `ChannelContextReused` `{channel_id, source_run_id}` (no access hash) opens a
-  segment that reused a channel; replay runs it without a `channel` phase,
+  run (a segment's posts run or media run) that reused a channel; replay runs it without a `channel` phase,
   rebuilding the context from the source run's `ChatFull` (which carries the
   channel object whichever route got the run in; a first segment that took route
   1 has no `ResolvedPeer`).
@@ -321,6 +353,23 @@ downloads that content again (a redundant download, never a missed one).
 * **`MessageEmpty` above the newest post (M4)** is projected as an `empty`
   tombstone, as `history` does; it cannot be told from a deletion (see
   "Deviations"), and a later live answer clears it.
+
+## Review fixes (round 2)
+
+* **Exclusion fail-closed (F2):** the channel is established alone before
+  exclusion is decided (see "Input").
+* **Backfill key (F4):** migration 0008 stamps a sighting only when its own
+  message AND the message its file was originally stored for are both stable on
+  that key (`test_0008_does_not_stamp_a_dedup_sighting_of_a_file_stored_for_an_edited_post`).
+* **Cross-channel repost (F1):** `already_stored`, not walked, no custody row
+  (Segments, step 3; ADR-0009; follow-up #95).
+* **Sha-dedup receipt:** the media phase's safety-net dedup (two photo ids, same
+  bytes) wrote a custody row with no raw receipt, so `reproject` dropped it - in
+  plain `collect` too. It now leaves a `MediaDownload` receipt (the bytes were
+  fetched), stamped with the same time as the custody row
+  (`test_reproject_reproduces_a_sha_dedup_custody_row`).
+* **`--no-media` misreport (F3):** rows are re-judged after the posts run
+  whether or not media follows.
 
 ## Deviations from the plan / spec
 
@@ -636,20 +685,29 @@ not: `media` over all three channels (source 50, reprojected 2) and
 `custody_log` over all three channels (source 161, reprojected 2).** They are
 not a `fetch-from-list` defect:
 
-* The 48 missing `media` rows are `@<C>` downloads from older plain media runs
-  (2026-09-24/26) whose raw rows carry no `MediaSelection` marker; the
-  `custody_log` gap (159 rows) is consistent with the same loss (those downloads
-  wrote custody rows too; not itemised here). The earlier reproject of this store (before the re-smoke) dropped
-  them too.
-* To test that claim instead of asserting it, `reproject` was run from the base
-  branch (`dev/gcs-pull` @ 7e6de9d, no #91 code) against the same scratch source
-  store, same scope, fresh output (offline). Result for the three channels:
-  `media` source 50, base-reprojected 2, #91-reprojected 2; `custody_log` source
-  161, base-reprojected 2, #91-reprojected 2 (whole store: `media` 306 vs 2,
-  `custody_log` 1838 vs 2, in both). The base branch loses exactly the same rows,
-  so the gap predates #91. Tracked in issue #94 (comment with these counts); not
-  fixed here because it is orthogonal to `fetch-from-list` and independent of this
-  change's code.
+* **Cause (evidence).** The scratch source store is a `sqlite3 .backup`: it holds
+  the database only, not the media files. Of the 50 `media` rows of the three
+  channels, 48 point at files absent from the scratch `media/` directory
+  (checked by file existence; 2 exist). `reproject` skips a media row whose file
+  is missing, by design (it re-verifies each file's sha). Each reproject log, the
+  #91 branch's and the base branch's, holds exactly 48 `replay: media file
+  missing for sha ...` warnings, one per lost row. Of the 159 lost
+  `custody_log` rows, 158 are the same cause (their file is absent); the other is
+  the bucket sighting written by smoke invocation 2, which replay skipped with
+  "receipt names a bucket outside the allow-list" because
+  `PAPERBOY_MEDIA_STORE_BUCKETS` was not set for the reproject. 158 + 1 + the 2
+  kept rows = 161.
+* **Base-branch check.** `reproject` from the base branch (`dev/gcs-pull` @
+  7e6de9d, no #91 code), same source, same scope, fresh output (offline): `media`
+  source 50, base-reprojected 2, #91-reprojected 2; `custody_log` source 161, 2,
+  2 (whole store: `media` 306 vs 2, `custody_log` 1838 vs 2, in both). The base
+  loses the same rows, so it is not a #91 regression, and the cause above makes
+  it not a bug at all in a profile that has its files. Issue #94 (which had
+  guessed "no `MediaSelection` marker") was corrected and closed as not planned.
+* **PENDING:** the bucket sighting's replay (custody id 1837) is unverified. It
+  needs an operator reproject with the bucket allow-listed
+  (`PAPERBOY_MEDIA_STORE_BUCKETS`) and ADC; I did not run it (it would read the
+  bucket).
 
 ### Docs updated
 

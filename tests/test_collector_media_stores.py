@@ -133,7 +133,12 @@ async def test_file_already_in_bucket_is_duplicate_without_upload(tmp_path, monk
         assert client.bucket("bkt").calls["upload"] == 0
         last = st.conn.execute("SELECT * FROM custody_log ORDER BY id DESC").fetchone()
         assert (last["store"], last["sha256"]) == (URL, sha)
-        assert len(_payload(st)) == 1  # custody only: no new receipt
+        # The bytes were fetched to be verified, so the run leaves a receipt for the
+        # custody row (reproject has no other trace of it; #91 review).
+        receipts = _payload(st)
+        assert len(receipts) == 2
+        assert {r.get("store") for r in receipts} == {None, URL}  # local run, bucket run
+        assert {r["sha256"] for r in receipts} == {sha}
 
 
 @pytest.mark.asyncio

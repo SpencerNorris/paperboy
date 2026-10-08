@@ -235,7 +235,10 @@ when the channel was established; replay walks only those ids, so a repost that
 the live run never considered gets no dedup custody row on replay. Since #91 the
 ids are decided after the `posts` phase, in a media run of their own (a repost
 sighting listed there keeps its custody row, with its `content_key`, on replay
-too: `tests/test_reproject_fetch_from_list.py`). (3) The
+too: `tests/test_reproject_fetch_from_list.py`). A cross-channel repost is not in any
+selection (it was not walked), so replay writes no custody row for it either; the
+media phase's sha-dedup custody row (two photo ids, identical bytes) is replayed
+from the `MediaDownload` receipt it now leaves. (3) The
 `posts` phase (#91) appends every object `channels.getMessages` answered as an
 ordinary message raw record whose context carries `method:
 "channels.getMessages"`.
