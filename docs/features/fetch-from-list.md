@@ -459,12 +459,207 @@ tests/fixtures/reproject/parity_golden.json
 (`fetch-media.md`, `fetch_media.py` and the two `*_fetch_media` test files appear as the
 deleted/renamed halves of the rename.)
 
-**Live status: the live re-smoke of THIS final commit is PENDING operator
-approval.** The live-call log is at 6 of 6; no live call was made in the review
-rounds. The live transcripts below ran on earlier commits (before migration 0008,
-the post-posts media decision and the channel-first exclusion); everything on this
-commit was exercised offline only: the full suite above, the replay parity tests,
-and the base-branch reproject comparison in the reproject section below.
+**Live status.** The final live re-smoke (operator-approved, 2026-10-09) ran twice
+against the scratch store only (no bucket, no downloads). Redaction as above:
+`<A>` is the channel of row 1, `<B>` that of row 3, `<id1>`/`<id2>` the message
+ids. Transcripts, by filename in `<scratch>/91/`: `smoke7-dryrun.unredacted.txt`,
+`smoke7.unredacted.txt`, `smoke7-report.csv`, `vpn-7.txt`, `smoke8.unredacted.txt`,
+`smoke8-report.csv`, `vpn-8.txt` (live-call log: 8 lines, 7 and 8 annotated as
+operator-approved). Before each call both Telegram DCs routed via `utun4`
+(`vpn-7.txt`, `vpn-8.txt`). The list is the 3-row list of the earlier re-smoke:
+
+```
+t.me/<A>/<id1>      (a text-only post, username link)
+tg:msg:<A>/<id1>    (the same message by id)
+tg:msg:<B>/<id2>    (a photo post whose file the store holds)
+```
+
+DEBUG `rpc ...` lines are omitted from the excerpts (12 RPCs in each run); everything
+else is verbatim apart from ANSI codes and the redactions.
+
+**Invocation 7 (commit 6cbc742)**, offline dry run first on the smoke store. It
+applied migration 0008 to the real-size store, and the new migration log shows
+how long that took:
+
+```
+[10/08/26 22:13:10] DEBUG    migration 0008_custody_content_key: applying
+[10/08/26 22:13:51] INFO     migration 0008_custody_content_key: applied in
+                             41.07s
+```
+
+(41.07 s wall on this run, on a disk busy at the time; the separate measurement
+above gave 21.87 s with the indexes and 106.68 s without, on a `.backup` copy of the
+same store. The first open of the store runs the backfill.) The live run, exit 0:
+
+```
+       fetch-from-list: offline
+            classification
+┏━━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┓
+┃ outcome       ┃ rows ┃ declared GB ┃
+┡━━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━┩
+│ pending       │    2 │        0.00 │
+│ needs_resolve │    0 │        0.00 │
+│ excluded      │    0 │        0.00 │
+│ duplicate_row │    1 │        0.00 │
+│ total         │    3 │        0.00 │
+└───────────────┴──────┴─────────────┘
+                  fetch-from-list: per channel (rows by state)
+┏━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+┃ chann… ┃        ┃        ┃        ┃        ┃        ┃       ┃        ┃       ┃
+┃     id ┃ pendi… ┃ in_st… ┃ not_y… ┃ media… ┃ needs… ┃ excl… ┃ dupli… ┃ total ┃
+┡━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+│ <B>… │      1 │      1 │      0 │      1 │      0 │     0 │      0 │     1 │
+│ <A>… │      1 │      1 │      0 │      0 │      0 │     0 │      1 │     2 │
+└────────┴────────┴────────┴────────┴────────┴────────┴───────┴────────┴───────┘
+              fetch-from-list: segment plan (list order)
+┏━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃ segment ┃ priority ┃ channel id ┃ rows ┃ posts calls ┃ declared GB ┃
+┡━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
+│       1 │ -        │ <A> │    1 │           1 │        0.00 │
+│       2 │ -        │ <B> │    1 │           1 │        0.00 │
+└─────────┴──────────┴────────────┴──────┴─────────────┴─────────────┘
+[10/08/26 22:14:08] INFO     pacing: factor=2.0 default=2.0s
+                             contacts.resolveUsername=10.0s; flood ceiling=60s
+                    INFO     ▶ channel
+[10/08/26 22:14:12] INFO     channel access: id=<A> via=saved_key
+                             granted=True error=None
+                    INFO     ✓ channel · channels=1 peers=2 · 2s
+                    INFO     fetch-from-list: segment 1/2 priority=None
+                             channel=<A> rows=1 start
+                    INFO     ▶ posts
+                    INFO     posts: batch 1/1 (1 ids) done
+                    INFO     ✓ posts · messages=1 revisions=0 tombstones=0
+                             edges=0 · 0s
+[10/08/26 22:14:15] INFO     ▶ media
+[10/08/26 22:14:16] INFO     media: store local
+[10/08/26 22:14:17] INFO     media: 0 selected message(s) have media to fetch;
+                             770 other(s) not selected
+                    WARNING  media: 1 selected id(s) have no stored, in-window
+                             media: [<id1>]
+                    INFO     ✓ media · downloaded=0 duplicates=0 unavailable=0
+                             skipped_kind=0 skipped=0 size_mismatch=0
+                             out_of_window=0 not_selected=770 too_large=0 · 2s
+                    INFO     fetch-from-list: segment 1/2 priority=None
+                             channel=<A> rows=1 end: posts {'fetched':
+                             1}; media no files considered
+                    INFO     ▶ channel
+                    INFO     channel access: id=<B> via=saved_key
+                             granted=True error=None
+                    INFO     ✓ channel · channels=1 peers=1 · 0s
+                    INFO     fetch-from-list: segment 2/2 priority=None
+                             channel=<B> rows=1 start
+                    INFO     ▶ posts
+                    INFO     posts: batch 1/1 (1 ids) done
+                    INFO     ✓ posts · messages=1 revisions=1 tombstones=0
+                             edges=0 · 0s
+[10/08/26 22:14:24] INFO     fetch-from-list: segment 2/2 priority=None
+                             channel=<B> rows=1 end: posts {'fetched':
+                             1}; media no files considered
+                    INFO     fetch-from-list: {'no_media': 1, 'duplicate_row':
+                             1, 'already_stored': 1}; 0 bytes downloaded; report
+                             <report>.csv
+  fetch-from-list: result
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━┓
+┃ outcome          ┃ rows ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━┩
+│ already_stored   │    1 │
+│ duplicate_row    │    1 │
+│ no_media         │    1 │
+│ bytes downloaded │    0 │
+└──────────────────┴──────┘
+report: <scratch>/91/<report>.csv
+```
+
+```
+line_no,uri,outcome,post,sha256,key,reason
+1,tg:msg:<A>/<id1>,no_media,fetched,,,
+2,tg:msg:<A>/<id1>,duplicate_row,skipped,,,
+3,tg:msg:<B>/<id2>,already_stored,fetched,e7c822cc9750...,media/e7/e7c822cc9750....jpg,
+```
+
+It exposed a bug: row 1 is a text-only post, yet it got a `media` run and the
+WARNING `media: 1 selected id(s) have no stored, in-window media`. The same
+needless run had been in both October-7 smokes. Fixed in 3bd26b9
+(`test_text_only_post_runs_no_media_phase`).
+
+**Invocation 8 (commit 3bd26b9, the fix)**, same list, exit 0 (the offline tables
+are the same as above and are omitted):
+
+```
+[10/08/26 22:20:50] INFO     pacing: factor=2.0 default=2.0s
+                             contacts.resolveUsername=10.0s; flood ceiling=60s
+[10/08/26 22:20:52] INFO     ▶ channel
+                    INFO     channel access: id=<A> via=saved_key
+                             granted=True error=None
+                    INFO     ✓ channel · channels=1 peers=2 · 2s
+                    INFO     fetch-from-list: segment 1/2 priority=None
+                             channel=<A> rows=1 start
+                    INFO     ▶ posts
+[10/08/26 22:20:54] INFO     posts: batch 1/1 (1 ids) done
+                    INFO     ✓ posts · messages=1 revisions=0 tombstones=0
+                             edges=0 · 0s
+[10/08/26 22:20:57] INFO     fetch-from-list: segment 1/2 priority=None
+                             channel=<A> rows=1 end: posts {'fetched':
+                             1}; media no files considered
+                    INFO     ▶ channel
+                    INFO     channel access: id=<B> via=saved_key
+                             granted=True error=None
+                    INFO     ✓ channel · channels=1 peers=1 · 1s
+                    INFO     fetch-from-list: segment 2/2 priority=None
+                             channel=<B> rows=1 start
+                    INFO     ▶ posts
+                    INFO     posts: batch 1/1 (1 ids) done
+                    INFO     ✓ posts · messages=1 revisions=1 tombstones=0
+                             edges=0 · 0s
+[10/08/26 22:21:01] INFO     fetch-from-list: segment 2/2 priority=None
+                             channel=<B> rows=1 end: posts {'fetched':
+                             1}; media no files considered
+                    INFO     fetch-from-list: {'no_media': 1, 'duplicate_row':
+                             1, 'already_stored': 1}; 0 bytes downloaded; report
+                             <report>.csv
+  fetch-from-list: result
+┏━━━━━━━━━━━━━━━━━━┳━━━━━━┓
+┃ outcome          ┃ rows ┃
+┡━━━━━━━━━━━━━━━━━━╇━━━━━━┩
+│ already_stored   │    1 │
+│ duplicate_row    │    1 │
+│ no_media         │    1 │
+│ bytes downloaded │    0 │
+└──────────────────┴──────┘
+report: <scratch>/91/<report>.csv
+```
+
+```
+line_no,uri,outcome,post,sha256,key,reason
+1,tg:msg:<A>/<id1>,no_media,fetched,,,
+2,tg:msg:<A>/<id1>,duplicate_row,skipped,,,
+3,tg:msg:<B>/<id2>,already_stored,fetched,e7c822cc9750...,media/e7/e7c822cc9750....jpg,
+```
+
+There is no `media` run for the text-only post and no WARNING; the photo post
+re-fetched its post and was `already_stored` (held, with its own custody row), so
+it had no media run either.
+
+Results of both runs: no FLOOD_WAIT, PEER_FLOOD or auth error; 12 RPCs each; 0 bytes
+downloaded; `custody_log` stayed at 1838 rows and `media` at 306 (no downloads, no
+new custody rows).
+
+Known issue the smoke surfaced (not part of this change): every fetch of a media
+post appends a revision (`posts ... revisions=1` on every run). The only difference
+is the rotating `file_reference` inside `media_json`, which the content hash covers.
+It predates #91 and is tracked in #96, which must land before the real pull.
+
+**Offline rebuild of the smoke store: not run this round.** These smokes downloaded
+nothing, so they wrote no new receipts to round-trip; the parity tests
+(`tests/test_reproject_fetch_from_list.py`, `tests/test_reproject_bucket.py`) cover
+reproject. The earlier reproject of this store is in the section above.
+
+### Follow-ups
+
+* #95: record a custody sighting for a cross-channel repost (today it is
+  `already_stored` with no custody row of its own; ADR-0009).
+* #96: stop appending a revision for a rotated `file_reference` alone. Must land
+  before the real pull.
 
 Tests added or changed in review rounds 1-2 (all committed; each new one was run
 against the code before its fix and failed there, the failing line is quoted):
