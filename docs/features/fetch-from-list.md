@@ -404,10 +404,10 @@ migration's start and duration (`migration <name>: applying` / `applied in Ns`; 
   nothing tried) writes no `ChannelAccess`, so that segment's run holds only the
   self `User` raw and `reproject` skips it with its "no resolve records"
   WARNING (#84 behaviour). Nothing was fetched for it.
-* A re-fetch can append a revision with no human edit: Telegram rotates the
-  `file_reference` inside a photo or document's `media_json`, and the content
-  hash covers `media_json`. The live smoke below shows it (one revision per
-  re-fetch of a photo post).
+* Telegram rotates the `file_reference` inside a photo or document's `media_json`
+  on every fetch. Since #96 the revision hash ignores it, so a re-fetch of an
+  unchanged post records `revisions=0`. The live smoke below predates the fix and
+  shows the old behaviour (one phantom revision per re-fetch of a photo post).
 * Within a segment ids arrive in id order, not list order.
 * A SIGKILL mid-segment leaves no report (rows persist; `.incoming` parts are
   swept next run; a re-run re-fetches posts and skips held media).
@@ -644,10 +644,9 @@ Results of both runs: no FLOOD_WAIT, PEER_FLOOD or auth error; 12 RPCs each; 0 b
 downloaded; `custody_log` stayed at 1838 rows and `media` at 306 (no downloads, no
 new custody rows).
 
-Known issue the smoke surfaced (not part of this change): every fetch of a media
-post appends a revision (`posts ... revisions=1` on every run). The only difference
-is the rotating `file_reference` inside `media_json`, which the content hash covers.
-It predates #91 and is tracked in #96, which must land before the real pull.
+Known issue the smoke surfaced (fixed by #96): every fetch of a media post
+appended a revision (`posts ... revisions=1` on every run). The only difference was
+the rotating `file_reference` inside `media_json`, which the content hash covered.
 
 **Offline rebuild of the smoke store: not run this round.** These smokes downloaded
 nothing, so they wrote no new receipts to round-trip; the parity tests
@@ -658,8 +657,9 @@ reproject. The earlier reproject of this store is in the section above.
 
 * #95: record a custody sighting for a cross-channel repost (today it is
   `already_stored` with no custody row of its own; ADR-0009).
-* #96: stop appending a revision for a rotated `file_reference` alone. Must land
-  before the real pull.
+* #96 (done): a rotated `file_reference` alone no longer appends a revision.
+  Collapsing phantom revisions already in existing stores is a separate decision;
+  `reproject` rebuilds them away (revisions come from raw replay).
 
 Tests added or changed in review rounds 1-2 (all committed; each new one was run
 against the code before its fix and failed there, the failing line is quoted):

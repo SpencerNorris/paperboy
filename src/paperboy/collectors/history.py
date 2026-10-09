@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, peer_ref_uri, peer_stub
+from paperboy.ids import peer_ref_uri, peer_stub
 from paperboy.store.edges import add_edge
-from paperboy.store.messages import mark_deleted, upsert_message
+from paperboy.store.messages import mark_deleted, upsert_message_revised
 from paperboy.store.peers import upsert_peer
 from paperboy.store.sync import add_range, get_state, set_state
 from paperboy.targets import Target
@@ -25,15 +25,6 @@ from paperboy.targets import Target
 _HISTORY_PAGE_SIZE = 100
 _GET_MESSAGES_CHUNK = 200
 _CHANNEL_DIFFERENCE_LIMIT = 100
-
-
-def _latest_revision_hash(ctx: CollectContext, uri: str) -> str | None:
-    row = ctx.store.conn.execute(
-        "SELECT content_hash FROM message_revisions WHERE message_uri=? "
-        "ORDER BY observed_at DESC, id DESC LIMIT 1",
-        (uri,),
-    ).fetchone()
-    return row["content_hash"] if row else None
 
 
 def observe_message(
@@ -79,12 +70,11 @@ def observe_message(
         m.get("_", "Message"), m, ctx.tier, context,
         observed_at=observed_at,
     )
-    uri = msg_uri(channel_id, m["id"])
-    before = _latest_revision_hash(ctx, uri)
-    upsert_message(ctx.store, channel_id, m, raw_id, observed_at, ctx.tier)
-    after = _latest_revision_hash(ctx, uri)
+    uri, revised = upsert_message_revised(
+        ctx.store, channel_id, m, raw_id, observed_at, ctx.tier
+    )
     counts["messages"] += 1
-    if after != before:
+    if revised:
         counts["revisions"] += 1
 
     # We only have the bare peer reference here (no username/name) — record

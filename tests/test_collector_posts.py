@@ -96,6 +96,22 @@ async def test_refetch_edit_adds_revision_and_metric(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_refetch_unchanged_photo_post_records_no_revision(tmp_path):
+    """#96: Telegram re-issues `file_reference` on every fetch; not an edit."""
+    def photo(ref):
+        return {"_": "messageMediaPhoto",
+                "photo": {"_": "Photo", "id": 9, "file_reference": ref}}
+
+    with Store.open(tmp_path / "p.sqlite") as st:
+        first = FakeGateway({"get_messages": {3: _m(3, media=photo("aa"))}})
+        await PostsCollector().collect(_posts_ctx(st, first, [3]))
+        again = FakeGateway({"get_messages": {3: _m(3, media=photo("bb"))}})
+        res = await PostsCollector().collect(_posts_ctx(st, again, [3]))
+        assert res.counts["revisions"] == 0
+        assert st.conn.execute("select count(*) from message_revisions").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
 async def test_message_empty_is_tombstone_deleted_upstream(tmp_path):
     gw = FakeGateway({})  # an id missing from the table answers MessageEmpty
     outcomes: dict[str, str] = {}

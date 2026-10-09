@@ -109,7 +109,9 @@ replays exactly as it did then (handle path) and writes no `ChannelAccess` row
   `deleted_at` is set for both, never for a plain `gap`.
 - **Edited messages**: a changed `content_hash` appends a
   `message_revisions` row and updates current state; identical content only
-  advances `last_seen`.
+  advances `last_seen`. The hash ignores Telegram's rotating `file_reference`
+  tokens, so re-fetching an unchanged photo/document message is not an edit (#96;
+  [data model](../data-model.md#message_revisions--edit-history)).
 - **Multi-username channels/peers** (Fragment-purchased extra handles):
   Telegram reports the legacy `username` field as `null` and lists every
   handle in `usernames[]` instead; `ids.primary_username` falls back to the
