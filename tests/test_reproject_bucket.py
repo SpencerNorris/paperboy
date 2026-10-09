@@ -165,3 +165,56 @@ def test_avatar_only_bucket_run_reprojects_with_bucket_custody(tmp_path, monkeyp
     assert receipts and all(json.loads(r[0])["store"] == URL for r in receipts)
     # The marker must not make replay invent a media phase.
     assert _rows(out, "SELECT count(*) FROM raw_records WHERE kind='MediaDownload'") == [(0,)]
+
+
+def test_bucket_duplicate_receipt_round_trips_through_reproject(tmp_path, monkeypatch):
+    """A bucket run finds the object already in the bucket (an orphan nobody
+    recorded), re-fetches and CRC-verifies it, and writes a `duplicate` custody row.
+    It also leaves a `MediaDownload` receipt (store = the bucket), which `reproject`
+    needs to reproduce that row (#91 review)."""
+    import hashlib
+    import logging
+
+    from paperboy.config import load_settings
+    from paperboy.recipes import collect_channel
+    from paperboy.store.db import Store
+    from paperboy.targets import parse_target
+    from tests.fakes import FakeGateway
+    from tests.test_reproject_fetch_from_list import _collect_fixtures
+
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    data = b"orphan-bytes"
+    sha = hashlib.sha256(data).hexdigest()
+    key = f"media/{sha[:2]}/{sha}.jpg"
+    log = logging.getLogger("t")
+    local = load_settings("default", {"data_dir": tmp_path, "media_min_free_gb": 0})
+    bucket = load_settings(
+        "default", {"data_dir": tmp_path, "media_min_free_gb": 0, **BUCKET_OVER}
+    )
+    phases = ["channel", "history", "media"]
+    db = tmp_path / "default" / "paperboy.sqlite"
+    with Store.open(db) as store:
+        fx = _collect_fixtures(10, "chan_a", {1: 101}) | {"media": {1: data}}
+        asyncio.run(collect_channel(
+            FakeGateway(fx), store, local, parse_target("@chan_a"), phases, log))
+        client.bucket("bkt").objects[f"p/x/{key}"] = data  # the orphan object
+        # Message 2 (a distinct photo id, the same bytes) is unknown to the content
+        # index, so only the post-download sha match can recognise it.
+        fx2 = _collect_fixtures(10, "chan_a", {1: 101, 2: 102}) | {
+            "media": {1: data, 2: data}
+        }
+        asyncio.run(collect_channel(
+            FakeGateway(fx2), store, bucket, parse_target("@chan_a"), phases, log))
+        assert store.conn.execute(
+            "SELECT count(*) FROM custody_log WHERE source_message_uri = 'tg:msg:10/2'"
+        ).fetchone()[0] == 1
+        assert {r[0] for r in store.conn.execute("SELECT store FROM custody_log")} == {
+            "local", URL,
+        }
+    assert client.bucket("bkt").calls["upload"] == 0  # nothing was written
+    monkeypatch.setenv("PAPERBOY_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PAPERBOY_MEDIA_STORE_BUCKETS", "bkt")
+    out = _reproject_default(tmp_path, monkeypatch)
+    assert_round_trip(db, out)
+    assert {r[0] for r in _rows(out, "SELECT store FROM custody_log")} == {"local", URL}

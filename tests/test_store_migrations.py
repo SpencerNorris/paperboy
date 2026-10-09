@@ -260,3 +260,17 @@ def test_0008_does_not_stamp_a_dedup_sighting_of_a_file_stored_for_an_edited_pos
         conn.executescript((_MIGRATIONS_DIR / "0008_custody_content_key.sql").read_text())
         assert [r[0] for r in conn.execute(
             "select content_key from custody_log order by id")] == [None, None]
+
+
+def test_migration_runner_logs_start_and_duration(tmp_path, caplog):
+    """A slow migration must be visible: each applied migration logs its name and
+    how long it took (#91: 0008 was quadratic and silent for minutes)."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="paperboy.store"):
+        Store.open(tmp_path / "p.sqlite").close()
+    messages = [r.getMessage() for r in caplog.records]
+    assert "migration 0008_custody_content_key: applying" in messages
+    assert any(
+        m.startswith("migration 0008_custody_content_key: applied in ") for m in messages
+    )

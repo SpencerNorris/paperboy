@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import shutil
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1090,3 +1091,124 @@ async def test_posts_stop_after_partial_batches_still_reports_the_fetched_rows(t
     assert [r["outcome"] for r in rows[:100]] == ["post_only"] * 100
     assert {r["sha256"] for r in rows[:100]} == {""}
     assert rows[100]["outcome"] == "not_attempted"
+
+
+# ── a failed refresh never leaves stale flags or hides the original error ──
+
+
+def _partial_batches_setup(st, tmp_path):
+    """101 messages that all look held offline (photo 7, stored by a first run)."""
+    seed_channel(st, 10, "chan_a", access_hash=100)
+    for i in range(1, 102):
+        seed_msg(st, 10, i, photo_id=7)
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_drops_stale_held_flags(tmp_path, monkeypatch):
+    """The posts phase stops after one batch and re-judging the fetched rows then
+    FAILS: the offline flags describe the posts as they were before this run, so
+    they are dropped - no row may be reported `already_stored` with an old file."""
+    from paperboy import fetch_from_list as fm
+    from paperboy.budget import PhaseStop
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    ids = range(1, 102)
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _partial_batches_setup(st, tmp_path)
+        await fetch_from_list(
+            _gateway({1: b"seven"}, get_messages={1: _photo_msg(1, 7)}), st,
+            _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        classified = _classified(st, tmp_path, "".join(f"tg:msg:10/{i}\n" for i in ids))
+        assert all(c.media_held for c in classified)  # stale: every row looks held
+        monkeypatch.setattr(fm, "_refresh_rows", broken)
+        gw = _gateway(
+            {}, get_messages={i: _photo_msg(i, 90_000 + i) for i in ids},
+            get_messages_errors=[None, PhaseStop("flood wait 3600s")],
+        )
+        summary = await fetch_from_list(
+            gw, st, _settings(tmp_path), classified, LOG,
+            profile="p", report_path=report, with_media=False,
+        )
+    assert "posts phase_stop" in (summary.stop_reason or "")  # the original ending
+    rows = _report(report)
+    assert [r["outcome"] for r in rows[:100]] == ["post_only"] * 100
+    assert {r["sha256"] for r in rows[:100]} == {""}
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_does_not_hide_the_original_error(tmp_path, monkeypatch):
+    from paperboy import fetch_from_list as fm
+
+    class Boom(Exception):
+        pass
+
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(fm, "_refresh_rows", broken)
+    gw = _gateway(BYTES, get_messages_errors=[Boom("posts bug")])
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        with pytest.raises(Boom, match="posts bug"):
+            await fetch_from_list(
+                gw, st, _settings(tmp_path), _classified(st, tmp_path), LOG,
+                profile="p", report_path=report,
+            )
+    assert {r["outcome"] for r in _report(report)} == {"not_attempted"}
+
+
+# ── an unrecorded bucket object is not "held" (selection agrees with the media phase) ──
+
+
+@pytest.mark.asyncio
+async def test_cross_channel_repost_on_an_orphan_bucket_object_is_not_already_stored(
+    tmp_path, monkeypatch
+):
+    """The bucket holds an object for the file but no custody row names the bucket
+    (an orphan). The media phase would re-fetch and CRC-verify it before adopting
+    it, so the selection must not call it held: the repost is walked, not
+    reported `already_stored` on an unverified object."""
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"orphan-bytes"
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    bucket_settings = load_settings(
+        "default",
+        {"data_dir": tmp_path, "media_min_free_gb": 0,
+         "media_store": "gs://bkt/p/x", "media_store_buckets": "bkt"},
+    )
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        await fetch_from_list(  # file stored by a LOCAL run, in channel 10
+            _gateway({1: data}, get_messages={1: _photo_msg(1, 1001)}),
+            st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/1\n"), LOG,
+            profile="p", report_path=tmp_path / "r0.csv",
+        )
+        (held,) = _report(tmp_path / "r0.csv")
+        client.bucket("bkt").objects[f"p/x/{held['key']}"] = data  # the orphan
+        gw = _gateway({11: data}, get_messages={11: _photo_msg(11, 1001)})
+        from paperboy.media_store import build_media_store
+
+        rows = classify_rows(
+            st, parse_media_list(_write(tmp_path, "tg:msg:20/11\n")),
+            media_store=build_media_store(bucket_settings, "p"),
+        )
+        assert not rows[0].media_held  # the offline preview agrees
+        await fetch_from_list(
+            gw, st, bucket_settings, rows, LOG, profile="p", report_path=tmp_path / "r1.csv",
+        )
+        (row,) = _report(tmp_path / "r1.csv")
+    assert row["outcome"] != "already_stored" and gw.download_media_calls == [11]
+
+
+def _write(tmp_path, text):
+    path = tmp_path / "orphan-list.csv"
+    path.write_text(text, encoding="utf-8")
+    return path
