@@ -263,8 +263,9 @@ def held_file(
     caller reads the row after the posts phase has refreshed it - and the file a
     custody sighting recorded for that very content (`load_content_index`), never
     by what an older version of the post once downloaded (#91). A custody row
-    naming the store answers offline; otherwise one existence check (a bucket
-    dry run therefore touches GCS - metadata GETs - but never Telegram)."""
+    naming the store answers offline; otherwise, for a store that cannot verify
+    objects (local), an existence check. An unrecorded object in a verifiable
+    store (an orphan bucket object) is not held. No GCS call is made."""
     if (media_kind or "").lower() not in DOWNLOADABLE_KINDS or not media_json:
         return None
     key = content_key(json.loads(media_json))
@@ -272,7 +273,14 @@ def held_file(
     if file is None:
         return None
     sha, path = file
-    if stored_in(store.conn, sha, media_store.store_id) or media_store.exists(path):
+    if stored_in(store.conn, sha, media_store.store_id):
+        return file
+    # No custody row names this store. A store that cannot verify an object
+    # (the local folder) is trusted on existence, exactly as the media phase's
+    # `_held` does; a verifiable one (a bucket) is NOT: an object nobody
+    # recorded is re-fetched and CRC-verified by the media phase before it is
+    # adopted as evidence, so the selection must not call it held either.
+    if not media_store.verifiable and media_store.exists(path):
         return file
     return None
 

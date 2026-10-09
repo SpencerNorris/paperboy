@@ -381,10 +381,9 @@ async def _run_segments(
             # stopped after some batches are refreshed too: their report must
             # describe the post as stored now, not as classified offline.
             if not refreshed:
-                try:
-                    _refresh_rows(store, media_store, cid, seg_rows, post_outcomes)
-                except MediaStoreError:
-                    log.warning("%s: cannot reach the media store to refresh rows", label)
+                _refresh_or_forget(
+                    store, media_store, cid, seg_rows, post_outcomes, log, label
+                )
             for r in seg_rows:
                 _settle(
                     store, r, post_outcomes.get(r.classified.uri),
@@ -432,6 +431,26 @@ async def _run_media_step(
         log.warning("%s: media phase stopped (%s); ending the command", label, reason)
         return f"media phase_stop ({reason})"
     return None
+
+
+def _refresh_or_forget(
+    store: Store, media_store: MediaStore, channel_id: int, seg_rows: list[RowResult],
+    post_outcomes: dict[str, str], log: logging.Logger, label: str,
+) -> None:
+    """`_refresh_rows` for the cleanup path (a `finally`): it must never raise, or
+    it would hide the error that brought us here. If it fails, the offline flags
+    on the fetched rows are stale (they describe the post BEFORE this run), so
+    they are cleared: `_settle` then cannot report `already_stored` with an old
+    file. The failure is logged with its traceback."""
+    try:
+        _refresh_rows(store, media_store, channel_id, seg_rows, post_outcomes)
+    except Exception:
+        log.exception(
+            "%s: cannot refresh the fetched rows; their stored-file info is dropped", label
+        )
+        for r in seg_rows:
+            if post_outcomes.get(r.classified.uri) == "fetched":
+                r.classified.media_held, r.classified.stored = False, None
 
 
 def _refresh_rows(

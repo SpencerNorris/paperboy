@@ -22,6 +22,7 @@ import base64
 import json
 import logging
 import sqlite3
+import time
 from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
@@ -104,11 +105,14 @@ class Store:
             stem = sql_path.stem
             if stem in applied:
                 continue
+            log.info("migration %s: applying", stem)
+            started = time.perf_counter()
             self.conn.executescript(sql_path.read_text())
             self.conn.execute(
                 "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                 (stem, utc_now_iso()),
             )
+            log.info("migration %s: applied in %.2fs", stem, time.perf_counter() - started)
 
     def begin_run(self, run_id: str | None = None) -> str:
         """Mark the start of one collect pass (ADR-0005): every subsequent

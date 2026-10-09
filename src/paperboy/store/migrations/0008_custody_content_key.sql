@@ -22,6 +22,9 @@
 -- message's sightings, avatar sightings (no message), sightings whose file has
 -- no media row. raw_records is not modified.
 
+-- The temp tables are indexed by uri: without it the NOT EXISTS / EXISTS probes
+-- below scan them per row (quadratic; minutes on a store of 30k messages).
+
 ALTER TABLE custody_log ADD COLUMN content_key TEXT;
 
 CREATE TEMP TABLE _msg_key AS
@@ -33,6 +36,7 @@ SELECT m.uri AS uri,
                THEN 'document:' || json_extract(m.media_json, '$.document.id')
        END AS key
 FROM messages m;
+CREATE INDEX temp._msg_key_uri ON _msg_key(uri);
 
 CREATE TEMP TABLE _rev_key AS
 SELECT r.message_uri AS uri,
@@ -43,6 +47,7 @@ SELECT r.message_uri AS uri,
                THEN 'document:' || json_extract(r.media_json, '$.document.id')
        END AS key
 FROM message_revisions r;
+CREATE INDEX temp._rev_key_uri ON _rev_key(uri);
 
 -- Messages that never carried a content key other than their current one.
 CREATE TEMP TABLE _stable_key AS
@@ -52,6 +57,7 @@ WHERE k.key IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM _rev_key r WHERE r.uri = k.uri AND COALESCE(r.key, '') <> k.key
   );
+CREATE INDEX temp._stable_key_uri ON _stable_key(uri);
 
 UPDATE custody_log
 SET content_key = (
