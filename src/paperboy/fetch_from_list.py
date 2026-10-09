@@ -486,7 +486,13 @@ def _refresh_rows(
         ).fetchone()
         if msg is None:
             continue
-        key = content_key(json.loads(msg["media_json"])) if msg["media_json"] else None
+        if (msg["media_kind"] or "").lower() not in DOWNLOADABLE_KINDS or not msg["media_json"]:
+            # Nothing downloadable (a text post, a poll, ...): never walked. It
+            # settles as `no_media` (or `post_only`), and a segment with no row to
+            # walk runs no media phase at all.
+            c.in_store, c.stored, c.media_held = True, None, False
+            continue
+        key = content_key(json.loads(msg["media_json"]))
         same_channel = key is not None and key in channel_index
         file = held_file(
             store, media_store, msg["media_kind"], msg["media_json"],

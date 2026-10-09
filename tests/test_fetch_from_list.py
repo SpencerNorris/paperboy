@@ -555,6 +555,39 @@ async def test_no_media_outcome_for_text_post(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_text_only_post_runs_no_media_phase(tmp_path, monkeypatch):
+    """A fetched post with nothing downloadable is never walked: no `media` run at
+    all (it used to cost a marker run and a "no stored, in-window media" WARNING),
+    and the row still settles as `no_media`."""
+    from paperboy import fetch_from_list as fm
+    from paperboy.collectors.media import MediaCollector
+
+    seen = []
+    real = fm.collect_channel_with_context
+
+    async def spy(*args, **kwargs):
+        seen.extend(type(c) for c in kwargs["collectors"])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(fm, "collect_channel_with_context", spy)
+    text_post = {"_": "message", "id": 4, "message": "hi", "date": 1767322445}
+    gw = _gateway({}, get_messages={4: text_post})
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _store_without_posts(st)
+        await fetch_from_list(
+            gw, st, _settings(tmp_path), _classified(st, tmp_path, "tg:msg:10/4\n"), LOG,
+            profile="p", report_path=report,
+        )
+        assert st.conn.execute(
+            "SELECT count(*) FROM raw_records WHERE kind = 'MediaSelection'"
+        ).fetchone()[0] == 0
+    assert MediaCollector not in seen
+    [row] = _report(report)
+    assert (row["outcome"], row["post"]) == ("no_media", "fetched")
+
+
+@pytest.mark.asyncio
 async def test_posts_phase_stop_ends_the_command(tmp_path):
     gw = _gateway(BYTES, get_messages_errors=[PhaseStop("flood wait 3600s")])
     report = tmp_path / "r.csv"
