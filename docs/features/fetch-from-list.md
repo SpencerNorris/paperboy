@@ -430,7 +430,7 @@ assert on Rich output, which colour codes break). Run on the final code
 
 ```
 $ uv run pytest -q --basetemp=<scratch>/pytest-91-fix
-1136 passed in 160.26s (0:02:40)
+1141 passed in 172.39s (0:02:52)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
@@ -448,10 +448,10 @@ docs/features/{collect-channel,fetch-from-list,fetch-media,media-stores,pacing,r
 docs/how-it-works.md docs/superpowers/plans/2026-10-06-fetch-from-list.md
 docs/superpowers/specs/2026-10-06-fetch-from-list-design.md
 src/paperboy/{cli,config,fetch_from_list,fetch_media,gateway,media_list,media_store,progress,replay,reproject}.py
-src/paperboy/collectors/{base,history,media,posts}.py src/paperboy/store/messages.py
+src/paperboy/collectors/{base,history,media,posts}.py src/paperboy/store/{db,messages}.py
 src/paperboy/store/migrations/0008_custody_content_key.sql
 tests/{conftest,test_cli,test_cli_fetch_from_list,test_collector_media,test_collector_media_stores,
-  test_collector_posts,test_fetch_from_list,test_fetch_media,test_media_list,
+  test_collector_posts,test_fetch_from_list,test_fetch_media,test_media_list,test_reproject_bucket,
   test_reproject_fetch_from_list,test_reproject_fetch_media,test_store_migrations}.py
 tests/fixtures/reproject/parity_golden.json
 ```
@@ -499,6 +499,24 @@ against the code before its fix and failed there, the failing line is quoted):
   `duplicate`): `tests/test_reproject_fetch_from_list.py` (19 tests),
   `test_end_to_end_two_channels_two_tiers`, `test_live_collector_list_is_the_standard_one`,
   `test_file_already_in_bucket_is_duplicate_without_upload`.
+* Review round 3 (minors):
+  * `test_failed_refresh_drops_stale_held_flags` (a failed re-judge drops the stale
+    flags; failed before with `sqlite3.OperationalError: disk I/O error` escaping
+    the `finally`).
+  * `test_failed_refresh_does_not_hide_the_original_error` (failed before with the
+    refresh error replacing `Boom: posts bug`).
+  * `test_cross_channel_repost_on_an_orphan_bucket_object_is_not_already_stored`
+    (failed before with `assert ('already_stored' != 'already_stored')`).
+  * `test_bucket_duplicate_receipt_round_trips_through_reproject` (failed against
+    the pre-receipt `media.py` with `custody_log diverged: only in source:
+    [(... 'tg:msg:10/2', 'gs://bkt/p/x', 'photo:102')]`).
+  * `test_migration_runner_logs_start_and_duration` (failed before with
+    `assert 'migration 0008_custody_content_key: applying' in []`).
+  * Updated for the rule that an unrecorded bucket object is not held:
+    `test_already_stored_is_per_store`,
+    `test_dry_run_against_bucket_makes_no_gcs_call_and_never_builds_a_gateway`
+    (renamed), `test_collect_media_flag_downloads_and_stays_off_without_it`
+    (asserts `▶ media`, since migration log lines mention "media").
 * `established is None` (the channel phase returning no context without a stop) is
   handled as a dead channel; it cannot be produced through the fake gateway, so it
   is covered only through the refused-channel test
@@ -514,6 +532,22 @@ $ git diff --stat origin/dev/gcs-pull -- tests/test_collector_history.py tests/t
 `fetch-media` no longer appears outside historical plans and specs, the
 `media-stores.md` transcripts (annotated), and the "named `fetch-media` until #91"
 notes.
+
+### Migration 0008 timing (offline, `.backup` copy of the scratch store)
+
+The backfill's temp tables had no index, so its probes were quadratic. Each run
+applied the migration SQL to its own fresh `sqlite3 .backup` copy of the scratch
+store (at migration 0007, 1838 `custody_log` rows), measured with
+`<scratch>/mig91/run.py`:
+
+```
+old-0008.sql (no indexes): wall 106.68s cpu 85.53s
+0008 with indexes:         wall  21.87s cpu  1.14s
+$ cmp keys-old.txt keys-new.txt   (id|content_key of every custody_log row)
+content_key columns IDENTICAL
+```
+
+(The remaining wall time is I/O on the 560 MB file; the CPU time is 1.14 s.)
 
 ### Offline smokes
 
