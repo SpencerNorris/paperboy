@@ -155,40 +155,64 @@ fingerprints, which is the one case where a rebuild touches the network; it
 never contacts Telegram. "Already have it" is checked per store: a file
 from a local run is downloaded again for a bucket run.
 
-`paperboy fetch-media LIST` (#68) pulls media for a prioritised list of
-messages that can span many channels. In plain terms:
+`paperboy fetch-from-list LIST` (#68, #91; called `fetch-media` before #91) pulls
+the posts, and then their media, for a prioritised list of messages that can span
+many channels. In plain terms:
 
 1. **Read the list.** Each row names one message. If any row is malformed the
    whole command stops before touching anything and says which lines.
-2. **Sort the rows offline.** Against what is already stored, every row is
-   labelled: already downloaded, not in the store, no media, deleted,
-   excluded (`--exclude-target` names its channel), or still to do. No network
-   is used, so `--dry-run` can show this for the whole list, channel by
-   channel, for free.
+2. **Sort the rows offline.** Against what is already stored, a row is a
+   duplicate, excluded (`--exclude-target` names its channel, and also its linked
+   discussion group; excluding only a group never excludes its parent channel) or
+   still to do. Every
+   row that is still to do will have its post fetched, whether we hold it or
+   not, so the offline step only counts what we already have: posts in the
+   store, posts not yet collected, media already in this run's store. No network
+   is used, so `--dry-run` can show this for the whole list, channel by channel,
+   for free.
 3. **Cut the to-do rows into segments.** One segment is "this priority, this
    channel", in the order they first appear in the list, so all the important
-   rows are fetched before the rest. Inside a segment files come in message-id
+   rows are fetched before the rest. Inside a segment ids go in message-id
    order.
-4. **Run each segment as an ordinary collect run** over the same session,
-   reaching the channel by its id the same way `collect` does (a key we
-   already saved, a message that mentioned it, or a handle we can verify; no
-   name lookup is needed when we hold a key). A channel we cannot reach is
-   marked `no_access` for its rows and the command goes on. Later segments of
-   a channel reuse the first one's access and leave a small note,
-   `ChannelContextReused` (channel id and the run that got access, never the
-   key). Each segment also notes which channel and which message ids it was
-   allowed to fetch (`MediaSelection`), just before the download starts.
-5. **Replay follows the notes.** `reproject` reads those two notes to rebuild
-   exactly the same `media` and `custody_log` rows, offline, with no new
-   tables. It replays a download only where access was actually granted: a
-   channel that was refused leaves nothing to replay.
-6. **A report for every row.** The report CSV has one line per input row and
-   what happened to it. If the command stops early (a hard stop, the disk
-   floor, a long Telegram wait) the rows it did not reach say
-   `not_attempted`; run the same command again and it picks up where it left
-   off, because finished rows now read `already_stored`.
+4. **Run each segment as ordinary collect runs** over the same session, in
+   three steps (separate runs: the channel once, then the posts, then the media). First the channel, reached by its id the same way `collect` does
+   (a key we already saved, a message that mentioned it, or a handle we can
+   verify; no name lookup is needed when we hold a key; a link with a handle we
+   have never seen is looked up by that handle). A channel we cannot reach is
+   marked `no_access` for its rows and the command goes on. Only once the channel is
+   established is `--exclude-target` applied to it, because a discussion group
+   of an excluded channel is recognisable only from what Telegram says about it
+   (its metadata is stored, nothing else is fetched). Then the **posts**:
+   one request per 100 ids, and each answer is saved as raw first and then
+   turned into a message row, exactly as `history` does it, so a post we never
+   had appears, an edit becomes a revision, new view counts become a metric row
+   and a deleted post becomes a tombstone. Posts we already hold are asked for
+   again so they are current. Then, once the posts are stored, the **media**: for each fetched
+   post we look at the photo or document it carries *now* (Telegram's id for it,
+   remembered with every custody row, [ADR-0009](adr/0009-custody-records-content-key.md)) and download only what this run's
+   store does not hold. A post edited to a different photo therefore downloads the
+   new one. A repost of a file we hold, in the same channel, is not downloaded again but
+   still gets its own custody row (where and when the file appeared); a repost
+   whose file is held under *another* channel is just reported as already stored
+   (no download, no custody row); a message that already has its row is left
+   alone, so re-runs add nothing. Later segments of a channel reuse the first
+   one's access and leave a small note, `ChannelContextReused` (channel id and
+   the run that got access, never the key). A segment also notes which message
+   ids its media step was allowed to fetch (`MediaSelection`), just before the
+   download starts.
+5. **Replay follows the notes.** `reproject` reads those notes, and the
+   `channels.getMessages` tag on the saved post answers, to rebuild exactly the
+   same messages, revisions, `media` and `custody_log` rows, offline. The one
+   schema change is migration 0008, a `content_key` column on `custody_log`. It replays a step only where it actually ran: a channel that was
+   refused leaves nothing to replay.
+6. **A report for every row.** The report CSV has one line per input row, what
+   happened to its post and what happened to its media. If the command stops
+   early (a hard stop, the disk floor, a long Telegram wait) the rows it did not
+   reach say `not_attempted`; run the same command again and it picks up where it
+   left off, fetching the posts again and skipping the media we now hold
+   (`already_stored`).
 
-Details, outcomes and stop rules: [`features/fetch-media.md`](features/fetch-media.md).
+Details, outcomes and stop rules: [`features/fetch-from-list.md`](features/fetch-from-list.md).
 
 ## 7. Where to read next
 

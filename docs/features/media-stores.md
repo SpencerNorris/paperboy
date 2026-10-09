@@ -12,12 +12,12 @@
 Each run's media goes to **one** store, never both: the local profile folder
 (the default), or a GCS bucket with **no local copy**. The database always
 stays local and is the system of record; only media bytes move. `collect
---media`, `fetch-media` and avatars (`--profiles`) all go through the same
+--media`, `fetch-from-list` and avatars (`--profiles`) all go through the same
 store. Mac first, using the operator's own Application Default Credentials.
 
 ## Inputs
 
-- `--media-store gs://<bucket>/<prefix>` on `collect` and `fetch-media`, or
+- `--media-store gs://<bucket>/<prefix>` on `collect` and `fetch-from-list`, or
   `PAPERBOY_MEDIA_STORE`. Unset = local. Validated at load: the bucket name
   must be well formed, the prefix non-empty with no empty, `.` or `..`
   segments, and a trailing `/` is dropped.
@@ -90,15 +90,15 @@ store. Mac first, using the operator's own Application Default Credentials.
 - **Avatars** use the same path (temp file, `exists`, create-only commit); a
   known avatar already held by the run's store is not fetched again.
 - **doctor / preflight.** With a store configured, `doctor` and the
-  `collect`/`fetch-media` preflight add four checks: `media_store_credentials`
+  `collect`/`fetch-from-list` preflight add four checks: `media_store_credentials`
   (fail), `media_store_permissions` (fail unless `storage.objects.create` and
   `get` are granted), `media_store_least_privilege` (**warn** if `delete` is
   granted: expected on the operator's Mac, never blocks), and
   `media_store_retention` (reports the retention span and versioning; a warning
   if `storage.buckets.get` is not granted, as for the VM service account). A
   bad bucket therefore blocks before any Telegram download.
-- **fetch-media.** `already_stored` is per store; a bucket `--dry-run` makes
-  read-only metadata GETs to GCS and never contacts Telegram (`fetch-media.md`).
+- **fetch-from-list.** `media_held` (outcome `already_stored`) is per store; a bucket `--dry-run` makes
+  no GCS call (only a custody row names a bucket as holding a file) and never contacts Telegram (`fetch-from-list.md`).
 - **Reproject (the network exception).** Bucket receipts are read back with
   ranged GETs, only for allow-listed buckets, re-hashed against the receipt
   sha, no writes; see `reproject.md`, "Bucket reads". The media collector in
@@ -121,7 +121,7 @@ small smoke files cost 93 days of retention.
 - No migration of an existing local archive into a bucket (mirrored by hand
   already, so the per-store `exists` check answers correctly for both).
 - No parallel uploads; no copy-into-bucket from `reproject`.
-- A bucket `fetch-media --dry-run` and a bucket `reproject` need ADC and touch
+- A bucket `fetch-from-list --dry-run` and a bucket `reproject` need ADC and touch
   GCS (not Telegram).
 - `--unsafe` skips the doctor preflight, including the store checks.
 
@@ -148,10 +148,10 @@ the operator's terminal environment; that is not a code defect.)
 Files in scope: the name-only diff against `origin/dev/gcs-pull` lists 48 files
 (it was 46 at the first review, not 50). They are: `CLAUDE.md`, `README.md`, `docs/adr/0003-guardrails.md`,
 `docs/adr/0008-media-stores.md`, `docs/data-model.md`,
-`docs/features/{fetch-media,media-stores,media-streaming,reproject}.md`,
+`docs/features/{fetch-from-list,media-stores,media-streaming,reproject}.md`,
 `docs/how-it-works.md`, `docs/opsec.md`,
 `docs/superpowers/plans/2026-10-06-media-stores.md`, `pyproject.toml`,
-`uv.lock`, `src/paperboy/{cli,config,doctor,fetch_media,media_list,media_sink,media_store,recipes,replay,reproject}.py`,
+`uv.lock`, `src/paperboy/{cli,config,doctor,fetch_from_list,media_list,media_sink,media_store,recipes,replay,reproject}.py`,
 `src/paperboy/collectors/{media,profiles}.py`,
 `src/paperboy/store/migrations/0007_media_stores.sql`, and the matching tests
 (`tests/fake_gcs.py` is the in-memory GCS fake; `tests/conftest.py` asserts no
@@ -159,6 +159,9 @@ test ever attempts a bucket delete; `tests/fixtures/reproject/parity_golden.json
 gains only `"store": "local"` on each `custody_log` row).
 
 ### Smoke test transcript
+
+(Historical: the transcripts below use the command's name at the time,
+`fetch-media`, renamed `fetch-from-list` in #91, and its pre-#91 outcome words.)
 
 Scratch data dir `<scratch>` (an `sqlite3 ".backup"` of the real store, never
 the real store itself), `PAPERBOY_REQUIRE_PROXY=false`, `--profile default`,
@@ -348,7 +351,7 @@ operator-approved override of the 3-file cap.
 ### Docs updated
 
 `docs/features/media-stores.md` (new), `docs/features/media-streaming.md`,
-`docs/features/reproject.md`, `docs/features/fetch-media.md`, `README.md`,
+`docs/features/reproject.md`, `docs/features/fetch-from-list.md`, `README.md`,
 `CLAUDE.md`, `docs/data-model.md`, `docs/how-it-works.md`, `docs/opsec.md`,
 `docs/adr/0008-media-stores.md` (new), `docs/adr/0003-guardrails.md`
 (amendment), `docs/superpowers/plans/2026-10-06-media-stores.md`.

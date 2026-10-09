@@ -34,8 +34,7 @@ default-on (`profiles` full enrichment behind `--profiles`), with the `users`/
 `docs/features/media-stores.md`): each run's media goes to the local profile folder
 or a write-once GCS bucket (`--media-store`, `PAPERBOY_MEDIA_STORE[_BUCKETS]`), no
 local copy, create-only uploads, no delete path, per-store dedup, `custody_log.store`
-(migration 0007), reproject reads bucket receipts read-only. #91 `fetch-from-list`
-is next and builds on `MediaStore`. Earlier in the chain: #69
+(migration 0007), reproject reads bucket receipts read-only. Earlier in the chain: #69
 pacing (`--pacing-factor`, `--max-flood-sleep`; migration 0005) and #62
 profile-relative media keys (ADR-0007; migration 0006) have merged. #64 media streaming is on `feat/media-streaming`
 (PR pending; `docs/features/media-streaming.md`): streamed downloads,
@@ -47,11 +46,20 @@ untouched. #75 replay lookup performance is on
 `scripts/unreferenced_media.py`, replay now verifies each media sha; no
 migration — `docs/features/reproject.md` "Splitting a mixed profile"). #84 collect
 by id is merged (PR #86; `docs/features/collect-channel.md`). #68
-`fetch-media LIST` is on `feat/fetch-media-by-id` (PR pending →
-`dev/media-storage`; `docs/features/fetch-media.md`): ordered cross-channel media
+`fetch-from-list LIST` (named `fetch-media` until #91) merged: ordered cross-channel
 pull, each channel reached by id through the standard `channel` phase,
 `--exclude-target`, `MediaSelection` names the channel so reproject walks the same
-rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+rows; no migration. #91 `fetch-from-list` is on `feat/fetch-from-list` (PR pending →
+`dev/gcs-pull`; `docs/features/fetch-from-list.md`): the rename, plus a `posts` phase
+between `channel` and `media` that fetches every listed post by `channels.getMessages`
+(≤100 ids per call, the same projection `history` uses via the shared
+`observe_message`), `--no-media`, handle rows for unseen channels resolved live, and
+replay of the `posts` receipts (tagged `method: channels.getMessages`); migration
+0008 `custody_log.content_key` (ADR-0009: media eligibility is decided after `posts`,
+keyed by content; every same-channel repost sighting keeps its own custody row, a
+cross-channel repost is `already_stored` without one (#95); `--exclude-target` is
+one-way, parent -> linked group, and decided after the channel is established). Order and protocol:
+`docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
 
 ## Read these first
 
@@ -123,8 +131,8 @@ rows; no migration. Order and protocol: `docs/superpowers/specs/2026-09-28-media
 `uv sync`; `uv run pytest -q`; `uv run ruff check`; `uv run pyright`;
 `uv run paperboy --help`. The CLI: `auth`, `doctor`, `collect TARGET
 [--phases channel,history] [--unsafe] [--pacing-factor F] [--max-flood-sleep S] [--media-store gs://B/P]`
-(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-media LIST [--dry-run] [--report OUT.csv] [--exclude-target T …] [--media-store gs://B/P]` (ordered cross-channel
-media pull, #68 — `docs/features/fetch-media.md`; per-run stores, #63 — `docs/features/media-stores.md`), `status [TARGET]`, `export TARGET
+(also on `doctor`; defaults 2.0 / 3600 — `docs/features/pacing.md`), `fetch-from-list LIST [--dry-run] [--no-media] [--report OUT.csv] [--exclude-target T …] [--media-store gs://B/P]` (ordered cross-channel
+post + media pull, #68/#91 — `docs/features/fetch-from-list.md`; per-run stores, #63 — `docs/features/media-stores.md`), `status [TARGET]`, `export TARGET
 --format jsonl --out DIR` — all read `api_id`/`api_hash`/session for
 `--profile` (default `default`) from the OS keychain via `keyring` (macOS/Windows/Linux; tested on macOS — see issue #10) (`scripts/store_api.py`,
 `scripts/login.py`, or `paperboy auth`). `reproject [--profile P] [--out

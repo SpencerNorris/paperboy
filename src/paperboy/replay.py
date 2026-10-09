@@ -29,6 +29,7 @@ import httpx
 from paperboy import media_store as _media_store
 from paperboy.budget import SkipAndRecord
 from paperboy.clock import ReplayClock
+from paperboy.collectors.posts import GET_MESSAGES_METHOD
 from paperboy.config import parse_media_store_url
 from paperboy.gateway import REPLAY_UNKNOWN_USER_KIND
 from paperboy.ids import primary_username
@@ -669,13 +670,22 @@ class ReplaySource:
     def has_history_evidence(self, run: ReplayRun) -> bool:
         """Whether `run` left any trace of a `history` phase: a message, or the
         `getChannelDifference` page `catch_up` always records. A run without
-        one (`--phases channel`, a fetch-media segment) must not replay
+        one (`--phases channel`, a fetch-from-list segment) must not replay
         `history`, which would append a synthetic difference raw the source
-        never had."""
+        never had. Messages the `posts` phase fetched (context `method`
+        `channels.getMessages`, #91) are NOT history evidence."""
         index = self.index(run)
-        return bool(index.entries(_MESSAGE_KINDS)) or bool(
-            index.entries(("channeldifference",), "contains")
-        )
+        return any(
+            e.ctx.get("method") != GET_MESSAGES_METHOD for e in index.entries(_MESSAGE_KINDS)
+        ) or bool(index.entries(("channeldifference",), "contains"))
+
+    def fetched_post_ids(self, run: ReplayRun) -> list[int]:
+        """The message ids the run's `posts` phase fetched by `channels.getMessages`
+        (#91), ascending - empty for any run that had no such phase. They become
+        `post_msgs` on replay, so the replayed phase asks for exactly what the
+        live one received."""
+        found = self.index(run).lookup(_MESSAGE_KINDS, ("method",), (GET_MESSAGES_METHOD,))
+        return sorted({e.payload_id for e in found if e.payload_id is not None})
 
     def has_kind(self, run: ReplayRun, *kinds: str) -> bool:
         return bool(self.index(run).entries(kinds))
@@ -698,7 +708,7 @@ class ReplaySource:
         return markers
 
     def context_markers(self, run: ReplayRun) -> list[RunMarker]:
-        """The run's `ChannelContextReused` markers (a fetch-media segment that
+        """The run's `ChannelContextReused` markers (a fetch-from-list segment that
         reused an already-resolved channel; payload `{channel_id, source_run_id}`)."""
         return self._markers(run, "channelcontextreused")
 

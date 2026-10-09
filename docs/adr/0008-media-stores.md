@@ -90,7 +90,7 @@ whole file has streamed.
   receipt sha. No Telegram, no keychain, no writes. A receipt for an unlisted
   bucket, missing ADC or a missing object is a per-file skip. A local-only
   source builds no GCS client. `--out-profile` copies into the local profile.
-- `doctor` and the `collect`/`fetch-media` preflight check credentials,
+- `doctor` and the `collect`/`fetch-from-list` preflight check credentials,
   `storage.objects.create`/`get`, warn if `storage.objects.delete` is granted
   (expected on the operator's Mac), and print retention/versioning (a warning
   if `storage.buckets.get` is not granted).
@@ -99,8 +99,9 @@ whole file has streamed.
 
 - Evidence in the bucket is write-once; mistakes are recoverable only by an
   operator lifting retention.
-- A bucket dry run of `fetch-media` touches GCS (metadata GETs), never
-  Telegram.
+- A bucket dry run of `fetch-from-list` never contacts Telegram (since #91 review
+  it makes no GCS call either: only a custody row names a bucket as holding a
+  file; an unrecorded object is re-fetched and CRC-verified, not trusted).
 - No archive migration, no parallel uploads, no copy-into-bucket from reproject.
 - #91 builds on `MediaStore` as the only seam.
 

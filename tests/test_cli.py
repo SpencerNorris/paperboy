@@ -39,8 +39,10 @@ def _fixtures():
 def test_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup", "fetch-media"):
+    commands = ("auth", "doctor", "collect", "status", "export", "watch", "lookup")
+    for cmd in (*commands, "fetch-from-list"):
         assert cmd in result.stdout
+    assert "fetch-media" not in result.stdout
 
 
 def test_collect_writes_sqlite_and_exits_zero(tmp_path, monkeypatch):
@@ -206,7 +208,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result.exit_code == 0, result.stdout
-    assert "media" not in result.stdout
+    assert "▶ media" not in result.stdout  # no media phase (migration names mention media)
 
     result2 = runner.invoke(
         app,
@@ -214,7 +216,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result2.exit_code == 0, result2.stdout
-    assert "media" in result2.stdout
+    assert "▶ media" in result2.stdout
     downloaded_path = tmp_path / "clitest_withmedia" / "media"
     assert downloaded_path.exists()
     assert any(downloaded_path.rglob("*.txt"))

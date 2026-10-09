@@ -164,3 +164,19 @@ def mark_deleted(
             "UPDATE messages SET deleted_at = COALESCE(deleted_at, ?) WHERE uri = ?",
             (observed_at, uri),
         )
+
+
+def clear_deleted(store: Store, channel_id: int, msg_id: int) -> bool:
+    """Un-tombstone a message that Telegram has just answered with a LIVE object.
+
+    The `deleted_at` flag means "currently believed deleted"; a direct
+    `channels.getMessages` answer that returns the message is stronger evidence
+    than the earlier `update`/`empty` observation, so the flag is cleared. The
+    `message_tombstones` rows are append-only history and stay, so the earlier
+    belief remains visible. Returns True iff a flag was cleared.
+    """
+    cur = store.conn.execute(
+        "UPDATE messages SET deleted_at = NULL WHERE uri = ? AND deleted_at IS NOT NULL",
+        (msg_uri(channel_id, msg_id),),
+    )
+    return cur.rowcount > 0
