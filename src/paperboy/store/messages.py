@@ -75,13 +75,27 @@ def upsert_message(
     observed_at: str,
     tier: str,
 ) -> str:
+    """Project one message (see `upsert_message_revised`); returns its URI."""
+    return upsert_message_revised(store, channel_id, msg, source_raw_id, observed_at, tier)[0]
+
+
+def upsert_message_revised(
+    store: Store,
+    channel_id: int,
+    msg: dict,
+    source_raw_id: int,
+    observed_at: str,
+    tier: str,
+) -> tuple[str, bool]:
     """Project one `message`/`messageService` TL dict into the store.
 
     Always writes current state to `messages`; appends a `message_revisions`
     row iff the content hash changed since the last recorded revision
     (including the very first observation); appends a `message_metrics` row
     iff at least one of views/forwards/replies/reactions is present on this
-    observation. Returns the message's URI.
+    observation. Returns `(uri, revised)`: the message's URI and whether this
+    observation appended a revision (callers count revisions from this rather
+    than re-deriving it).
     """
     del tier  # not yet stored per-message; carried by raw_records/edges/peers
     msg_id = msg["id"]
@@ -150,7 +164,8 @@ def upsert_message(
         ),
     )
 
-    if latest_revision_hash(store, uri) != chash:
+    revised = latest_revision_hash(store, uri) != chash
+    if revised:
         store.conn.execute(
             "INSERT INTO message_revisions "
             "(message_uri, observed_at, edit_date, content_hash, text, entities_json, "
@@ -172,7 +187,7 @@ def upsert_message(
             (uri, observed_at, views, forwards, replies, reactions_json),
         )
 
-    return uri
+    return uri, revised
 
 
 def mark_deleted(
