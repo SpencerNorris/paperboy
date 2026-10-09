@@ -430,7 +430,7 @@ assert on Rich output, which colour codes break). Run on the final code
 
 ```
 $ uv run pytest -q --basetemp=<scratch>/pytest-91-fix
-1141 passed in 172.39s (0:02:52)
+1142 passed in 180.44s (0:03:00)
 $ uv run ruff check
 All checks passed!
 $ uv run pyright
@@ -517,6 +517,12 @@ against the code before its fix and failed there, the failing line is quoted):
     `test_dry_run_against_bucket_makes_no_gcs_call_and_never_builds_a_gateway`
     (renamed), `test_collect_media_flag_downloads_and_stays_off_without_it`
     (asserts `▶ media`, since migration log lines mention "media").
+* Live-smoke finding (a text-only post got a needless `media` marker run and a
+  "no stored, in-window media" WARNING): `test_text_only_post_runs_no_media_phase`
+  (failed before with `assert 1 == 0` on the `MediaSelection` count). A post whose
+  stored media is absent or not in `DOWNLOADABLE_KINDS` is never walked; it settles
+  as `no_media`. No existing run-layout expectation changed: the replay sources
+  mix text and photo posts per segment, so their media runs remain.
 * `established is None` (the channel phase returning no context without a stop) is
   handled as a dead channel; it cannot be produced through the fake gateway, so it
   is covered only through the refused-channel test
