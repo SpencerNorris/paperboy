@@ -9,7 +9,9 @@ row and updates the entity; identical content only advances `last_seen`
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 
 from paperboy.ids import iso_or_none, msg_uri, peer_ref_uri
 from paperboy.store.db import Store, dumps
@@ -18,10 +20,51 @@ from paperboy.store.sync import is_self
 _TOMBSTONE_SETS_DELETED_AT = {"update", "empty"}
 
 
+# Telegram re-issues this on every fetch of an unchanged media object (#96), so
+# it is a transport token, not content: it never counts as an edit.
+_VOLATILE_KEYS = frozenset({"file_reference"})
+
+
+def _without_volatile(node: object) -> object:
+    """`node` with every `_VOLATILE_KEYS` dict key dropped, at any depth."""
+    if isinstance(node, dict):
+        return {k: _without_volatile(v) for k, v in node.items() if k not in _VOLATILE_KEYS}
+    if isinstance(node, list):
+        return [_without_volatile(v) for v in node]
+    return node
+
+
 def content_hash(text: str, media_json: str | None) -> str:
-    """sha256 hex of the text + a NUL separator + the media json (or empty)."""
+    """Revision fingerprint: sha256 hex of the text + NUL + the media json (or empty).
+
+    The media json is hashed with the volatile `file_reference` tokens removed
+    (everything else - ids, size, mime, attributes, webpage fields - stays), so
+    re-observing an unchanged media message is not a new revision. Only the
+    hash input is normalised; stored `media_json` stays verbatim.
+    """
+    if media_json:
+        # Not JSON: hash it verbatim rather than guess.
+        with contextlib.suppress(ValueError):
+            media_json = dumps(_without_volatile(json.loads(media_json)))
     payload = f"{text}\x00{media_json or ''}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def latest_revision_hash(store: Store, uri: str) -> str | None:
+    """Fingerprint of a message's latest revision, recomputed under the current scheme.
+
+    Re-hashes the revision's stored `text`/`media_json` rather than trusting its
+    stored `content_hash`, which an older release computed with `file_reference`
+    included; comparing against that would add one phantom revision per message
+    on the first re-observation after the fix. The single place that answers
+    "what did we last record?" for `upsert_message` and `observe_message`.
+    """
+    row = store.conn.execute(
+        "SELECT text, media_json FROM message_revisions WHERE message_uri=? "
+        "ORDER BY observed_at DESC, id DESC LIMIT 1",
+        (uri,),
+    ).fetchone()
+    return content_hash(row["text"] or "", row["media_json"]) if row else None
 
 
 def upsert_message(
@@ -32,13 +75,27 @@ def upsert_message(
     observed_at: str,
     tier: str,
 ) -> str:
+    """Project one message (see `upsert_message_revised`); returns its URI."""
+    return upsert_message_revised(store, channel_id, msg, source_raw_id, observed_at, tier)[0]
+
+
+def upsert_message_revised(
+    store: Store,
+    channel_id: int,
+    msg: dict,
+    source_raw_id: int,
+    observed_at: str,
+    tier: str,
+) -> tuple[str, bool]:
     """Project one `message`/`messageService` TL dict into the store.
 
     Always writes current state to `messages`; appends a `message_revisions`
     row iff the content hash changed since the last recorded revision
     (including the very first observation); appends a `message_metrics` row
     iff at least one of views/forwards/replies/reactions is present on this
-    observation. Returns the message's URI.
+    observation. Returns `(uri, revised)`: the message's URI and whether this
+    observation appended a revision (callers count revisions from this rather
+    than re-deriving it).
     """
     del tier  # not yet stored per-message; carried by raw_records/edges/peers
     msg_id = msg["id"]
@@ -107,12 +164,8 @@ def upsert_message(
         ),
     )
 
-    latest = store.conn.execute(
-        "SELECT content_hash FROM message_revisions WHERE message_uri=? "
-        "ORDER BY observed_at DESC, id DESC LIMIT 1",
-        (uri,),
-    ).fetchone()
-    if latest is None or latest["content_hash"] != chash:
+    revised = latest_revision_hash(store, uri) != chash
+    if revised:
         store.conn.execute(
             "INSERT INTO message_revisions "
             "(message_uri, observed_at, edit_date, content_hash, text, entities_json, "
@@ -134,7 +187,7 @@ def upsert_message(
             (uri, observed_at, views, forwards, replies, reactions_json),
         )
 
-    return uri
+    return uri, revised
 
 
 def mark_deleted(
@@ -164,3 +217,19 @@ def mark_deleted(
             "UPDATE messages SET deleted_at = COALESCE(deleted_at, ?) WHERE uri = ?",
             (observed_at, uri),
         )
+
+
+def clear_deleted(store: Store, channel_id: int, msg_id: int) -> bool:
+    """Un-tombstone a message that Telegram has just answered with a LIVE object.
+
+    The `deleted_at` flag means "currently believed deleted"; a direct
+    `channels.getMessages` answer that returns the message is stronger evidence
+    than the earlier `update`/`empty` observation, so the flag is cleared. The
+    `message_tombstones` rows are append-only history and stay, so the earlier
+    belief remains visible. Returns True iff a flag was cleared.
+    """
+    cur = store.conn.execute(
+        "UPDATE messages SET deleted_at = NULL WHERE uri = ? AND deleted_at IS NOT NULL",
+        (msg_uri(channel_id, msg_id),),
+    )
+    return cur.rowcount > 0

@@ -60,7 +60,7 @@ class ChannelContext:
     """A channel already resolved earlier in the SAME process (#68).
 
     Lets `collect_channel` skip the flood-limited `contacts.resolveUsername`
-    when `fetch-media` runs several segments against one channel. Never
+    when `fetch-from-list` runs several segments against one channel. Never
     persisted (access hashes rotate); `source_run_id` names the run whose
     `channel` phase established it, for the replay marker.
     """

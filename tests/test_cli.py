@@ -39,8 +39,10 @@ def _fixtures():
 def test_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for cmd in ("auth", "doctor", "collect", "status", "export", "watch", "lookup", "fetch-media"):
+    commands = ("auth", "doctor", "collect", "status", "export", "watch", "lookup")
+    for cmd in (*commands, "fetch-from-list"):
         assert cmd in result.stdout
+    assert "fetch-media" not in result.stdout
 
 
 def test_collect_writes_sqlite_and_exits_zero(tmp_path, monkeypatch):
@@ -206,7 +208,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result.exit_code == 0, result.stdout
-    assert "media" not in result.stdout
+    assert "▶ media" not in result.stdout  # no media phase (migration names mention media)
 
     result2 = runner.invoke(
         app,
@@ -214,7 +216,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result2.exit_code == 0, result2.stdout
-    assert "media" in result2.stdout
+    assert "▶ media" in result2.stdout
     downloaded_path = tmp_path / "clitest_withmedia" / "media"
     assert downloaded_path.exists()
     assert any(downloaded_path.rglob("*.txt"))
@@ -558,3 +560,37 @@ def test_out_of_range_id_is_rejected_without_a_traceback(tmp_path, cmd, target):
     assert result.exit_code == 1
     assert "64-bit" in result.stdout
     assert "Traceback" not in result.stdout
+
+
+def test_collect_media_store_flag_and_bad_bucket_exit_1(tmp_path, monkeypatch):
+    from tests.fake_gcs import FakeGcsClient
+
+    async def fake_build_gateway(settings, secrets, profile, store):
+        raise AssertionError("a config error must stop before any gateway is built")
+
+    monkeypatch.setattr(composition, "build_gateway", fake_build_gateway)
+    env = {"PAPERBOY_DATA_DIR": str(tmp_path)}
+    bad = runner.invoke(
+        app,
+        ["collect", "@x", "--profile", "c", "--media-store", "gs://not-allowed/p", "--unsafe"],
+        env=env,
+    )
+    assert bad.exit_code == 1
+    assert "media_store_buckets" in bad.stdout and "Traceback" not in bad.stdout
+
+    async def ok_gateway(settings, secrets, profile, store):
+        del settings, secrets, profile, store
+        return FakeGateway(_fixtures())
+
+    monkeypatch.setattr(composition, "build_gateway", ok_gateway)
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    good = runner.invoke(
+        app,
+        [
+            "collect", "@x", "--profile", "c", "--phases", "channel,history",
+            "--media-store", "gs://bkt/p/x", "--unsafe",
+        ],
+        env={**env, "PAPERBOY_MEDIA_STORE_BUCKETS": "bkt"},
+    )
+    assert good.exit_code == 0, good.stdout

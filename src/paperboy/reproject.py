@@ -18,6 +18,7 @@ from paperboy.collectors.graph import GraphCollector
 from paperboy.collectors.history import HistoryCollector
 from paperboy.collectors.media import MediaCollector
 from paperboy.collectors.participants import ParticipantsCollector
+from paperboy.collectors.posts import PostsCollector
 from paperboy.collectors.profiles import ProfilesCollector
 from paperboy.collectors.web import WebCollector
 from paperboy.config import Settings, profile_dir
@@ -241,6 +242,12 @@ def _pin_selection(
         clock.pin_json(selection.observed_at, dumps(current))
 
 
+def _pin_store_marker(clock: ReplayClock, marker: RunMarker | None) -> None:
+    """Give the replayed `MediaStore` marker (#63) its recorded stamp."""
+    if marker is not None:
+        clock.pin_json(marker.observed_at, marker.payload_json)
+
+
 def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     """The phase set ONE historical run executed, inferred from the raw kinds
     it left behind (spec §3: a run that never did graph reprojects without
@@ -249,11 +256,18 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     (spec §8) and conservative: a phase whose every RPC was skipped leaves no
     raw and is treated as never-run for that run; --phases overrides.
     """
+    posts = bool(source.fetched_post_ids(run))
     if source.context_markers(run):
-        # A fetch-media segment that reused a resolved channel (#68): no
-        # channel or history phase ran, only media.
-        return ["media"]
+        # A fetch-from-list segment that reused a resolved channel (#68): no
+        # channel or history phase ran, only `posts` (#91) and `media`. The
+        # selection receipt is the evidence for media: a pre-#91 segment has it
+        # and no posts evidence; a `--no-media` segment has the reverse.
+        return (["posts"] if posts else []) + (
+            ["media"] if source.media_selection(run) is not None else []
+        )
     phases = ["channel"]
+    if posts:
+        phases.append("posts")
     if source.has_history_evidence(run):
         phases.append("history")
     linked = source.linked_group_ids(run)
@@ -275,7 +289,10 @@ def detect_phases(source: ReplaySource, run: ReplayRun) -> list[str]:
     if source.has_kind(run, "tme_page", "wayback_cdx"):
         phases.append("web")
     selection = source.media_selection(run)
+    store_marker = source.media_store(run)
     if source.has_kind(run, "mediadownload") or (
+        store_marker is not None and store_marker.payload.get("media", True)
+    ) or (
         selection is not None
         and source.channel_established(run, selection.payload.get("channel_id"))
     ):
@@ -381,6 +398,9 @@ async def reproject(
             "profile_budget": 10**9, "participant_oracle_budget": 10**9,
             "participant_reactions_budget": 10**9,
         })
+        replay_settings = replay_settings.model_copy(
+            update={"post_msgs": source.fetched_post_ids(run) or None}
+        )
         selection = source.media_selection(run)
         if selection is not None:
             # The live media phase walked only these messages (#55/#68); walk
@@ -389,6 +409,16 @@ async def reproject(
             replay_settings = replay_settings.model_copy(
                 update={"media_msgs": list(selection.payload.get("msg_ids") or [])}
             )
+        # A bucket run's `MediaStore` marker names the store its custody rows and
+        # receipts refer to (#63). A copy into another profile (`--out-profile`)
+        # lands in that LOCAL profile, so it replays as a local run; a plain
+        # reproject keeps the recorded store. The reproject's own env/CLI store is
+        # never used for replay.
+        store_marker = source.media_store(run)
+        replay_store = None
+        if store_marker is not None and out_profile is None:
+            replay_store = store_marker.payload.get("store")
+        replay_settings = replay_settings.model_copy(update={"media_store": replay_store})
         run_phases = phases if phases is not None else detect_phases(source, run)
         for p in run_phases:
             if p not in phases_seen:
@@ -396,12 +426,12 @@ async def reproject(
         run_targets = source.resolve_targets(run)
         markers = source.context_markers(run)
         if not run_targets and markers:
-            # A media-only fetch-media segment (#68): its channel was resolved
+            # A media-only fetch-from-list segment (#68): its channel was resolved
             # by an earlier run, so it has no resolve records of its own.
             if len(markers) > 1:
                 raise ReprojectSourceError(
                     f"run {run.run_id} holds {len(markers)} ChannelContextReused markers; "
-                    "a fetch-media segment writes exactly one"
+                    "a fetch-from-list segment writes exactly one"
                 )
             marker = markers[0]
             channel_id = marker.payload.get("channel_id")
@@ -440,6 +470,8 @@ async def reproject(
             clock = ReplayClock()
             clock.pin_json(marker.observed_at, marker.payload_json)
             _pin_selection(clock, selection, channel_id)
+            if replay_store is not None:
+                _pin_store_marker(clock, store_marker)
             context = ChannelContext(
                 {"channel_id": channel_id, "access_hash": access_hash}, channel_id,
                 marker.tier, source_run_id,
@@ -472,6 +504,8 @@ async def reproject(
             clock = ReplayClock()
             established = source.established_channel_ids(run)
             _pin_selection(clock, selection, established[0] if established else None)
+            if replay_store is not None:
+                _pin_store_marker(clock, store_marker)
             results.setdefault(raw_target, []).extend(
                 await _replay_one(
                     source, out_store, replay_settings, media_profile, run, list(run_phases),
@@ -520,14 +554,16 @@ async def _replay_one(
 ) -> list[CollectResult]:
     """Replay ONE `(run, raw target)` pair through the normal collectors.
 
-    `channel_context` is set for a media-only fetch-media segment (#68): the
+    `channel_context` is set for a media-only fetch-from-list segment (#68): the
     recipe then skips `channel` and rewrites the run's marker.
     """
-    gateway = RawReplayGateway(source, clock, run)
+    gateway = RawReplayGateway(
+        source, clock, run, allowed_buckets=replay_settings.media_store_bucket_set
+    )
     web_client = RawReplayWebClient(source, clock, run)
     collectors = [
-        ChannelCollector(), HistoryCollector(), DiscussionCollector(),
-        ParticipantsCollector(), ProfilesCollector(),
+        ChannelCollector(), PostsCollector(), HistoryCollector(), DiscussionCollector(),
+        ParticipantsCollector(), ProfilesCollector(copy_on_replay=out_profile is not None),
         GraphCollector(),
         WebCollector(client=web_client, min_interval=0.0, sleep=lambda s: None),
         MediaCollector(copy_on_replay=out_profile is not None),

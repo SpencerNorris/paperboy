@@ -49,6 +49,8 @@ def phase_status(store: Store, phase: str) -> str:
             return "resolving…"
         if phase == "history":
             return f"{count('SELECT count(*) FROM messages')} messages"
+        if phase == "posts":
+            return f"{count('SELECT count(*) FROM messages')} messages"
         if phase == "graph":
             return f"{count('SELECT count(*) FROM edges')} edges"
         if phase == "participants":

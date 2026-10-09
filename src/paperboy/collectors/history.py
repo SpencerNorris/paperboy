@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from paperboy.budget import PhaseStop
 from paperboy.collectors.base import CollectContext, CollectResult
-from paperboy.ids import msg_uri, peer_ref_uri, peer_stub
+from paperboy.ids import peer_ref_uri, peer_stub
 from paperboy.store.edges import add_edge
-from paperboy.store.messages import mark_deleted, upsert_message
+from paperboy.store.messages import mark_deleted, upsert_message_revised
 from paperboy.store.peers import upsert_peer
 from paperboy.store.sync import add_range, get_state, set_state
 from paperboy.targets import Target
@@ -27,13 +27,76 @@ _GET_MESSAGES_CHUNK = 200
 _CHANNEL_DIFFERENCE_LIMIT = 100
 
 
-def _latest_revision_hash(ctx: CollectContext, uri: str) -> str | None:
-    row = ctx.store.conn.execute(
-        "SELECT content_hash FROM message_revisions WHERE message_uri=? "
-        "ORDER BY observed_at DESC, id DESC LIMIT 1",
-        (uri,),
-    ).fetchone()
-    return row["content_hash"] if row else None
+def observe_message(
+    ctx: CollectContext,
+    channel_id: int,
+    m: dict,
+    counts: dict[str, int],
+    *,
+    context: dict | None = None,
+) -> None:
+    """Append one message object to the raw log, then project it: the message
+    row (a revision on an edit), its author peer and its forward edge; a
+    `MessageEmpty` placeholder becomes a tombstone instead.
+
+    Shared by `history`, `discussion` and the `posts` collector (#91), so every
+    way of obtaining a message projects it identically. `context` is the raw
+    record's context (default `{"channel_id": ...}`); `posts` adds the fetching
+    method so replay can tell its receipts from history's.
+    """
+    context = context if context is not None else {"channel_id": channel_id}
+    # `MessageEmpty` is Telegram's placeholder for an id that no longer
+    # resolves (empirically only ever seen via `_probe_gaps`'s explicit
+    # `get_messages` call, never inline from `iter_history` — but nothing
+    # in the TL contract guarantees that stays true). `upsert_message`'s
+    # `ON CONFLICT DO UPDATE` has no concept of "unknown"; it would write
+    # `text=""`/`media=NULL` over a previously-stored populated row,
+    # blanking the queryable copy of a post captured before the channel
+    # served an empty for it. Route it through the same tombstone path
+    # `_probe_gaps` uses instead, and stop before the peer/edge
+    # projection below, which has nothing to project for a placeholder.
+    if m.get("_", "").lower() == "messageempty":
+        observed_at = ctx.clock.for_payload(m)
+        ctx.store.add_raw(
+            "MessageEmpty", m, ctx.tier, context,
+            observed_at=observed_at,
+        )
+        mark_deleted(ctx.store, channel_id, m["id"], "empty", observed_at)
+        counts["tombstones"] += 1
+        return
+
+    observed_at = ctx.clock.for_payload(m)
+    raw_id = ctx.store.add_raw(
+        m.get("_", "Message"), m, ctx.tier, context,
+        observed_at=observed_at,
+    )
+    uri, revised = upsert_message_revised(
+        ctx.store, channel_id, m, raw_id, observed_at, ctx.tier
+    )
+    counts["messages"] += 1
+    if revised:
+        counts["revisions"] += 1
+
+    # We only have the bare peer reference here (no username/name) — record
+    # it as `min`, honestly reflecting how little we know; a Phase 2
+    # `profiles` collector fills in the rest. Channel-typed authors count
+    # too: in a linked discussion group an anonymous or channel-authored
+    # comment arrives as `PeerChannel`, and those commenters are exactly
+    # the people-discovery data the `discussion` phase exists to collect.
+    stub = peer_stub(m.get("from_id"))
+    if stub is not None:
+        upsert_peer(
+            ctx.store, stub, raw_id, observed_at,
+            seen_in_chat=channel_id, seen_in_msg=m["id"],
+        )
+
+    fwd_from = m.get("fwd_from")
+    object_uri = peer_ref_uri(fwd_from.get("from_id")) if fwd_from else None
+    if object_uri and add_edge(
+        ctx.store, uri, "forwarded_from", object_uri, observed_at, ctx.tier, raw_id,
+        {"fwd_from": fwd_from},
+    ):
+        counts["edges"] += 1
 
 
 class HistoryCollector:
@@ -154,59 +217,7 @@ class HistoryCollector:
     def _observe_message(
         self, ctx: CollectContext, channel_id: int, m: dict, counts: dict[str, int]
     ) -> None:
-        # `MessageEmpty` is Telegram's placeholder for an id that no longer
-        # resolves (empirically only ever seen via `_probe_gaps`'s explicit
-        # `get_messages` call, never inline from `iter_history` — but nothing
-        # in the TL contract guarantees that stays true). `upsert_message`'s
-        # `ON CONFLICT DO UPDATE` has no concept of "unknown"; it would write
-        # `text=""`/`media=NULL` over a previously-stored populated row,
-        # blanking the queryable copy of a post captured before the channel
-        # served an empty for it. Route it through the same tombstone path
-        # `_probe_gaps` uses instead, and stop before the peer/edge
-        # projection below, which has nothing to project for a placeholder.
-        if m.get("_", "").lower() == "messageempty":
-            observed_at = ctx.clock.for_payload(m)
-            ctx.store.add_raw(
-                "MessageEmpty", m, ctx.tier, {"channel_id": channel_id},
-                observed_at=observed_at,
-            )
-            mark_deleted(ctx.store, channel_id, m["id"], "empty", observed_at)
-            counts["tombstones"] += 1
-            return
-
-        observed_at = ctx.clock.for_payload(m)
-        raw_id = ctx.store.add_raw(
-            m.get("_", "Message"), m, ctx.tier, {"channel_id": channel_id},
-            observed_at=observed_at,
-        )
-        uri = msg_uri(channel_id, m["id"])
-        before = _latest_revision_hash(ctx, uri)
-        upsert_message(ctx.store, channel_id, m, raw_id, observed_at, ctx.tier)
-        after = _latest_revision_hash(ctx, uri)
-        counts["messages"] += 1
-        if after != before:
-            counts["revisions"] += 1
-
-        # We only have the bare peer reference here (no username/name) — record
-        # it as `min`, honestly reflecting how little we know; a Phase 2
-        # `profiles` collector fills in the rest. Channel-typed authors count
-        # too: in a linked discussion group an anonymous or channel-authored
-        # comment arrives as `PeerChannel`, and those commenters are exactly
-        # the people-discovery data the `discussion` phase exists to collect.
-        stub = peer_stub(m.get("from_id"))
-        if stub is not None:
-            upsert_peer(
-                ctx.store, stub, raw_id, observed_at,
-                seen_in_chat=channel_id, seen_in_msg=m["id"],
-            )
-
-        fwd_from = m.get("fwd_from")
-        object_uri = peer_ref_uri(fwd_from.get("from_id")) if fwd_from else None
-        if object_uri and add_edge(
-            ctx.store, uri, "forwarded_from", object_uri, observed_at, ctx.tier, raw_id,
-            {"fwd_from": fwd_from},
-        ):
-            counts["edges"] += 1
+        observe_message(ctx, channel_id, m, counts)
 
     async def _probe_gaps(
         self,
