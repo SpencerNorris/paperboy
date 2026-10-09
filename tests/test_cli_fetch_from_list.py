@@ -214,7 +214,7 @@ def test_unknown_exclude_target_exits_1_before_anything_else(tmp_path, monkeypat
     assert "999" in result.stdout
 
 
-def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monkeypatch):
+def test_dry_run_against_bucket_makes_no_gcs_call_and_never_builds_a_gateway(tmp_path, monkeypatch):
     from tests.fake_gcs import FakeGcsClient
 
     path = _prepare(tmp_path)
@@ -236,8 +236,10 @@ def test_dry_run_against_bucket_heads_but_never_builds_a_gateway(tmp_path, monke
         env={**_env(tmp_path), "PAPERBOY_MEDIA_STORE_BUCKETS": "bkt"},
     )
     assert result.exit_code == 0, result.stdout
-    assert client.bucket("bkt").calls["exists"] > 0  # a bucket dry run touches GCS...
-    assert client.bucket("bkt").calls["upload"] == 0  # ...read-only
+    # Only a custody row names a bucket as holding a file (an unrecorded object is
+    # re-fetched and verified, not trusted): a bucket dry run makes no GCS call.
+    assert client.bucket("bkt").calls["exists"] == 0
+    assert client.bucket("bkt").calls["upload"] == 0
     assert "media_stored" in result.stdout and "pending" in result.stdout
 
 

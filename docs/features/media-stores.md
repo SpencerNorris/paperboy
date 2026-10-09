@@ -98,7 +98,7 @@ store. Mac first, using the operator's own Application Default Credentials.
   if `storage.buckets.get` is not granted, as for the VM service account). A
   bad bucket therefore blocks before any Telegram download.
 - **fetch-from-list.** `media_held` (outcome `already_stored`) is per store; a bucket `--dry-run` makes
-  read-only metadata GETs to GCS and never contacts Telegram (`fetch-from-list.md`).
+  no GCS call (only a custody row names a bucket as holding a file) and never contacts Telegram (`fetch-from-list.md`).
 - **Reproject (the network exception).** Bucket receipts are read back with
   ranged GETs, only for allow-listed buckets, re-hashed against the receipt
   sha, no writes; see `reproject.md`, "Bucket reads". The media collector in

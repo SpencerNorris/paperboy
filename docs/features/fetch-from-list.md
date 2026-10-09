@@ -105,9 +105,11 @@ would download what was meant to be kept out).
 must be listed in `PAPERBOY_MEDIA_STORE_BUCKETS`) sends the pull to a bucket
 with no local copy; see `media-stores.md`. Whether the media phase still has to
 download a row is then per store: a custody row naming the bucket answers
-offline, otherwise one metadata GET per candidate (`MediaStore.exists`).
-**A bucket `--dry-run` therefore touches GCS (read-only metadata GETs, needs
-Application Default Credentials), never Telegram.** An unreachable bucket exits
+offline; otherwise a store that cannot verify objects (the local folder) is
+trusted on `exists`, while an object in a bucket that no custody row names (an
+orphan) is NOT held - the media phase re-fetches and CRC-verifies it before
+adopting it, so the selection (`media_list.held_file`) agrees. **A bucket
+`--dry-run` therefore makes no GCS call and never contacts Telegram.** An unreachable bucket exits
 1. `--media-store` is validated before anything runs; an unlisted bucket is a
 one-line config error (exit 1).
 
@@ -339,7 +341,9 @@ current media and every revision agree on one content key. Sightings of an
 edited message, and avatars, stay NULL ("unknown"): the media phase then
 downloads that content again (a redundant download, never a missed one).
 `raw_records` is untouched. It is applied by `Store.open` like every migration;
-`docs/data-model.md` documents the column.
+`docs/data-model.md` documents the column. The backfill's temp tables are indexed
+by `uri` (without that it is quadratic), and the migration runner logs each
+migration's start and duration (`migration <name>: applying` / `applied in Ns`; DEBUG, INFO when it takes a second or more).
 
 ## Review fixes (round 1)
 
@@ -523,7 +527,7 @@ notes.
   `pending 3`, `needs_resolve 0`; per channel `@<channel A>`: pending 2 / in_store 2 /
   not_yet_collected 0 / media_stored 0, `@<channel B>`: pending 1 / in_store 0 /
   not_yet_collected 1; segment plan 2 segments, `posts calls` 1 each.
-  Bucket dry run of rows 1-2 (read-only metadata GET, `exists(...) -> False`):
+  Bucket dry run of rows 1-2 (taken before the orphan-object rule: one read-only metadata GET, `exists(...) -> False`; it now makes none):
   `pending 2`, `media_stored 0`.
 
 ### Smoke test transcript

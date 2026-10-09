@@ -208,7 +208,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result.exit_code == 0, result.stdout
-    assert "media" not in result.stdout
+    assert "▶ media" not in result.stdout  # no media phase (migration names mention media)
 
     result2 = runner.invoke(
         app,
@@ -216,7 +216,7 @@ def test_collect_media_flag_downloads_and_stays_off_without_it(tmp_path, monkeyp
         env={"PAPERBOY_DATA_DIR": str(tmp_path)},
     )
     assert result2.exit_code == 0, result2.stdout
-    assert "media" in result2.stdout
+    assert "▶ media" in result2.stdout
     downloaded_path = tmp_path / "clitest_withmedia" / "media"
     assert downloaded_path.exists()
     assert any(downloaded_path.rglob("*.txt"))

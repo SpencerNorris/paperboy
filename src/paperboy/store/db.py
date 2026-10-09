@@ -33,6 +33,7 @@ from paperboy.ids import to_iso, utc_now_iso
 from paperboy.media_keys import key_sha256
 
 log = logging.getLogger("paperboy.store")
+_SLOW_MIGRATION_S = 1.0  # seconds; a migration slower than this is logged at INFO
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -105,14 +106,19 @@ class Store:
             stem = sql_path.stem
             if stem in applied:
                 continue
-            log.info("migration %s: applying", stem)
+            log.debug("migration %s: applying", stem)
             started = time.perf_counter()
             self.conn.executescript(sql_path.read_text())
             self.conn.execute(
                 "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                 (stem, utc_now_iso()),
             )
-            log.info("migration %s: applied in %.2fs", stem, time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            # Quiet for the usual instant migration; a slow one is announced.
+            log.log(
+                logging.INFO if elapsed >= _SLOW_MIGRATION_S else logging.DEBUG,
+                "migration %s: applied in %.2fs", stem, elapsed,
+            )
 
     def begin_run(self, run_id: str | None = None) -> str:
         """Mark the start of one collect pass (ADR-0005): every subsequent

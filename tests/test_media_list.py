@@ -345,8 +345,8 @@ def test_excluded_channel_ids_rejects_unknown_or_non_channel_specs(tmp_path, spe
 
 
 def test_already_stored_is_per_store(tmp_path):
-    """A file the DB holds from a LOCAL run is `pending` for a bucket run until the
-    bucket holds it (by custody row, offline, or by one existence check)."""
+    """A file the DB holds from a LOCAL run is `pending` for a bucket run until a custody
+    row names the bucket (offline); an unrecorded bucket object does not count."""
     from paperboy.media_store import GcsMediaStore
     from tests.fake_gcs import FakeGcsClient
 
@@ -366,11 +366,12 @@ def test_already_stored_is_per_store(tmp_path):
 
         pending = classify_rows(st, rows, media_store=bucket_store)
         assert [c.media_held for c in pending] == [False]
-        assert client.bucket("bkt").calls["exists"] == 1  # one metadata check, no custody row
+        assert client.bucket("bkt").calls["exists"] == 0  # no custody row, no GCS call
 
-        client.bucket("bkt").objects[f"p/x/{key}"] = b"x"  # the object is there by hand
-        held = classify_rows(st, rows, media_store=bucket_store)
-        assert [c.media_held for c in held] == [True]
+        client.bucket("bkt").objects[f"p/x/{key}"] = b"x"  # an orphan, put there by hand
+        orphan = classify_rows(st, rows, media_store=bucket_store)
+        # The media phase would re-fetch and CRC-verify it; it is not "held".
+        assert [c.media_held for c in orphan] == [False]
 
         calls_before = client.bucket("bkt").calls["exists"]
         record_media_custody(st, "tg:msg:10/1", sha, "gs://bkt/p/x")
