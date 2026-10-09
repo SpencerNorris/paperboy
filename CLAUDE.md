@@ -60,6 +60,7 @@ keyed by content; every same-channel repost sighting keeps its own custody row, 
 cross-channel repost is `already_stored` without one (#95); `--exclude-target` is
 one-way, parent -> linked group, and decided after the channel is established). Order and protocol:
 `docs/superpowers/specs/2026-09-28-media-storage-overview.md`.
+#96 (`fix/phantom-revisions` → `dev/gcs-pull`, PR pending): the message revision hash ignores `file_reference` at any depth and compares against the latest revision re-hashed under that rule; no migration (`docs/data-model.md`).
 
 ## Read these first
 

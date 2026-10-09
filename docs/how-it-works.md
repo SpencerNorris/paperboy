@@ -185,7 +185,7 @@ many channels. In plain terms:
    (its metadata is stored, nothing else is fetched). Then the **posts**:
    one request per 100 ids, and each answer is saved as raw first and then
    turned into a message row, exactly as `history` does it, so a post we never
-   had appears, an edit becomes a revision, new view counts become a metric row
+   had appears, an edit becomes a revision (Telegram's rotating `file_reference` tokens do not count as an edit), new view counts become a metric row
    and a deleted post becomes a tombstone. Posts we already hold are asked for
    again so they are current. Then, once the posts are stored, the **media**: for each fetched
    post we look at the photo or document it carries *now* (Telegram's id for it,

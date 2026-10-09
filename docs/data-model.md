@@ -149,7 +149,7 @@ richer row in `channels`.
 | `via_bot_id` | INTEGER | Inline bot the message was sent via. |
 | `is_service` | INTEGER | 1 for service messages (joins, pins, title changes, …). |
 | `action_json` | TEXT | The service action object, when `is_service=1`. |
-| `content_hash` | TEXT | Hash of text+media; a change triggers a new `message_revisions` row. |
+| `content_hash` | TEXT | Fingerprint of text + media with every `file_reference` key removed (see `message_revisions`); a change triggers a new `message_revisions` row. |
 | `deleted_at` | TEXT | Set when a deletion is observed via `update`/`empty` evidence (see `message_tombstones`); NULL otherwise. Cleared again when `fetch-from-list` (`posts`) gets a LIVE answer for the message; the `message_tombstones` rows stay. |
 | `source_raw_id` | INTEGER | Provenance. |
 | `first_seen` / `last_seen` | TEXT | Bounds of observation. |
@@ -194,6 +194,20 @@ One row per observation; diff them to see subscriber growth, renames, etc.
 
 Append-only; one row per observed version of a message (including the first).
 A new row is written whenever `content_hash` changes.
+
+`content_hash` is sha256 of the text, a NUL, and the media JSON with every
+`file_reference` key dropped (at any depth: `photo`, `document`, `alt_documents`,
+`webpage.photo`, `cached_page.photos`, ...). Telegram re-issues that token on every
+fetch of an unchanged media object, so hashing it recorded false edits (#96).
+Everything else - text, photo/document id, size, mime, attributes, webpage fields,
+poll results - still counts. Only the hash input is normalised: the stored
+`media_json` (in `messages` and here) and the raw records stay verbatim. "Is this
+new?" compares against the latest revision **re-hashed from its stored
+`text`/`media_json`**, not its stored `content_hash`, so revisions written by an
+older release (hash included `file_reference`) do not cause a fresh phantom on the
+first re-observation. Stored hashes of old revisions are not rewritten; a rebuild
+(`reproject`) recomputes them, and `export` shows the new values for rebuilt
+media messages (text-only messages keep their hashes).
 
 | Column | Type | Meaning |
 |---|---|---|
