@@ -207,3 +207,27 @@ async def test_download_user_photo_payload_without_sha_is_a_skip(tmp_path):
     gw = _avatar_gateway(tmp_path, "bogus.jpg")
     with pytest.raises(SkipAndRecord):
         await gw.download_user_photo({"id": 701})
+
+
+@pytest.mark.asyncio
+async def test_download_user_photo_from_bucket(tmp_path, monkeypatch):
+    import hashlib
+
+    from tests.fake_gcs import FakeGcsClient
+
+    data = b"jpeg"
+    sha = hashlib.sha256(data).hexdigest()
+    db, profile_root = _seed(tmp_path)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE raw_records SET payload_json = json_set(payload_json, "
+            "'$.store', 'gs://bkt/p', '$.sha256', ?, '$.path', ?) WHERE kind = 'AvatarDownload'",
+            (sha, f"media/{sha[:2]}/{sha}.jpg"),
+        )
+    client = FakeGcsClient()
+    client.bucket("bkt").objects[f"p/media/{sha[:2]}/{sha}.jpg"] = data
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    src = ReplaySource.open(db, profile_root)
+    gw = RawReplayGateway(src, ReplayClock(), src.runs()[0], allowed_buckets=frozenset({"bkt"}))
+    assert await gw.download_user_photo({"id": 701}) == data
+    assert client.bucket("bkt").calls["upload"] == 0

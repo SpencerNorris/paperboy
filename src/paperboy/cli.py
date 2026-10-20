@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Annotated, Any, cast
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from paperboy import app as composition
+from paperboy.collectors.posts import GET_MESSAGES_BATCH
 from paperboy.config import (
     Settings,
     load_settings,
@@ -29,11 +31,15 @@ from paperboy.config import (
 )
 from paperboy.doctor import doctor_blocks, run_doctor
 from paperboy.export.jsonl import export_jsonl
-from paperboy.fetch_media import FetchSummary, fetch_media, initial_results, write_report
+from paperboy.fetch_from_list import (
+    FetchSummary,
+    fetch_from_list,
+    initial_results,
+    write_report,
+)
 from paperboy.ids import channel_uri
 from paperboy.logging_setup import configure_logging
 from paperboy.media_list import (
-    OFFLINE_OUTCOMES,
     ClassifiedRow,
     MediaListError,
     Segment,
@@ -42,6 +48,7 @@ from paperboy.media_list import (
     parse_media_list,
     plan_segments,
 )
+from paperboy.media_store import MediaStoreError, build_media_store
 from paperboy.recipes import collect_channel
 from paperboy.replay import ReplaySource, ReprojectSourceError
 from paperboy.reproject import ReprojectError, TargetFilter, resolve_target_filter
@@ -69,15 +76,32 @@ _PACING_HELP = (
     "Multiply every request interval we assume by this (default 2.0, min 1.0). "
     "Never applied to server-mandated FLOOD_WAITs."
 )
+_MEDIA_STORE_HELP = (
+    "Where this run's media goes: gs://<bucket>/<prefix> (the bucket must be in "
+    "PAPERBOY_MEDIA_STORE_BUCKETS; no local copy is kept). Default: the local profile folder."
+)
 _FLOOD_HELP = (
     "Longest single FLOOD_WAIT (seconds, margin included) to sleep through before "
     "stopping the phase (default 3600)."
 )
 
 
+def _load_settings_or_exit(profile: str, overrides: dict[str, object]) -> Settings:
+    """`load_settings`, but an invalid setting (e.g. a media store whose bucket is not
+    in `media_store_buckets`) is a clean one-line CLI error (exit 1), not a traceback.
+    Only the field and message are printed, never the offending value."""
+    try:
+        return load_settings(profile, overrides)
+    except ValidationError as exc:
+        for err in exc.errors():
+            where = ".".join(str(part) for part in err["loc"]) or "settings"
+            console.print(f"[red]invalid setting {escape(where)}: {escape(err['msg'])}[/]")
+        raise typer.Exit(code=1) from None
+
+
 def _settings_with_overrides(profile: str, **overrides: object) -> Settings:
     clean = {k: v for k, v in overrides.items() if v is not None}
-    return load_settings(profile, clean)
+    return _load_settings_or_exit(profile, clean)
 
 
 def _run_async_or_exit[T](coro: Coroutine[Any, Any, T]) -> T:
@@ -229,6 +253,7 @@ def collect(
         help="With --media: stop the media phase when free disk on the media volume, minus "
              "the next file's declared size, would fall below this many GB (default 5).",
     ),
+    media_store: str = typer.Option(None, "--media-store", help=_MEDIA_STORE_HELP),
 ) -> None:
     """Collect channel metadata, full message history, and the discovery/
     relationship graph for TARGET."""
@@ -270,9 +295,11 @@ def collect(
         overrides["media_max_mb"] = media_max_mb
     if media_min_free_gb is not None:
         overrides["media_min_free_gb"] = media_min_free_gb
+    if media_store is not None:
+        overrides["media_store"] = media_store
     if unsafe:
         overrides["unsafe"] = True
-    settings = load_settings(profile, overrides)
+    settings = _load_settings_or_exit(profile, overrides)
     if settings.enrich_profiles:
         console.print(
             "[yellow]--profiles enabled: full profile enrichment (getFullUser, photo history, "
@@ -374,56 +401,79 @@ def _gb(nbytes: int) -> str:
     return f"{nbytes / 1e9:.2f}"
 
 
+def _dry_label(c: ClassifiedRow) -> str:
+    """The offline outcome the dry run shows: a handle row the store has never
+    seen is `needs_resolve` (it is looked up live, by handle, in the real run)."""
+    return "needs_resolve" if c.needs_resolve else c.outcome
+
+
+# `pending` = addressable rows whose post will be fetched (and media, unless held).
+_DRY_OUTCOMES = ("pending", "needs_resolve", "excluded", "duplicate_row")
+
+
 def _print_plan(classified: list[ClassifiedRow], segments: list[Segment]) -> None:
     """The three offline tables: outcome -> rows -> declared GB, channel x
-    outcome, and the segment plan. Channels appear by numeric id only
-    (logs/consoles reference targets by id)."""
+    state, and the segment plan. Channels appear by numeric id only
+    (logs/consoles reference targets by id); a handle row for a channel the
+    store has never seen is grouped under `-`."""
     by_outcome: dict[str, list[ClassifiedRow]] = {}
     for c in classified:
-        by_outcome.setdefault(c.outcome, []).append(c)
-    outcomes = Table(title="fetch-media: offline classification")
+        by_outcome.setdefault(_dry_label(c), []).append(c)
+    outcomes = Table(title="fetch-from-list: offline classification")
     outcomes.add_column("outcome")
     outcomes.add_column("rows", justify="right")
     outcomes.add_column("declared GB", justify="right")
-    for name in OFFLINE_OUTCOMES:
+    for name in _DRY_OUTCOMES:
         rows = by_outcome.get(name, [])
         outcomes.add_row(name, str(len(rows)), _gb(sum(c.declared_bytes or 0 for c in rows)))
     total_bytes = sum(c.declared_bytes or 0 for c in classified)
     outcomes.add_row("total", str(len(classified)), _gb(total_bytes))
     console.print(outcomes)
 
-    # Per channel (by id) x outcome, over the outcomes that occur: the operator's
-    # view of what each channel will cost before anything is fetched.
-    seen_outcomes = [n for n in OFFLINE_OUTCOMES if n in by_outcome]
+    # Per channel (by id): what each costs before anything is fetched. Of the
+    # pending rows, `in_store` already have their post, `not_yet_collected` will
+    # be new, and `media_stored` already have their file in this run's store.
+    columns = (
+        "pending", "in_store", "not_yet_collected", "media_stored", "needs_resolve",
+        "excluded", "duplicate_row",
+    )
     per_channel: dict[str, Counter[str]] = {}
     for c in classified:
         label = str(c.channel_id) if c.channel_id is not None else "-"
-        per_channel.setdefault(label, Counter())[c.outcome] += 1
-    channels = Table(title="fetch-media: per channel (rows by outcome)")
+        counts = per_channel.setdefault(label, Counter())
+        name = _dry_label(c)
+        counts[name] += 1
+        if name == "pending":
+            counts["in_store" if c.in_store else "not_yet_collected"] += 1
+            counts["media_stored"] += c.media_held
+    channels = Table(title="fetch-from-list: per channel (rows by state)")
     channels.add_column("channel id", justify="right")
-    for name in seen_outcomes:
+    for name in columns:
         channels.add_column(name, justify="right")
     channels.add_column("total", justify="right")
     for label in sorted(per_channel, key=lambda x: (x == "-", int(x) if x != "-" else 0)):
         counts = per_channel[label]
         channels.add_row(
-            label, *(str(counts[n]) for n in seen_outcomes), str(sum(counts.values()))
+            label, *(str(counts[n]) for n in columns),
+            str(sum(counts[n] for n in _DRY_OUTCOMES)),
         )
     console.print(channels)
 
-    plan = Table(title="fetch-media: segment plan (list order)")
-    for column in ("segment", "priority", "channel id", "rows", "declared GB"):
+    plan = Table(title="fetch-from-list: segment plan (list order)")
+    for column in ("segment", "priority", "channel id", "rows", "posts calls", "declared GB"):
         plan.add_column(column, justify="right" if column != "priority" else "left")
     for i, seg in enumerate(segments, start=1):
         plan.add_row(
-            str(i), seg.priority or "-", str(seg.channel_id), str(len(seg.rows)),
+            str(i), seg.priority or "-",
+            str(seg.channel_id) if seg.channel_id is not None else "(by handle)",
+            str(len(seg.rows)), str(-(-len(seg.msg_ids) // GET_MESSAGES_BATCH)),
             _gb(sum(c.declared_bytes or 0 for c in seg.rows)),
         )
     console.print(plan)
 
 
 def _print_summary(summary: FetchSummary) -> None:
-    table = Table(title="fetch-media: result")
+    table = Table(title="fetch-from-list: result")
     table.add_column("outcome")
     table.add_column("rows", justify="right")
     for name, n in sorted(summary.counts.items()):
@@ -432,7 +482,9 @@ def _print_summary(summary: FetchSummary) -> None:
     console.print(table)
 
 
-async def _run_fetch(settings, profile, store, classified, log, report_path):
+async def _run_fetch(
+    settings, profile, store, classified, log, report_path, with_media, excluded_ids
+):
     try:
         secrets = composition.build_secrets(profile)
         gateway = await composition.build_gateway(settings, secrets, profile, store)
@@ -449,17 +501,22 @@ async def _run_fetch(settings, profile, store, classified, log, report_path):
             "Run `paperboy doctor` for details, or pass --unsafe to override."
         )
         raise typer.Exit(code=1)
-    return await fetch_media(
-        gateway, store, settings, classified, log, profile=profile, report_path=report_path
+    return await fetch_from_list(
+        gateway, store, settings, classified, log, profile=profile, report_path=report_path,
+        with_media=with_media, excluded_ids=excluded_ids,
     )
 
 
-@app.command(name="fetch-media")
-def fetch_media_cmd(
+@app.command(name="fetch-from-list")
+def fetch_from_list_cmd(
     list_file: Annotated[
         Path, typer.Argument(metavar="LIST", help="CSV with a `uri` column, or one URI per line.")
     ],
     profile: str = typer.Option("default", "--profile"),
+    no_media: bool = typer.Option(
+        False, "--no-media",
+        help="Fetch and store the listed posts only; download no media.",
+    ),
     media_max_mb: int = typer.Option(
         None, "--media-max-mb", min=1, help="Skip any file larger than this many MB."
     ),
@@ -473,7 +530,7 @@ def fetch_media_cmd(
         typer.Option(
             "--report",
             help="Where to write the per-row report CSV "
-                 "(default <data_dir>/<profile>/fetch-media-<timestamp>.csv).",
+                 "(default <data_dir>/<profile>/fetch-from-list-<timestamp>.csv).",
         ),
     ] = None,
     exclude_target: Annotated[
@@ -487,15 +544,19 @@ def fetch_media_cmd(
     ] = None,
     dry_run: bool = typer.Option(
         False, "--dry-run",
-        help="Classify offline and print the plan; no keychain, no network, no report.",
+        help=(
+            "Classify and print the plan; no Telegram, no keychain, no report. "
+            "With a bucket store: read-only metadata GETs (needs ADC)."
+        ),
     ),
+    media_store: str = typer.Option(None, "--media-store", help=_MEDIA_STORE_HELP),
     max_rpc: int = typer.Option(None, "--max-rpc"),
     unsafe: bool = typer.Option(False, "--unsafe", help="Skip the doctor preflight gate."),
     pacing_factor: float = typer.Option(None, "--pacing-factor", min=1.0, help=_PACING_HELP),
     max_flood_sleep: int = typer.Option(None, "--max-flood-sleep", min=0, help=_FLOOD_HELP),
 ) -> None:
-    """Download media for an ordered list of message URIs across channels
-    (resumable; every input row gets an outcome in the report)."""
+    """Fetch the posts of an ordered list of message URIs across channels, then
+    their media (resumable; every input row gets an outcome in the report)."""
     try:
         rows = parse_media_list(list_file)
     except (MediaListError, OSError) as exc:
@@ -513,9 +574,11 @@ def fetch_media_cmd(
         overrides["pacing_factor"] = pacing_factor
     if max_flood_sleep is not None:
         overrides["flood_sleep_threshold"] = max_flood_sleep
+    if media_store is not None:
+        overrides["media_store"] = media_store
     if unsafe:
         overrides["unsafe"] = True
-    settings = load_settings(profile, overrides)
+    settings = _load_settings_or_exit(profile, overrides)
 
     configure_logging(profile_dir(settings, profile) / "paperboy.log", console=True)
     log = logging.getLogger("paperboy.cli")
@@ -526,16 +589,24 @@ def fetch_media_cmd(
             console.print(f"[red]{escape(str(exc))}[/]")
             raise typer.Exit(code=1) from None
         if excluded_ids:
-            log.info("fetch-media: excluding %d channel id(s): %s",
+            log.info("fetch-from-list: excluding %d channel id(s): %s",
                      len(excluded_ids), sorted(excluded_ids))
-        classified = classify_rows(store, rows, excluded_ids=excluded_ids)
+        try:
+            classified = classify_rows(
+                store, rows, media_store=build_media_store(settings, profile),
+                excluded_ids=excluded_ids,
+            )
+        except MediaStoreError as exc:
+            # A bucket dry run asks GCS whether it holds each candidate (metadata only).
+            console.print(f"[red]cannot reach the media store: {escape(str(exc))}[/]")
+            raise typer.Exit(code=1) from None
         segments = plan_segments(classified)
         _print_plan(classified, segments)
         if dry_run:
             return
 
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        report_path = report or profile_dir(settings, profile) / f"fetch-media-{stamp}.csv"
+        report_path = report or profile_dir(settings, profile) / f"fetch-from-list-{stamp}.csv"
         try:
             # Fail before any segment, not after hours of downloading.
             report_path.open("w", encoding="utf-8").close()
@@ -546,14 +617,15 @@ def fetch_media_cmd(
         if segments:
             summary = _run_async_or_exit(
                 _run_fetch(
-                    settings, profile, store, classified, log, report_path,
+                    settings, profile, store, classified, log, report_path, not no_media,
+                    excluded_ids,
                 )
             )
         else:
             summary = asyncio.run(
-                fetch_media(
+                fetch_from_list(
                     None, store, settings, classified, log,
-                    profile=profile, report_path=report_path,
+                    profile=profile, report_path=report_path, with_media=not no_media,
                 )
             )
 
@@ -703,7 +775,8 @@ def reproject(
     ),
 ) -> None:
     """Rebuild all projections from raw_records into a fresh DB — offline,
-    no network, no credentials. See docs/features/reproject.md."""
+    no Telegram, no keychain; a bucket receipt is read back read-only (needs ADC,
+    allow-listed buckets only). See docs/features/reproject.md."""
     settings = _settings_with_overrides(profile)
     phase_list = phases.split(",") if phases else None
     include_target, exclude_target = include_target or [], exclude_target or []

@@ -16,6 +16,7 @@ append to a partial file or hash garbage.
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import logging
@@ -24,6 +25,8 @@ import shutil
 from pathlib import Path
 from types import TracebackType
 from typing import IO
+
+import google_crc32c
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +76,7 @@ class MediaSink:
             except OSError as exc:
                 raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher = hashlib.sha256()
+        self._crc = google_crc32c.Checksum()
         self._size = 0
 
     def write(self, chunk: bytes) -> int:
@@ -85,6 +89,7 @@ class MediaSink:
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher.update(chunk)
+        self._crc.update(chunk)
         self._size = received
         return len(chunk)
 
@@ -97,6 +102,7 @@ class MediaSink:
         except OSError as exc:
             raise MediaSinkWriteError(_describe(exc)) from exc
         self._hasher = hashlib.sha256()
+        self._crc = google_crc32c.Checksum()
         self._size = 0
 
     def flush(self) -> None:
@@ -140,6 +146,15 @@ class MediaSink:
     def sha256(self) -> str:
         """Hex digest of everything written since the last reset."""
         return self._hasher.hexdigest()
+
+    @property
+    def crc32c(self) -> str:
+        """Base64 big-endian CRC32C of everything written since the last reset.
+
+        Same encoding as GCS's `blob.crc32c`, so a store can compare them
+        directly after an upload (#63).
+        """
+        return base64.b64encode(self._crc.digest()).decode()
 
     def __enter__(self) -> MediaSink:
         return self

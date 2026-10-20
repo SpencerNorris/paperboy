@@ -63,12 +63,27 @@ access_hash, msg_id}}`), `key_source_raw_id` (a live-store raw id,
 informational, not a cross-store foreign key) and, for `handle`, `handle`.
 Context: `{target, channel_id}`. Only stamped runs carry it.
 
-Two more kinds are written by paperboy itself for `fetch-media` (#68, no schema
-change, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
+Two more kinds are written by paperboy itself for `fetch-from-list` (#68, see ADR-0005): `ChannelContextReused` (`{channel_id, source_run_id}`; a
 segment that reused an already-established channel) and `MediaSelection`
 (`{channel_id, msg_ids}`; legacy `{msg_ids}`; the message ids a scoped media phase
 was allowed to walk, written just before the media phase). `reproject` reads them
 to replay those runs exactly.
+
+`fetch-from-list` (#91) also appends the message objects its `posts` phase gets from
+`channels.getMessages` as ordinary `Message`/`MessageService`/`MessageEmpty` raw
+records, with context `{channel_id, method: "channels.getMessages"}`. The `method`
+tag is the only difference from `history`'s records: `reproject` uses it to tell the
+two apart (a `getMessages` receipt is not evidence of a `history` phase) and to
+rebuild the ids the phase asked for. No new kind; the only schema change of #91 is `custody_log.content_key` (migration `0008`).
+
+Per-run media stores (#63, ADR-0008) add one more and extend two receipts.
+`MediaStore` (`{store}`, the run's `gs://<bucket>/<prefix>`) is written once, just
+before the `media` phase of a **bucket** run only (local runs write none), so a
+custody row that merely records a duplicate still has its store derivable from
+raw. The `MediaDownload` and `AvatarDownload` payloads gain `"store"` (the same
+URL), **only when the run's store is not local: a missing `store` key means
+`local`**, which keeps legacy and local-run receipts byte-identical. `reproject`
+reads each file from the store its receipt names.
 
 ## Entities (current state)
 
@@ -134,8 +149,8 @@ richer row in `channels`.
 | `via_bot_id` | INTEGER | Inline bot the message was sent via. |
 | `is_service` | INTEGER | 1 for service messages (joins, pins, title changes, …). |
 | `action_json` | TEXT | The service action object, when `is_service=1`. |
-| `content_hash` | TEXT | Hash of text+media; a change triggers a new `message_revisions` row. |
-| `deleted_at` | TEXT | Set when a deletion is observed via `update`/`empty` evidence (see `message_tombstones`); NULL otherwise. |
+| `content_hash` | TEXT | Fingerprint of text + media with every `file_reference` key removed (see `message_revisions`); a change triggers a new `message_revisions` row. |
+| `deleted_at` | TEXT | Set when a deletion is observed via `update`/`empty` evidence (see `message_tombstones`); NULL otherwise. Cleared again when `fetch-from-list` (`posts`) gets a LIVE answer for the message; the `message_tombstones` rows stay. |
 | `source_raw_id` | INTEGER | Provenance. |
 | `first_seen` / `last_seen` | TEXT | Bounds of observation. |
 
@@ -154,7 +169,7 @@ Content-addressed by SHA-256; deduped across messages.
 | `size` | INTEGER | Bytes received (streamed and counted; equals the declared size for documents, #64). |
 | `file_name` | TEXT | Original filename (documents). |
 | `attributes_json` | TEXT | Video/audio/sticker attributes. |
-| `path` | TEXT | Media key, relative to the profile dir: `media/<sha[:2]>/<sha><ext>` — resolve with `media_keys.resolve_media_key` (ADR-0007). |
+| `path` | TEXT | Media key, relative to the store root: `media/<sha[:2]>/<sha><ext>` — store-neutral (the same key under the profile dir or under a bucket prefix); resolve locally with `media_keys.resolve_media_key` (ADR-0007). Which store holds the bytes is in `custody_log.store`. |
 | `downloaded_at` | TEXT | Download time. |
 | `exif_json` | TEXT | Extracted EXIF/metadata (documents). |
 
@@ -179,6 +194,20 @@ One row per observation; diff them to see subscriber growth, renames, etc.
 
 Append-only; one row per observed version of a message (including the first).
 A new row is written whenever `content_hash` changes.
+
+`content_hash` is sha256 of the text, a NUL, and the media JSON with every
+`file_reference` key dropped (at any depth: `photo`, `document`, `alt_documents`,
+`webpage.photo`, `cached_page.photos`, ...). Telegram re-issues that token on every
+fetch of an unchanged media object, so hashing it recorded false edits (#96).
+Everything else - text, photo/document id, size, mime, attributes, webpage fields,
+poll results - still counts. Only the hash input is normalised: the stored
+`media_json` (in `messages` and here) and the raw records stay verbatim. "Is this
+new?" compares against the latest revision **re-hashed from its stored
+`text`/`media_json`**, not its stored `content_hash`, so revisions written by an
+older release (hash included `file_reference`) do not cause a fresh phantom on the
+first re-observation. Stored hashes of old revisions are not rewritten; a rebuild
+(`reproject`) recomputes them, and `export` shows the new values for rebuilt
+media messages (text-only messages keep their hashes).
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -302,6 +331,8 @@ SHA-256 of every file paperboy writes to disk, for forensic integrity.
 | `sha256` | TEXT | Hash at write time. |
 | `recorded_at` | TEXT | When. |
 | `source_message_uri` | TEXT | Message the file came from, if any. |
+| `store` | TEXT | Which media store this sighting's bytes are in (migration `0007_media_stores`, #63): `local` (the profile folder) or the full `gs://<bucket>/<prefix>` URL; never a filesystem path. NOT NULL, default `local` (every earlier row was written by a local run). One sha can have rows in several stores. |
+| `content_key` | TEXT | The Telegram content this sighting was FOR, `photo:<id>` or `document:<id>` (migration `0008_custody_content_key`, #91, ADR-0009). Lets the dedup index file a file under the content it was downloaded for, not under whatever its message carries now (a post edited to another photo). NULL = unknown: avatar sightings (no message), and sightings the migration could not stamp with certainty (the backfill needs BOTH the sighting's message and the message its file was first stored for to be stable on that key); a cross-channel repost found by `fetch-from-list` has no custody row at all (ADR-0009, #95); a NULL sighting is ignored by the index, so its content is downloaded again (redundant, never missed). |
 
 ## Web (Phase 2)
 

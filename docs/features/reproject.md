@@ -175,6 +175,26 @@ operator can eyeball the correction before swapping files.
   exception is `--out-profile` (#70), which copies into the OUTPUT profile's
   `media/` through the live write path; the source profile is still never
   written.
+- **Bucket reads: the one network exception (#63, ADR-0003 amendment).** A
+  `MediaDownload`/`AvatarDownload` receipt that names a bucket store
+  (`"store": "gs://<bucket>/<prefix>"`; no `store` key means local) is read
+  back with ranged GETs through `MediaStore.open_read` and re-hashed against
+  the receipt sha, exactly like a local file. Only buckets in
+  `PAPERBOY_MEDIA_STORE_BUCKETS` are ever fetched from; a receipt naming any
+  other bucket is skipped with a WARNING (logged once per store). It needs
+  Application Default Credentials on the machine running reproject; without
+  them (or on a missing object, or an outage) the file is a recorded per-file
+  skip, logged once, never a reproject abort. Still absolute: no Telegram
+  (no session, `TelethonGateway` or `Budget`), no `t.me`/`web.archive.org`, no
+  keychain, and no write, upload or delete in any bucket. A source whose
+  receipts are all local builds no GCS client at all (tested: the client
+  factory is patched to raise). A bucket run's `MediaStore` marker is replayed
+  with its recorded stamp, so a replay of it reproduces `custody_log.store`
+  and the raw log byte for byte. A plain reproject writes no media bytes
+  anywhere; `--out-profile` of a bucket source copies the bytes into the
+  LOCAL output profile, which then replays as a local run (custody `local`,
+  no `store` key, no marker). Tests: `tests/test_reproject_bucket.py`,
+  `tests/test_replay_gateway.py`.
 - **Log beside `--out`.** `reproject` writes `<out filename>.log` (`x.sqlite.log`, `x.log.log`;
   never equal to the output DB; default `paperboy.reprojected.sqlite.log`), never into the source profile's
   `paperboy.log`.
@@ -195,36 +215,54 @@ operator can eyeball the correction before swapping files.
   a WARNING and gets no `media` row. See the "Replay smoke (spec §4.1)" in
   `media-streaming.md`.
 
-## Replaying `fetch-media` runs (#68)
+## Replaying `fetch-from-list` runs (#68, #91)
 
-A `fetch-media` segment is an ordinary run (the standard `channel` + `media`
-collectors, targeting the channel id) with two differences that replay must
-honour. (1) A segment that reuses an already-established channel has no
-`channel` phase; it carries a `ChannelContextReused` marker, and `reproject`
-replays it as a media-only run: the channel id and tier come from the marker,
-the access hash from the *source* run's `ChatFull` for that channel (it holds
-the channel object whichever Step A route got the run in, so a source run that
-took route 1 and has no `ResolvedPeer` works; an unknown source run or one that
-never established the channel is a `ReprojectSourceError`, never guessed), and
-the target spelling from the source run's resolve records. Under
+A `fetch-from-list` segment is an ordinary run (the standard `channel`, `posts`
+and `media` collectors, targeting the channel id, or the handle for a channel
+the store had never seen) with differences that replay must honour. (1) A
+segment that reuses an already-established channel has no `channel` phase; it
+carries a `ChannelContextReused` marker, and `reproject` replays it without a
+`channel` phase: the channel id and tier come from the marker, the access hash
+from the *source* run's `ChatFull` for that channel (it holds the channel
+object whichever Step A route got the run in, so a source run that took route 1
+and has no `ResolvedPeer` works; an unknown source run or one that never
+established the channel is a `ReprojectSourceError`, never guessed), and the
+target spelling from the source run's resolve records. Under
 `--include-target`/`--exclude-target` the marker's channel id decides. (2) A
 media phase scoped to specific ids records `MediaSelection` `{channel_id,
 msg_ids}` (legacy: `{msg_ids}`), written just before the media phase and only
 when the channel was established; replay walks only those ids, so a repost that
-the live run never considered gets no dedup custody row on replay.
+the live run never considered gets no dedup custody row on replay. Since #91 the
+ids are decided after the `posts` phase, in a media run of their own (a repost
+sighting listed there keeps its custody row, with its `content_key`, on replay
+too: `tests/test_reproject_fetch_from_list.py`). A cross-channel repost is not in any
+selection (it was not walked), so replay writes no custody row for it either; the
+media phase's sha-dedup custody row (two photo ids, identical bytes) is replayed
+from the `MediaDownload` receipt it now leaves. (3) The
+`posts` phase (#91) appends every object `channels.getMessages` answered as an
+ordinary message raw record whose context carries `method:
+"channels.getMessages"`.
 
 **Phase rule: replay what executed, not what was intended.** `media` is a
 replayed phase iff the run has `MediaDownload` rows or its `MediaSelection`
 names a channel for which the run recorded a `ChatFull`
 (`ReplaySource.channel_established`; a granted `ChannelAccess` always precedes
 that `ChatFull`). A granted segment with zero downloads therefore still
-replays; a refused one does not. Phase detection also no longer infers
-`history` for a run with no message and no `getChannelDifference` raw (a
-`--phases channel` run, a fetch-media segment). The paperboy-authored records
-keep their stored `observed_at` through `ReplayClock.pin_json`. Tests:
-`tests/test_reproject_fetch_media.py` (round-trip parity over a normal, a
-refused and a zero-download segment, a legacy selection, and the collector
-lists).
+replays; a refused one does not. `posts` is replayed iff the run has message
+records with that `method` tag (`ReplaySource.fetched_post_ids`, ascending,
+which become `post_msgs` on replay, so the replayed phase asks for exactly what
+the live one received; `RawReplayGateway.get_messages` serves the latest record
+per id, and an id it never saw comes back as a `ReplayUnknownMessage`
+placeholder that projects nothing). Those receipts are **not** `history`
+evidence: `has_history_evidence` ignores them, so a segment never replays
+`history`. A marker run therefore detects `[posts]`, `[posts, media]` or (a
+segment recorded before #91, with a selection and no receipts) `[media]`; a
+`--no-media` run has no selection and detects `posts` alone. The
+paperboy-authored records keep their stored `observed_at` through
+`ReplayClock.pin_json`. Tests: `tests/test_reproject_fetch_from_list.py`
+(round-trip parity over a normal, a refused and a zero-download segment, a
+legacy selection, an edited post, a new post and a `MessageEmpty` tombstone, a
+`--no-media` run, and the collector lists).
 
 ## Splitting a mixed profile (#70)
 

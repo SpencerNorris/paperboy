@@ -13,8 +13,30 @@ import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9._-]{1,221}")
+
+
+def parse_media_store_url(url: str) -> tuple[str, str]:
+    """Split `gs://<bucket>/<prefix>` into `(bucket, prefix)`; `ValueError` if malformed.
+
+    A trailing `/` is tolerated. The prefix must be non-empty and free of empty,
+    `.` and `..` segments so an object name can never escape it.
+    """
+    if not url.startswith("gs://"):
+        raise ValueError("media_store must look like gs://<bucket>/<prefix>")
+    bucket, _, prefix = url[len("gs://") :].partition("/")
+    prefix = prefix.rstrip("/")
+    if not _BUCKET_RE.fullmatch(bucket):
+        raise ValueError("media_store has an invalid bucket name")
+    if not prefix:
+        raise ValueError("media_store needs a non-empty prefix: gs://<bucket>/<prefix>")
+    if any(seg in ("", ".", "..") for seg in prefix.split("/")):
+        raise ValueError("media_store prefix must not contain empty, '.' or '..' segments")
+    return bucket, prefix
+
 
 _DURATION_RE = re.compile(r"^(\d+)([dhms]?)$")
 _DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "": 1}
@@ -143,6 +165,9 @@ class Settings(BaseSettings):
     media_since: datetime | None = None
     # `--media-msgs` (issue #55): download media only for these message ids.
     media_msgs: list[int] | None = None
+    # Set by `fetch-from-list` (#91): the message ids the `posts` phase fetches
+    # by `channels.getMessages`. None = the phase has nothing to do.
+    post_msgs: list[int] | None = None
     # `--media-max-mb` (issue #53): skip media whose size, as recorded in the
     # stored message, exceeds this many MB (10^6 bytes). None = no cap.
     media_max_mb: int | None = Field(default=None, ge=1)
@@ -150,6 +175,12 @@ class Settings(BaseSettings):
     # volume. Checked before each download against `free - declared size`;
     # the media phase stops cleanly when it would be crossed. 0 disables.
     media_min_free_gb: float = Field(default=5.0, ge=0)
+    # Where this run's media goes (#63, ADR-0008): None = the local profile folder,
+    # `gs://<bucket>/<prefix>` = a GCS bucket (no local copy). The bucket must be in
+    # `media_store_buckets` (comma-separated) so a typo cannot send evidence to
+    # someone else's bucket; the same list is reproject's bucket read allow-list.
+    media_store: str | None = None
+    media_store_buckets: str = ""
     participant_oracle_budget: int = Field(default=100, ge=0)
     participant_reactions_budget: int = Field(default=200, ge=0)
 
@@ -157,6 +188,23 @@ class Settings(BaseSettings):
     @classmethod
     def _expand_data_dir(cls, v: Path) -> Path:
         return v.expanduser()
+
+    @property
+    def media_store_bucket_set(self) -> frozenset[str]:
+        return frozenset(b.strip() for b in self.media_store_buckets.split(",") if b.strip())
+
+    @model_validator(mode="after")
+    def _validate_media_store(self) -> Settings:
+        if self.media_store is None:
+            return self
+        bucket, prefix = parse_media_store_url(self.media_store)  # ValueError if malformed
+        if bucket not in self.media_store_bucket_set:
+            raise ValueError(
+                f"media_store bucket {bucket!r} is not in media_store_buckets "
+                "(PAPERBOY_MEDIA_STORE_BUCKETS)"
+            )
+        self.media_store = f"gs://{bucket}/{prefix}"
+        return self
 
 
 def load_settings(profile: str, overrides: dict) -> Settings:

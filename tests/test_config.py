@@ -156,3 +156,40 @@ def test_media_min_free_gb_default_env_and_bounds(monkeypatch):
     assert load_settings("default", {"media_min_free_gb": 0}).media_min_free_gb == 0
     with pytest.raises(ValidationError):
         load_settings("default", {"media_min_free_gb": -1})
+
+
+def test_media_store_defaults_env_and_validation(monkeypatch):
+    from pydantic import ValidationError
+
+    monkeypatch.delenv("PAPERBOY_MEDIA_STORE", raising=False)
+    monkeypatch.delenv("PAPERBOY_MEDIA_STORE_BUCKETS", raising=False)
+    assert load_settings("default", {}).media_store is None
+    ok = {"media_store": "gs://my-bucket/paperboy/x/", "media_store_buckets": "other,my-bucket"}
+    s = load_settings("default", ok)
+    assert s.media_store == "gs://my-bucket/paperboy/x"  # trailing slash stripped
+    assert s.media_store_bucket_set == {"other", "my-bucket"}
+    with pytest.raises(ValidationError, match="unlisted-bucket"):
+        load_settings(
+            "default",
+            {"media_store": "gs://unlisted-bucket/p", "media_store_buckets": "my-bucket"},
+        )
+    for bad in (
+        "file:///tmp/x",
+        "gs://my-bucket",
+        "gs://my-bucket/",
+        "gs://my-bucket/a/../b",
+        "gs://my-bucket//a",
+        "gs://My_Bucket/a",
+        "my-bucket/a",
+    ):
+        with pytest.raises(ValidationError):
+            load_settings(
+                "default", {"media_store": bad, "media_store_buckets": "my-bucket,My_Bucket"}
+            )
+
+
+def test_media_store_cli_beats_env(monkeypatch):
+    monkeypatch.setenv("PAPERBOY_MEDIA_STORE_BUCKETS", "bkt")
+    monkeypatch.setenv("PAPERBOY_MEDIA_STORE", "gs://bkt/env")
+    assert load_settings("default", {}).media_store == "gs://bkt/env"
+    assert load_settings("default", {"media_store": "gs://bkt/cli"}).media_store == "gs://bkt/cli"

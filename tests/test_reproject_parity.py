@@ -123,15 +123,17 @@ def _web_transport() -> httpx.MockTransport:
 async def run_full_collect(
     data_dir: Path,
     mutate_fixtures: Callable[[dict], dict] | None = None,
+    settings_over: dict | None = None,
 ) -> Path:
     """Collect every phase into <data_dir>/default/paperboy.sqlite; returns the DB path.
 
     `mutate_fixtures` (ADR-0005 / #33) lets a caller run a SECOND collect pass
     against the same DB with varied FakeGateway fixtures — e.g. a later run
     observing a new message — to exercise multi-run replay. The web transport
-    is unchanged; only the FakeGateway fixtures dict is mutated.
+    is unchanged; only the FakeGateway fixtures dict is mutated. `settings_over`
+    adds `Settings` overrides (e.g. a bucket `media_store`, #63).
     """
-    settings = load_settings("default", {"data_dir": data_dir})
+    settings = load_settings("default", {"data_dir": data_dir, **(settings_over or {})})
     db = data_dir / "default" / "paperboy.sqlite"
     web = WebCollector(
         client=WebClient(transport=_web_transport()),

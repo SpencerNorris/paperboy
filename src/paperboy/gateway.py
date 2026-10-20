@@ -177,7 +177,8 @@ class FakeGateway:
     """Replays recorded fixture dicts — no network, no `Budget` involved.
 
     `fixtures` keys: `resolve`, `full_channel`, `self`, `history` (a flat
-    list, newest-first), `get_messages` (a `{id: message_dict}` lookup),
+    list, newest-first), `get_messages` (a `{id: message_dict}` lookup;
+    `get_messages_errors`: per-call list of `BaseException | None` to raise),
     `channel_difference`, `authorizations`, `password_state`, `privacy` (a
     `{key: rules_dict}` lookup keyed by `"phone"`/`"lastseen"`/`"photo"`;
     missing key → `SkipAndRecord`, was `KeyError`),
@@ -309,6 +310,12 @@ class FakeGateway:
     async def get_messages(self, input_channel: dict, ids: list[int]) -> list[dict]:
         self.calls.append("get_messages")
         del input_channel
+        # `get_messages_errors` models a flood/skip on the Nth call (0-based),
+        # like `get_channel_difference`'s exception pages; `None` = answer normally.
+        errors: list[BaseException | None] = self._fx.get("get_messages_errors", [])
+        n = self.calls.count("get_messages") - 1
+        if n < len(errors) and errors[n] is not None:
+            raise cast(BaseException, errors[n])
         table: dict[int, dict] = self._fx.get("get_messages", {})
         return [table.get(i, {"_": "MessageEmpty", "id": i}) for i in ids]
 

@@ -1,4 +1,5 @@
-"""`fetch-media` input: parse and classify an ordered list of message URIs (#68).
+"""`fetch-from-list` input: parse and classify an ordered list of message URIs
+(#68, renamed #91; the module keeps its name because it parses the list).
 
 Two input shapes, chosen by the first meaningful line:
 
@@ -12,10 +13,12 @@ Each entry is `tg:msg:<channel_id>/<msg_id>` (paperboy's own message uri),
 list up front, naming every bad line: nothing is fetched from a half-parsed
 list.
 
-`classify_rows` then decides, offline against the store, what can still
-happen to each row (`already_stored`, `not_in_store`, ...), and
-`plan_segments` groups the rows that remain `pending` into the ordered
-`(priority, channel)` passes the driver runs (`fetch_media.py`).
+`classify_rows` then decides, offline against the store, which rows are
+`duplicate_row` or `excluded` and which are `pending` - every other addressable
+row is fetched (its post, then its media) - and records what the store already
+knows about each (`in_store`, `media_held`, `needs_resolve`). `plan_segments`
+groups the pending rows into the ordered `(priority, channel)` passes the
+driver runs (`fetch_from_list.py`).
 """
 
 from __future__ import annotations
@@ -28,8 +31,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from paperboy.collectors.media import DOWNLOADABLE_KINDS, content_key, recorded_size
+from paperboy.collectors.media import (
+    DOWNLOADABLE_KINDS,
+    content_key,
+    load_content_index,
+    recorded_size,
+)
 from paperboy.ids import msg_uri, parse_uri
+from paperboy.media_store import MediaStore, stored_in
 from paperboy.store.channels import find_channel_id
 from paperboy.targets import TargetKind, UnsupportedTarget, parse_target
 
@@ -42,11 +51,9 @@ _LINK_USER_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?t\.me/([A-Za-z][A-Za-z0-9_]{0,31})/(\d+)/?$", re.IGNORECASE
 )
 
-# The outcome vocabulary of a fetch-media report (docs/features/fetch-media.md).
-OFFLINE_OUTCOMES = (
-    "duplicate_row", "excluded", "not_in_store", "deleted", "no_media",
-    "already_stored", "pending",
-)
+# The outcomes classification decides offline (docs/features/fetch-from-list.md);
+# the live run turns every `pending` row into one of the report's other outcomes.
+OFFLINE_OUTCOMES = ("duplicate_row", "excluded", "pending")
 
 
 class MediaListError(Exception):
@@ -176,27 +183,44 @@ class ClassifiedRow:
     declared_bytes: int | None = None
     # `(sha256, media key)` of the already-stored file, when known offline.
     stored: tuple[str, str] | None = None
+    # The message row exists in the store (else the post is "not yet collected").
+    in_store: bool = False
+    # THIS run's media store already holds the file: the media phase skips the row.
+    media_held: bool = False
+    # A handle row whose channel the store has never seen: resolved live, by
+    # handle, through the #84 handle route (never offline).
+    needs_resolve: bool = False
 
 
-def _global_indexes(store: Store) -> tuple[dict[tuple[str, int], tuple[str, str]], set[str]]:
-    """`content_key -> (sha256, path)` over EVERY stored file, and the set of
-    message uris that already have a `media`/`custody_log` record."""
-    index: dict[tuple[str, int], tuple[str, str]] = {}
-    for r in store.conn.execute(
-        "SELECT media.sha256 AS sha256, media.path AS path, messages.media_json AS mj "
-        "FROM media JOIN messages ON media.message_uri = messages.uri"
+_GROUP_KINDS = frozenset({"megagroup", "forum"})
+
+
+def linked_discussion_groups(store: Store, channel_id: int) -> set[int]:
+    """The discussion groups that follow `channel_id` into an exclusion: channels
+    joined to it by a `linked_group` edge stored in EITHER direction (Telegram's
+    `linked_chat_id` is bidirectional, so the edge points from whichever side was
+    collected), kept only when the other end is not a broadcast channel. One-way
+    by rule (#70): excluding a parent excludes its group; excluding only a group
+    never excludes its parent. A channel that is itself a group has no followers."""
+    row = store.conn.execute("SELECT kind FROM channels WHERE id = ?", (channel_id,)).fetchone()
+    if row is not None and row["kind"] in _GROUP_KINDS:
+        return set()
+    uri = f"tg:channel:{channel_id}"
+    linked: set[int] = set()
+    for edge in store.conn.execute(
+        "SELECT subject_uri, object_uri FROM edges WHERE predicate = 'linked_group' "
+        "AND (subject_uri = ? OR object_uri = ?)", (uri, uri),
     ):
-        key = content_key(json.loads(r["mj"])) if r["mj"] else None
-        if key is not None:
-            index[key] = (r["sha256"], r["path"])
-    uris = {
-        r[0] for r in store.conn.execute(
-            "SELECT message_uri FROM media WHERE message_uri IS NOT NULL "
-            "UNION SELECT source_message_uri FROM custody_log "
-            "WHERE source_message_uri IS NOT NULL"
-        )
-    }
-    return index, uris
+        for other in (edge["subject_uri"], edge["object_uri"]):
+            kind, (other_id,) = parse_uri(other)
+            if kind != "channel" or other_id == channel_id:
+                continue
+            other_row = store.conn.execute(
+                "SELECT kind FROM channels WHERE id = ?", (other_id,)
+            ).fetchone()
+            if other_row is None or other_row["kind"] != "broadcast":
+                linked.add(other_id)  # a group, or one not collected yet (cannot tell)
+    return linked
 
 
 def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
@@ -220,24 +244,62 @@ def excluded_channel_ids(store: Store, specs: Iterable[str]) -> frozenset[int]:
         if channel_id is None:
             raise MediaListError(f"--exclude-target {spec!r}: no such channel in this store")
         ids.add(channel_id)
-        for edge in store.conn.execute(
-            "SELECT object_uri FROM edges WHERE subject_uri = ? AND predicate = 'linked_group'",
-            (f"tg:channel:{channel_id}",),
-        ):
-            kind, (group_id,) = parse_uri(edge["object_uri"])
-            if kind == "channel":
-                ids.add(group_id)
+        ids |= linked_discussion_groups(store, channel_id)
     return frozenset(ids)
 
 
+def held_file(
+    store: Store,
+    media_store: MediaStore,
+    media_kind: str | None,
+    media_json: str | None,
+    index: dict[tuple[str, int], tuple[str, str]],
+) -> tuple[str, str] | None:
+    """`(sha256, media key)` of the file for a message's CURRENT media when THIS
+    run's store already holds it, else `None` (nothing to download, or it must
+    be downloaded into this store, #63).
+
+    Judged by the content key of the media as the message row stores it now - the
+    caller reads the row after the posts phase has refreshed it - and the file a
+    custody sighting recorded for that very content (`load_content_index`), never
+    by what an older version of the post once downloaded (#91). A custody row
+    naming the store answers offline; otherwise, for a store that cannot verify
+    objects (local), an existence check. An unrecorded object in a verifiable
+    store (an orphan bucket object) is not held. No GCS call is made."""
+    if (media_kind or "").lower() not in DOWNLOADABLE_KINDS or not media_json:
+        return None
+    key = content_key(json.loads(media_json))
+    file = index.get(key) if key is not None else None
+    if file is None:
+        return None
+    sha, path = file
+    if stored_in(store.conn, sha, media_store.store_id):
+        return file
+    # No custody row names this store. A store that cannot verify an object
+    # (the local folder) is trusted on existence, exactly as the media phase's
+    # `_held` does; a verifiable one (a bucket) is NOT: an object nobody
+    # recorded is re-fetched and CRC-verified by the media phase before it is
+    # adopted as evidence, so the selection must not call it held either.
+    if not media_store.verifiable and media_store.exists(path):
+        return file
+    return None
+
+
 def classify_rows(
-    store: Store, rows: Iterable[ListRow], *, excluded_ids: frozenset[int] = frozenset()
+    store: Store,
+    rows: Iterable[ListRow],
+    *,
+    media_store: MediaStore,
+    excluded_ids: frozenset[int] = frozenset(),
 ) -> list[ClassifiedRow]:
-    """Offline outcome for every row, first match wins:
-    `duplicate_row`, `excluded` (its channel is in `excluded_ids`; a username
-    row is resolved first), `not_in_store`, `deleted`, `no_media`,
-    `already_stored`, else `pending`. No network, no gateway."""
-    index, stored_uris = _global_indexes(store)
+    """Offline outcome for every row, first match wins: `duplicate_row`,
+    `excluded` (its channel is in `excluded_ids`; a username row is resolved
+    first), else `pending` - including rows the store has never seen, tombstoned
+    rows and text posts, because the live run fetches the post of every
+    addressable row. The flags say what the store already holds: `in_store`,
+    `media_held` (THIS run's `media_store` has the file, #63), `needs_resolve`.
+    No Telegram, no gateway; a bucket store is asked for metadata."""
+    index = load_content_index(store.conn)
     usernames = {
         r["username"].lower(): r["id"]
         for r in store.conn.execute("SELECT id, username FROM channels WHERE username IS NOT NULL")
@@ -253,7 +315,7 @@ def classify_rows(
             assert row.username is not None
             channel_id = usernames.get(row.username)
             if channel_id is None:
-                out.append(ClassifiedRow(row, "not_in_store", row.uri))
+                out.append(ClassifiedRow(row, "pending", row.uri, needs_resolve=True))
                 continue
         uri = msg_uri(channel_id, row.msg_id)
         if channel_id in excluded_ids:
@@ -264,27 +326,17 @@ def classify_rows(
             continue
         seen.add((channel_id, row.msg_id))
         msg = store.conn.execute(
-            "SELECT media_kind, media_json, deleted_at FROM messages WHERE uri = ?", (uri,)
+            "SELECT media_kind, media_json FROM messages WHERE uri = ?", (uri,)
         ).fetchone()
         if msg is None:
-            out.append(ClassifiedRow(row, "not_in_store", uri, channel_id))
+            out.append(ClassifiedRow(row, "pending", uri, channel_id))
             continue
         media = json.loads(msg["media_json"]) if msg["media_json"] else {}
-        declared = recorded_size(media)
-        if msg["deleted_at"] is not None:
-            out.append(ClassifiedRow(row, "deleted", uri, channel_id, declared))
-            continue
-        if (msg["media_kind"] or "").lower() not in DOWNLOADABLE_KINDS:
-            out.append(ClassifiedRow(row, "no_media", uri, channel_id, declared))
-            continue
-        key = content_key(media)
-        if uri in stored_uris or (key is not None and key in index):
-            out.append(ClassifiedRow(
-                row, "already_stored", uri, channel_id, declared,
-                index.get(key) if key is not None else None,
-            ))
-            continue
-        out.append(ClassifiedRow(row, "pending", uri, channel_id, declared))
+        stored = held_file(store, media_store, msg["media_kind"], msg["media_json"], index)
+        out.append(ClassifiedRow(
+            row, "pending", uri, channel_id, recorded_size(media), stored,
+            in_store=True, media_held=stored is not None,
+        ))
     return out
 
 
@@ -294,29 +346,40 @@ def classify_rows(
 @dataclass
 class Segment:
     """One ordinary collect pass: the pending rows of one channel at one
-    priority. Within a segment the collector fetches by ascending message id;
-    list order decides only the order of segments."""
+    priority. The channel is addressed by id, or by handle for a row whose
+    channel the store has never seen (`username`, resolved live). The driver
+    fetches the segment's posts in ascending id order; list order decides only
+    the order of segments."""
 
     priority: str | None
-    channel_id: int
+    channel_id: int | None
     rows: list[ClassifiedRow] = field(default_factory=list)
+    username: str | None = None
 
     @property
     def msg_ids(self) -> list[int]:
+        """Every listed id: all of them are fetched, stored or not."""
         return sorted({c.row.msg_id for c in self.rows})
+
+    @property
+    def address(self) -> int | str:
+        """The channel id, or `@<handle>`: what identifies this channel in one run."""
+        return self.channel_id if self.channel_id is not None else f"@{self.username}"
 
 
 def plan_segments(classified: Iterable[ClassifiedRow]) -> list[Segment]:
-    """Group `pending` rows by `(priority, channel_id)` in order of first
-    appearance. The channel id is the address (#68 amendment): no handle."""
-    segments: dict[tuple[str | None, int], Segment] = {}
+    """Group `pending` rows by `(priority, channel)` in order of first
+    appearance. A row is addressed by channel id (#68 amendment), or by handle
+    when `needs_resolve` (#91)."""
+    segments: dict[tuple[str | None, int | str], Segment] = {}
     for c in classified:
         if c.outcome != "pending":
             continue
-        assert c.channel_id is not None
-        key = (c.row.priority, c.channel_id)
+        username = c.row.username if c.channel_id is None else None
+        seg_key: int | str = c.channel_id if c.channel_id is not None else f"@{username}"
+        key = (c.row.priority, seg_key)
         seg = segments.get(key)
         if seg is None:
-            seg = segments[key] = Segment(c.row.priority, c.channel_id)
+            seg = segments[key] = Segment(c.row.priority, c.channel_id, username=username)
         seg.rows.append(c)
     return list(segments.values())

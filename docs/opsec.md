@@ -57,6 +57,15 @@ request. You **can** be:
   like a normal user; churning exits looks like a compromised account. Register
   and operate through the *same* proxy. Tor exits are often blocked. A paid VPN
   or self-hosted proxy moves trust to that provider — an honest trade-off.
+- **GCS media store (#63).** With `--media-store`, paperboy also talks to
+  `storage.googleapis.com`, only for the one configured bucket that you listed in
+  `PAPERBOY_MEDIA_STORE_BUCKETS` (`reproject` reads only from listed buckets).
+  This is not Telegram traffic and does not use `proxy` (a SOCKS/MTProto route
+  for the Telegram session). On the Mac the system VPN already covers it; on
+  the VM, bucket egress follows the VM's own policy. Authentication is
+  **Application Default Credentials only** (`gcloud auth application-default
+  login`, or the VM's service account): no key files, nothing in the keychain,
+  and paperboy never prints or logs a token.
 - Keep `device` (model/system/app) stable and generic. We do not impersonate an
   official client.
 
@@ -78,6 +87,16 @@ request. You **can** be:
 
 - Keep the data directory on an **encrypted volume**. FileVault covers the
   internal disk only; confirm any external/`/Volumes` disk is APFS-encrypted.
+- **Media bucket (#63).** Grant the collecting identity `roles/storage.objectCreator`
+  (plus read for `reproject`), never `objectAdmin`: `doctor` warns when
+  `storage.objects.delete` is granted (expected on an owner's Mac) and prints the
+  bucket's retention. paperboy only ever creates an object once, to its final
+  name, and has no delete or overwrite path, because a retention policy keeps
+  deleted or replaced versions for its whole span (93 days on the current
+  bucket; objects written by a smoke test are kept that long too). If a
+  checksum mismatch is reported, compare `gcloud storage hash` with
+  `media.sha256`; fixing it means lifting the unlocked retention and deleting by
+  hand: paperboy never will.
 - Logs redact credentials and reference targets by id. Exports scrub the
   collecting account's own record before you share a dataset.
 

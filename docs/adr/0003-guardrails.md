@@ -77,3 +77,25 @@ to keep phases resumable.
 ### Notes
 Spec: `docs/superpowers/specs/2026-09-28-pacing-safety-factor-design.md`.
 Plan: `docs/superpowers/plans/2026-09-28-pacing-safety-factor.md`. Issue #69.
+
+## Amendment (2026-10-06, #63): GCS egress for media stores
+
+`storage.googleapis.com` joins the outbound allow-list under three limits:
+
+- Only when a GCS media store is configured (`media_store`), or, for
+  `reproject`, when a `MediaDownload`/`AvatarDownload` receipt names a bucket
+  that is in the explicit `media_store_buckets` allow-list. A receipt naming
+  any other bucket is skipped with a WARNING and never fetched.
+- Only for those buckets. The bucket must be in `media_store_buckets` at
+  settings load, so a typo cannot send evidence to someone else's bucket.
+- `reproject` is read-only against a bucket (ranged GETs). It still never
+  touches Telegram, `t.me` or `web.archive.org`, and never writes or deletes
+  in any bucket.
+
+GCS traffic is not Telegram traffic, and it does **not** use `settings.proxy`.
+That setting is an MTProto/SOCKS route for the Telegram session; the Google
+client speaks HTTPS and would not honour it, and forcing it through the proxy
+would route evidence bytes via an unrelated hop. On the operator's Mac the
+system VPN already covers all egress; on the VM, egress policy is the VM's
+(see `docs/opsec.md`). Credentials are Application Default Credentials only;
+nothing is stored by paperboy or logged.

@@ -27,9 +27,12 @@ not fill the disk.
   is one chunk however large the file. `Gateway.download_media(ic, message,
   sink) -> bool` (`False` = unavailable server-side). Avatars still return
   bytes (< ~1 MB).
-- **Temp file, atomic rename.** Downloads go to
-  `media/.incoming/<uuid>.part` (same filesystem as the destination), then
-  `os.replace` to `media/<sha[:2]>/<sha><ext>`. A crash or exception leaves
+- **Temp file, then commit to the run's store (#63).** Downloads go to
+  `media/.incoming/<uuid>.part` for BOTH stores (see `media-stores.md`). For
+  the local store the commit is today's atomic `os.replace` to
+  `media/<sha[:2]>/<sha><ext>` (same filesystem as the temp file); for a
+  bucket store it is a create-only upload and the temp file is deleted
+  (no local copy). A crash or exception leaves
   at most a `.part`; `media` rows and files appear only for complete
   downloads. `media/` and `media/.incoming/` are created at phase start, so
   a media phase that downloads nothing leaves an empty `.incoming/`.
@@ -52,9 +55,16 @@ not fill the disk.
 - **Disk errors.** An `OSError` from the temp file (disk full, EIO) becomes
   `MediaSinkWriteError` and a `PhaseStop`: it is not transient, so no 3x
   re-download.
-- **Dedup order.** After streaming: sha already in `media` -> temp deleted,
-  custody row only (`duplicates`); else file already on disk (replay, or a
-  legacy suffix) -> temp deleted, rows only; else rename, then rows.
+- **Dedup order (per store, #63).** Before the download, a content-id hit is
+  skipped only if THIS run's store holds the file (a `custody_log` row naming
+  the store, else one existence check). After streaming: sha already in
+  `media` AND held by the store -> temp deleted, custody row only
+  (`duplicates`); sha in `media` but not in this store -> the temp is
+  committed under the existing row's key, custody + receipt, no second `media`
+  row, counted `downloaded`; else (new sha) reuse an object already under the
+  key or a legacy suffix, otherwise commit; then rows.
+- **Free-disk floor.** It keeps measuring the volume holding
+  `media/.incoming/`: for a bucket run that is the only local disk use.
 - **Sweep.** At phase start `.incoming/*.part` older than 1 h (a dead run) are
   deleted and counted in an INFO log.
   Running two `collect`s against the same profile at once is unsupported (the
@@ -74,7 +84,8 @@ not fill the disk.
   WARNING). The one replay that writes files is `reproject --out-profile`
   (#70): the collector then takes the live write path into the OUTPUT
   profile (`.incoming/`, atomic rename, destination disk floor); see
-  `reproject.md`, "Splitting a mixed profile".
+  `reproject.md`, "Splitting a mixed profile". A bucket receipt is read back
+  with ranged GETs (`reproject.md`, "Bucket reads").
 - **Durability.** `MediaSink.close()` fsyncs before the rename, so an OS crash
   cannot leave a partial file under a final name; a failed close during
   exception unwinding is logged, never allowed to mask the original error.

@@ -163,3 +163,24 @@ def test_close_releases_the_descriptor_when_fsync_fails(tmp_path, monkeypatch):
     with pytest.raises(MediaSinkWriteError):
         sink.close()
     assert sink.closed
+
+
+def test_sink_exposes_crc32c_base64(tmp_path: Path) -> None:
+    import base64
+
+    import google_crc32c
+
+    data = b"abcdefgh"
+    with MediaSink(tmp_path / "x.part") as sink:
+        sink.write(b"abc")
+        sink.write(b"defgh")
+        expected = base64.b64encode(google_crc32c.Checksum(data).digest()).decode()
+        assert sink.crc32c == expected
+        sink.reset()
+        assert sink.crc32c == base64.b64encode(google_crc32c.Checksum(b"").digest()).decode()
+
+
+def test_crc32c_uses_the_c_implementation() -> None:
+    import google_crc32c
+
+    assert google_crc32c.implementation == "c"
