@@ -133,7 +133,9 @@ def test_upload_that_never_gets_through_is_a_store_error_not_a_raw_retry_error(
 ):
     # The real library gives up with `RetryError` (not a GoogleAPICallError). It
     # must surface as MediaStoreError so fetch-from-list ends with a reason.
-    monkeypatch.setattr(media_store, "UPLOAD_RETRY_TIMEOUT_S", 1.0)
+    # raising=False: on code without the constant this still reaches the upload and
+    # fails for the real reason (a raw RetryError), not on the missing attribute.
+    monkeypatch.setattr(media_store, "UPLOAD_RETRY_TIMEOUT_S", 1.0, raising=False)
     transport = _ResettingTransport()
     path, crc = _big_file(tmp_path)
     with pytest.raises(MediaStoreError):

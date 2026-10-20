@@ -427,7 +427,10 @@ async def _run_media_step(
         return "hard_stop"
     media_result = {r.name: r for r in results}.get("media")
     if media_result is not None and media_result.stopped == "phase_stop":
-        reason = type(media_result.stop_exc).__name__
+        # The type alone ("PhaseStop") hides the cause; the message names it
+        # (e.g. "cannot write to the media store: upload failed: RetryError").
+        exc = media_result.stop_exc
+        reason = f"{type(exc).__name__}: {exc}"
         log.warning("%s: media phase stopped (%s); ending the command", label, reason)
         return f"media phase_stop ({reason})"
     return None

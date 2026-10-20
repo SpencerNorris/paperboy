@@ -471,6 +471,48 @@ async def test_second_run_against_bucket_is_already_stored(tmp_path, monkeypatch
         assert gw.calls.count("get_messages") == 4
 
 
+@pytest.mark.asyncio
+async def test_bucket_upload_retry_error_ends_the_command_with_the_store_reason(
+    tmp_path, monkeypatch
+):
+    # #103: the library's RetryError used to escape raw (no reason, no run_event).
+    from google.api_core.exceptions import RetryError
+
+    from paperboy.media_store import build_media_store
+    from tests.fake_gcs import FakeGcsClient
+
+    client = FakeGcsClient()
+    client.bucket("bkt").upload_error = RetryError("Timeout of 900.0s exceeded", ConnectionError())
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+    settings = load_settings(
+        "default",
+        {
+            "data_dir": tmp_path, "media_min_free_gb": 0,
+            "media_store": "gs://bkt/p/x", "media_store_buckets": "bkt",
+        },
+    )
+    path = tmp_path / "list.csv"
+    path.write_text(LIST, encoding="utf-8")
+    report = tmp_path / "r.csv"
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        classified = classify_rows(
+            st, parse_media_list(path), media_store=build_media_store(settings, "p")
+        )
+        summary = await fetch_from_list(
+            _gateway(BYTES), st, settings, classified, LOG, profile="p", report_path=report
+        )
+        events = st.conn.execute(
+            "SELECT kind, detail_json FROM run_events WHERE phase = 'media'"
+        ).fetchall()
+    assert not summary.complete
+    assert "media store" in (summary.stop_reason or "")
+    assert "RetryError" in (summary.stop_reason or "")
+    assert [e["kind"] for e in events] == ["phase_stop"]
+    assert "RetryError" in events[0]["detail_json"]
+    assert client.bucket("bkt").objects == {}
+
+
 # ── #91: posts before media ───────────────────────────────────────────────
 
 
