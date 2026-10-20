@@ -142,13 +142,33 @@ class LocalMediaStore:
         return open(resolve_key_under(self._root, key), "rb")  # noqa: SIM115 - caller closes
 
 
-def _transport_errors() -> tuple[type[BaseException], ...]:
-    """Errors that mean "the bucket is unreachable/unusable", not "this file"."""
-    import requests
-    from google.api_core.exceptions import GoogleAPICallError
-    from google.auth.exceptions import GoogleAuthError
+# How long one upload keeps retrying through network blips (a VPN reconnect, a
+# router reset) before the bucket counts as unreachable. The library default is
+# 120 s, which a reconnect outlasted on the 2026-10-20 list run. Retrying is safe:
+# uploads are create-only (`if_generation_match=0`), so a retry can never overwrite.
+UPLOAD_RETRY_TIMEOUT_S = 900.0
 
-    return (GoogleAPICallError, GoogleAuthError, requests.exceptions.RequestException)
+
+def _upload_retry() -> Any:
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    return DEFAULT_RETRY.with_timeout(UPLOAD_RETRY_TIMEOUT_S)
+
+
+def _transport_errors() -> tuple[type[BaseException], ...]:
+    """Errors that mean "the bucket is unreachable/unusable", not "this file".
+
+    `GoogleAPIError` (not just its `GoogleAPICallError` subclass) so the library's
+    `RetryError` - raised when its retry window runs out on a reset connection -
+    is included, as is the resumable-upload `InvalidResponse`; neither derives
+    from `GoogleAPICallError`, and both used to escape raw and abort the run.
+    """
+    import requests
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
+    from google.cloud.storage.exceptions import InvalidResponse
+
+    return (GoogleAPIError, GoogleAuthError, InvalidResponse, requests.exceptions.RequestException)
 
 
 class _GcsReader:
@@ -254,7 +274,9 @@ class GcsMediaStore:
         try:
             # if_generation_match=0: create only if no live object has this name.
             # It also makes the library's resumable upload retry-safe.
-            blob.upload_from_filename(str(temp), if_generation_match=0, checksum=None)
+            blob.upload_from_filename(
+                str(temp), if_generation_match=0, checksum=None, retry=_upload_retry()
+            )
         except PreconditionFailed:
             log.info("media store: %s already exists (lost create race); not overwritten", key)
             return False

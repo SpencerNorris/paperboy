@@ -6,8 +6,11 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
+from google.api_core.exceptions import PreconditionFailed, RetryError, ServiceUnavailable
+from google.api_core.retry import Retry
+from google.cloud.storage.exceptions import InvalidResponse
 
+from paperboy import media_store
 from paperboy.config import load_settings
 from paperboy.media_keys import media_key
 from paperboy.media_store import (
@@ -125,6 +128,44 @@ def test_gcs_transport_failure_is_a_store_error(tmp_path):
     store = GcsMediaStore("b", "p/x", client_factory=lambda: client)
     with pytest.raises(MediaStoreError):
         store.commit(_temp(tmp_path), KEY, CRC)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # What the library raises once its own retry window runs out on a reset
+        # connection (reproduced against the real library, 2026-10-20 run).
+        RetryError("Timeout of 900.0s exceeded", ConnectionError("Connection reset by peer")),
+        InvalidResponse(None, "unexpected status"),
+    ],
+    ids=["retry_error", "invalid_response"],
+)
+def test_gcs_upload_errors_outside_api_call_errors_are_store_errors(tmp_path, error):
+    # Neither is a GoogleAPICallError; before the fix both escaped `commit` raw and
+    # aborted fetch-from-list with no reason recorded (rows left not_attempted).
+    client = FakeGcsClient()
+    client.bucket("b").upload_error = error
+    store = GcsMediaStore("b", "p/x", client_factory=lambda: client)
+    with pytest.raises(MediaStoreError):
+        store.commit(_temp(tmp_path), KEY, CRC)
+
+
+def test_gcs_exists_retry_error_is_a_store_error():
+    client = FakeGcsClient()
+    client.bucket("b").exists_error = RetryError("Timeout exceeded", ConnectionError("reset"))
+    store = GcsMediaStore("b", "p/x", client_factory=lambda: client)
+    with pytest.raises(MediaStoreError):
+        store.exists(KEY)
+
+
+def test_gcs_commit_rides_out_network_blips_with_a_long_retry_window(tmp_path):
+    client = FakeGcsClient()
+    store = GcsMediaStore("b", "p/x", client_factory=lambda: client)
+    store.commit(_temp(tmp_path), KEY, CRC)
+    retry = client.bucket("b").last_upload_kwargs["retry"]
+    assert isinstance(retry, Retry)
+    assert retry.timeout == media_store.UPLOAD_RETRY_TIMEOUT_S
+    assert media_store.UPLOAD_RETRY_TIMEOUT_S >= 600  # far past the library's 120 s default
 
 
 def test_gcs_client_is_built_lazily(tmp_path):
