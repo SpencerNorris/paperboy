@@ -42,10 +42,11 @@ class FakeBlob:
         filename: str,
         if_generation_match: int | None = None,
         checksum: str | None = None,
-        **_: object,
+        **kwargs: object,
     ) -> None:
         bucket = self._bucket
         bucket.calls["upload"] += 1
+        bucket.last_upload_kwargs = kwargs
         assert if_generation_match == 0, "uploads must be create-only (if_generation_match=0)"
         data = Path(filename).read_bytes()
         if bucket.upload_error is not None:
@@ -85,6 +86,7 @@ class FakeBucket:
         self.corrupt_crc: str | None = None  # server-side crc32c to report after upload
         self.upload_error: Exception | None = None
         self.exists_error: Exception | None = None  # e.g. ServiceUnavailable on any exists()
+        self.last_upload_kwargs: dict[str, object] = {}  # e.g. the `retry` policy passed
         self.race_once = False
         self.race_data: bytes | None = None  # what the racing writer stored (default: same bytes)
         self.stored_crc: dict[str, str] = {}  # per-object crc32c override (corrupt leftovers)

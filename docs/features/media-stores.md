@@ -80,11 +80,15 @@ store. Mac first, using the operator's own Application Default Credentials.
   rows, the file is counted `skipped`, the object is left in place, the run
   continues. Manual recovery (ADR-0008): compare `gcloud storage hash` with
   `media.sha256`; the operator lifts the unlocked retention and deletes by hand;
-  paperboy never will. A transport failure after the library's own retries
-  (`GoogleAPICallError`, `RequestException`, credential errors) is
-  `MediaStoreError`, which stops the media phase (`PhaseStop`); a bucket outage
-  is not per-file and never causes a re-download. Uploads happen outside
-  `Budget.call`; `Budget` only sees Telegram RPCs.
+  paperboy never will. Each upload retries through network blips for up to
+  `UPLOAD_RETRY_TIMEOUT_S` (900 s; the library default of 120 s was outlasted by a
+  VPN reconnect on the 2026-10-20 list run). Retrying is safe because uploads are
+  create-only. A transport failure after those retries (any `GoogleAPIError`,
+  including the library's `RetryError`; the resumable-upload `InvalidResponse`;
+  `RequestException`; credential errors) is `MediaStoreError`, which stops the
+  media phase (`PhaseStop`) with the reason recorded; a bucket outage is not
+  per-file and never causes a re-download. Uploads happen outside `Budget.call`;
+  `Budget` only sees Telegram RPCs.
 - **Free-disk floor** still measures the volume holding `media/.incoming/`:
   for a bucket run that is the only local disk use. `media/` itself stays empty.
 - **Avatars** use the same path (temp file, `exists`, create-only commit); a

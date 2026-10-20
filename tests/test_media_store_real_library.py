@@ -20,7 +20,8 @@ import requests
 from google.auth.credentials import AnonymousCredentials
 from google.cloud import storage
 
-from paperboy.media_store import GcsMediaStore, MediaStoreIntegrityError
+from paperboy import media_store
+from paperboy.media_store import GcsMediaStore, MediaStoreError, MediaStoreIntegrityError
 
 OVER_MULTIPART = 8 * 1024 * 1024 + 1  # the library's resumable-upload threshold + 1
 KEY = "media/ab/" + "ab" * 32 + ".bin"
@@ -114,4 +115,30 @@ def test_object_created_with_a_wrong_crc_is_integrity_error_and_never_a_delete(t
     path, crc = _big_file(tmp_path)
     with pytest.raises(MediaStoreIntegrityError):
         _store(transport).commit(path, KEY, crc)
+    assert transport.deletes() == []
+
+
+class _ResettingTransport(_Transport):
+    """Every upload request dies with a reset connection, like a VPN reconnect."""
+
+    def request(self, method, url, data=None, headers=None, **kw):
+        if method in ("POST", "PUT"):
+            self.requests.append((method, url))
+            raise requests.exceptions.ConnectionError("Connection reset by peer")
+        return super().request(method, url, data=data, headers=headers, **kw)
+
+
+def test_upload_that_never_gets_through_is_a_store_error_not_a_raw_retry_error(
+    tmp_path, monkeypatch
+):
+    # The real library gives up with `RetryError` (not a GoogleAPICallError). It
+    # must surface as MediaStoreError so fetch-from-list ends with a reason.
+    # raising=False: on code without the constant this still reaches the upload and
+    # fails for the real reason (a raw RetryError), not on the missing attribute.
+    monkeypatch.setattr(media_store, "UPLOAD_RETRY_TIMEOUT_S", 1.0, raising=False)
+    transport = _ResettingTransport()
+    path, crc = _big_file(tmp_path)
+    with pytest.raises(MediaStoreError):
+        _store(transport).commit(path, KEY, crc)
+    assert len(transport.requests) >= 2  # it did retry before giving up
     assert transport.deletes() == []
