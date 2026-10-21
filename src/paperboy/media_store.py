@@ -142,8 +142,11 @@ class LocalMediaStore:
         return open(resolve_key_under(self._root, key), "rb")  # noqa: SIM115 - caller closes
 
 
-# How long one upload keeps retrying through network blips (a VPN reconnect, a
-# router reset) before the bucket counts as unreachable. The library default is
+# How long one upload request (the session start, or one chunk) keeps retrying
+# through network blips (a VPN reconnect, a router reset) before the bucket counts
+# as unreachable; a request stalled for the full UPLOAD_REQUEST_TIMEOUT_S gets
+# about 3 attempts. The window is per request, so a whole upload over a link that
+# keeps dropping can take longer than this in total. The library default is
 # 120 s, which a reconnect outlasted on the 2026-10-20 list run. Retrying is safe:
 # uploads are create-only (`if_generation_match=0`), so a retry can never overwrite.
 UPLOAD_RETRY_TIMEOUT_S = 900.0

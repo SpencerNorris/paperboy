@@ -80,8 +80,9 @@ store. Mac first, using the operator's own Application Default Credentials.
   rows, the file is counted `skipped`, the object is left in place, the run
   continues. Manual recovery (ADR-0008): compare `gcloud storage hash` with
   `media.sha256`; the operator lifts the unlocked retention and deletes by hand;
-  paperboy never will. Each upload retries through network blips for up to
-  `UPLOAD_RETRY_TIMEOUT_S` (900 s; the library default of 120 s was outlasted by a
+  paperboy never will. Each upload request (session start, or one chunk) retries
+  through network blips for up to `UPLOAD_RETRY_TIMEOUT_S` (900 s, per request, so
+  a whole upload over a link that keeps dropping can take longer; the library default of 120 s was outlasted by a
   VPN reconnect on the 2026-10-20 list run). Retrying is safe because uploads are
   create-only. A file over 8 MiB goes up in `UPLOAD_CHUNK_BYTES` (8 MiB) requests,
   so a retry resends one chunk, not the whole file; each request may take up to

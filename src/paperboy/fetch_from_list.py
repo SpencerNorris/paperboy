@@ -373,7 +373,8 @@ async def _run_segments(
                     )
         except MediaStoreError as exc:
             log.warning("%s: cannot reach the media store: %s; ending the command", label, exc)
-            end_reason = f"media store unreachable ({type(exc).__name__})"
+            # The message names the cause chain by type only (#107); no URLs.
+            end_reason = f"media store unreachable ({exc})"
         finally:
             # Merge even when an unexpected error escapes mid-segment: rows the
             # posts/media phases already finished and recorded must be reported
