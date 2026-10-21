@@ -149,6 +149,19 @@ class LocalMediaStore:
 UPLOAD_RETRY_TIMEOUT_S = 900.0
 
 
+# Each upload request carries at most this many bytes. Without it the library
+# sends a file of up to 100 MiB in ONE request, and a retry restarts that request
+# from byte 0; on the 2026-10-20 list run, over a VPN with a stalling uplink, the
+# first new file never got through (#107). A retry now resends only that chunk. GCS
+# requires a multiple of 256 KiB. Files of 8 MiB or less go in one request anyway.
+UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
+
+# Per-request timeout. The library default of 60 s also bounds each blocking
+# socket write, and the stalling uplink exceeded it ("The write operation timed
+# out"), so every attempt failed (#107).
+UPLOAD_REQUEST_TIMEOUT_S = 300.0
+
+
 def _upload_retry() -> Any:
     from google.cloud.storage.retry import DEFAULT_RETRY
 
@@ -171,6 +184,25 @@ def _transport_errors() -> tuple[type[BaseException], ...]:
     return (GoogleAPIError, GoogleAuthError, InvalidResponse, requests.exceptions.RequestException)
 
 
+def _cause_chain(exc: BaseException) -> str:
+    """`RetryError <- ConnectionError <- TimeoutError`: the exception's type and
+    its causes, outermost first, so a store error names the real failure.
+
+    Type names only: library messages can embed the resumable-upload session URL,
+    which is itself a write capability for that upload and must not be logged.
+    """
+    names: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return " <- ".join(names)
+
+
 class _GcsReader:
     """Wraps a blob reader so transport failures surface as `MediaStoreError`
     and a missing object as `FileNotFoundError`, whenever they happen."""
@@ -186,7 +218,7 @@ class _GcsReader:
         except NotFound as exc:
             raise FileNotFoundError("media object not found") from exc
         except _transport_errors() as exc:
-            raise MediaStoreError(f"read failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"read failed: {_cause_chain(exc)}") from exc
 
     def close(self) -> None:
         self._raw.close()
@@ -224,7 +256,7 @@ class GcsMediaStore:
                 self._client = self._client_factory()
             except _transport_errors() as exc:
                 raise MediaStoreError(
-                    f"cannot create the storage client: {type(exc).__name__}"
+                    f"cannot create the storage client: {_cause_chain(exc)}"
                 ) from exc
         return self._client.bucket(self._bucket_name)
 
@@ -238,7 +270,7 @@ class GcsMediaStore:
         try:
             found = bool(self._bucket().blob(name).exists())
         except _transport_errors() as exc:
-            raise MediaStoreError(f"exists check failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"exists check failed: {_cause_chain(exc)}") from exc
         log.debug("media store: exists(%s) -> %s", key, found)
         return found
 
@@ -247,7 +279,7 @@ class GcsMediaStore:
         try:
             blob = self._bucket().get_blob(name)
         except _transport_errors() as exc:
-            raise MediaStoreError(f"metadata read failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"metadata read failed: {_cause_chain(exc)}") from exc
         return None if blob is None else blob.crc32c
 
     def find_key(self, sha256: str) -> str | None:
@@ -255,7 +287,7 @@ class GcsMediaStore:
         try:
             names = sorted(b.name for b in self._bucket().list_blobs(prefix=shard_prefix))
         except _transport_errors() as exc:
-            raise MediaStoreError(f"list failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"list failed: {_cause_chain(exc)}") from exc
         for name in names:
             key = name[len(self._prefix) + 1 :]
             if is_media_key(key):
@@ -271,11 +303,16 @@ class GcsMediaStore:
         # Do not switch this to the library's `checksum="crc32c"`: on a
         # resumable upload that path calls `blob.delete()` on a mismatch.
         blob.crc32c = crc32c_b64
+        blob.chunk_size = UPLOAD_CHUNK_BYTES
         try:
             # if_generation_match=0: create only if no live object has this name.
             # It also makes the library's resumable upload retry-safe.
             blob.upload_from_filename(
-                str(temp), if_generation_match=0, checksum=None, retry=_upload_retry()
+                str(temp),
+                if_generation_match=0,
+                checksum=None,
+                timeout=UPLOAD_REQUEST_TIMEOUT_S,
+                retry=_upload_retry(),
             )
         except PreconditionFailed:
             log.info("media store: %s already exists (lost create race); not overwritten", key)
@@ -286,9 +323,9 @@ class GcsMediaStore:
                 raise MediaStoreIntegrityError(
                     key, crc32c_b64, "rejected by the server"
                 ) from exc
-            raise MediaStoreError(f"upload failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"upload failed: {_cause_chain(exc)}") from exc
         except _transport_errors() as exc:
-            raise MediaStoreError(f"upload failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"upload failed: {_cause_chain(exc)}") from exc
         remote = blob.crc32c
         if remote != crc32c_b64:
             raise MediaStoreIntegrityError(key, crc32c_b64, str(remote))
@@ -302,7 +339,7 @@ class GcsMediaStore:
                 raise FileNotFoundError("media object not found")
             raw = blob.open("rb", chunk_size=_READ_CHUNK)
         except _transport_errors() as exc:
-            raise MediaStoreError(f"open failed: {type(exc).__name__}") from exc
+            raise MediaStoreError(f"open failed: {_cause_chain(exc)}") from exc
         return _GcsReader(raw)
 
 

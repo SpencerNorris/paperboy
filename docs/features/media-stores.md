@@ -83,9 +83,16 @@ store. Mac first, using the operator's own Application Default Credentials.
   paperboy never will. Each upload retries through network blips for up to
   `UPLOAD_RETRY_TIMEOUT_S` (900 s; the library default of 120 s was outlasted by a
   VPN reconnect on the 2026-10-20 list run). Retrying is safe because uploads are
-  create-only. A transport failure after those retries (any `GoogleAPIError`,
+  create-only. A file over 8 MiB goes up in `UPLOAD_CHUNK_BYTES` (8 MiB) requests,
+  so a retry resends one chunk, not the whole file; each request may take up to
+  `UPLOAD_REQUEST_TIMEOUT_S` (300 s; the library's 60 s also bounds each socket
+  write, which a stalling VPN uplink exceeded on every attempt, #107). A transport
+  failure after those retries (any `GoogleAPIError`,
   including the library's `RetryError`; the resumable-upload `InvalidResponse`;
-  `RequestException`; credential errors) is `MediaStoreError`, which stops the
+  `RequestException`; credential errors) is `MediaStoreError`, whose message names
+  the cause chain by type (`upload failed: RetryError <- ConnectionError <- ...
+  <- TimeoutError`; messages are left out because they can carry the resumable
+  session URL), and which stops the
   media phase (`PhaseStop`) with the reason recorded; a bucket outage is not
   per-file and never causes a re-download. Uploads happen outside `Budget.call`;
   `Budget` only sees Telegram RPCs.
