@@ -1287,3 +1287,43 @@ def _write(tmp_path, text):
     path = tmp_path / "orphan-list.csv"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+@pytest.mark.asyncio
+async def test_bucket_unreachable_mid_run_names_the_cause_chain_in_the_stop_reason(
+    tmp_path, monkeypatch
+):
+    # #107: the end reason used to say only "MediaStoreError", hiding the cause.
+    # The store error's message is already scrubbed to type names (no session URL).
+    from paperboy import fetch_from_list as ffl
+    from paperboy.media_store import MediaStoreError, build_media_store
+    from tests.fake_gcs import FakeGcsClient
+
+    client = FakeGcsClient()
+    monkeypatch.setattr("paperboy.media_store.default_client_factory", lambda: client)
+
+    def unreachable(*_args, **_kwargs):
+        raise MediaStoreError("exists check failed: RetryError <- ConnectionError")
+
+    monkeypatch.setattr(ffl, "_refresh_rows", unreachable)
+    settings = load_settings(
+        "default",
+        {
+            "data_dir": tmp_path, "media_min_free_gb": 0,
+            "media_store": "gs://bkt/p/x", "media_store_buckets": "bkt",
+        },
+    )
+    path = tmp_path / "list.csv"
+    path.write_text(LIST, encoding="utf-8")
+    with Store.open(tmp_path / "p" / "paperboy.sqlite") as st:
+        _seed_store(st)
+        classified = classify_rows(
+            st, parse_media_list(path), media_store=build_media_store(settings, "p")
+        )
+        summary = await fetch_from_list(
+            _gateway(BYTES), st, settings, classified, LOG, profile="p",
+            report_path=tmp_path / "r.csv",
+        )
+    assert not summary.complete
+    assert "media store unreachable" in (summary.stop_reason or "")
+    assert "RetryError <- ConnectionError" in (summary.stop_reason or "")

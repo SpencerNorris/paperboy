@@ -142,3 +142,75 @@ def test_upload_that_never_gets_through_is_a_store_error_not_a_raw_retry_error(
         _store(transport).commit(path, KEY, crc)
     assert len(transport.requests) >= 2  # it did retry before giving up
     assert transport.deletes() == []
+
+
+class _ChunkedTransport(_Transport):
+    """A resumable-upload server that answers each non-final chunk with 308.
+
+    Records every upload PUT as (start, end, payload bytes, timeout). `stall_put`
+    (1-based) makes that PUT die once the way a stalled VPN socket does.
+    """
+
+    def __init__(self, *, stall_put: int | None = None, always_stall: bool = False) -> None:
+        super().__init__()
+        self.puts: list[tuple[int, int, int, object]] = []
+        self.timeouts: list[object] = []  # of every upload POST/PUT
+        self.stall_put = stall_put
+        self.always_stall = always_stall
+
+    def request(self, method, url, data=None, headers=None, timeout=None, **kw):
+        if "upload" in url:  # not the library's own bucket-metadata GET
+            self.timeouts.append(timeout)
+        if method != "PUT":
+            return super().request(method, url, data=data, headers=headers, **kw)
+        self.requests.append((method, url))
+        assert headers is not None and isinstance(data, bytes)  # a chunk PUT always has both
+        span, _, total = headers["content-range"].removeprefix("bytes ").partition("/")
+        start, _, end = span.partition("-")
+        self.puts.append((int(start), int(end), len(data), timeout))
+        if self.always_stall or len(self.puts) == self.stall_put:
+            raise requests.exceptions.ConnectionError(
+                "HTTPSConnectionPool: Max retries exceeded with url: "
+                "/upload/storage/v1/b/bkt/o?uploadType=resumable&upload_id=SESSION-SECRET"
+            ) from TimeoutError("The write operation timed out")
+        if int(end) + 1 < int(total):
+            return _response(308, headers={"range": f"bytes=0-{end}"})
+        return _response(200, {"name": "p/" + KEY, "crc32c": self.declared_crc})
+
+
+def test_big_upload_goes_in_bounded_chunks_with_the_long_request_timeout(tmp_path, monkeypatch):
+    # #107: one request per file (the library's 100 MiB default chunk) with its
+    # 60 s request timeout never finished over a slow, stalling uplink.
+    monkeypatch.setattr(media_store, "UPLOAD_CHUNK_BYTES", 4 * 1024 * 1024)
+    transport = _ChunkedTransport()
+    path, crc = _big_file(tmp_path)
+    assert _store(transport).commit(path, KEY, crc) is True
+    assert len(transport.puts) == 3  # 4 MiB + 4 MiB + 1 byte
+    assert all(size <= media_store.UPLOAD_CHUNK_BYTES for _, _, size, _ in transport.puts)
+    assert set(transport.timeouts) == {media_store.UPLOAD_REQUEST_TIMEOUT_S}
+    assert transport.deletes() == []
+
+
+def test_a_stalled_chunk_is_resent_from_its_own_offset_not_from_byte_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(media_store, "UPLOAD_CHUNK_BYTES", 4 * 1024 * 1024)
+    transport = _ChunkedTransport(stall_put=2)
+    path, crc = _big_file(tmp_path)
+    assert _store(transport).commit(path, KEY, crc) is True
+    starts = [start for start, _, _, _ in transport.puts]
+    assert starts == [0, 4 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]
+    assert transport.deletes() == []
+
+
+def test_upload_failure_names_the_root_cause_but_not_the_session_url(tmp_path, monkeypatch):
+    # #107: the error used to say only "RetryError", hiding the write timeout.
+    # The resumable session URL is a write capability, so it must not be logged.
+    monkeypatch.setattr(media_store, "UPLOAD_RETRY_TIMEOUT_S", 1.0)
+    transport = _ChunkedTransport(always_stall=True)
+    path, crc = _big_file(tmp_path)
+    with pytest.raises(MediaStoreError) as caught:
+        _store(transport).commit(path, KEY, crc)
+    message = str(caught.value)
+    assert "RetryError" in message
+    assert "TimeoutError" in message
+    assert "SESSION-SECRET" not in message
+    assert transport.deletes() == []
